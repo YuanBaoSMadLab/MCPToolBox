@@ -1,0 +1,27 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0-beta",
+  "FriendlyName": "MCP Toolbox - Unreal Engine AI Assistant",
+  "Description": "MCP Toolbox UE编辑器插件，集成MCP(Model Context Protocol)服务器通信、多AI服务商管理、智能对话、视觉分析和截屏功能。基于开源AI助手库构建。",
+  "Category": "AI",
+  "CreatedBy": "MCPToolbox Team",
+  "EngineVersion": "5.8.0",
+  "CanContainContent": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "MCPToolbox",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [ "Win64", "Linux", "Mac" ]
+    },
+    {
+      "Name": "MCPToolboxScreenshot",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [ "Win64", "Linux", "Mac" ]
+    }
+  ],
+  "Plugins": []
+}
