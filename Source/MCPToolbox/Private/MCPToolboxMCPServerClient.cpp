@@ -627,3 +627,14 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 
 	Request->ProcessRequest();
 }
+
+void FMCPToolboxMCPServerClient::RebuildToolNameSet()
+{
+	McpToolNameSet.Empty();
+	for (const auto& T : Tools)
+	{
+		FString N;
+		if (T->TryGetStringField(TEXT("name"), N))
+			McpToolNameSet.Add(N);
+	}
+}

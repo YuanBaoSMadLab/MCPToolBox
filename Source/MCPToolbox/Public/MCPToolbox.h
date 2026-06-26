@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
+#include "Widgets/Docking/SDockTab.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogMCPToolbox, Log, All);
 
@@ -19,13 +20,10 @@ public:
 
 	// ---- Window Management ----
 
-	/** Create and return the main MCPToolbox window */
-	TSharedPtr<SWindow> CreateMCPToolboxWindow();
-
-	/** Open the MCPToolbox window (creates it if not already open) */
+	/** Open the MCPToolbox tab (creates it if not already open) */
 	void OpenMCPToolboxWindow();
 
-	/** Toggle the MCPToolbox window open/closed */
+	/** Toggle the MCPToolbox tab open/closed */
 	void ToggleMCPToolboxWindow();
 
 	// ---- MCP Server ----
@@ -48,19 +46,22 @@ private:
 	/** Register the menu entry under the Window menu */
 	void RegisterMenuEntry();
 
+	/** Register the tab spawner with the level editor */
+	void RegisterTabSpawner();
+
 	/** Load configuration from DefaultMCPToolbox.ini */
 	void LoadConfiguration();
 
 	/** Validate the runtime environment (check for required modules) */
 	void ValidateRuntimeEnvironment();
 
+	/** Spawn the MCPToolbox tab content */
+	TSharedRef<SDockTab> OnSpawnMCPToolboxTab(const FSpawnTabArgs& Args);
+
 	// ---- State ----
 
 	/** The MCPToolbox main widget */
 	TSharedPtr<SMCPToolboxWidget> MCPToolboxWidget;
-
-	/** The window that contains the MCPToolbox widget */
-	TSharedPtr<SWindow> MCPToolboxWindow;
 
 	/** Handle for the toolbar button extender */
 	TSharedPtr<FExtender> ToolbarExtender;
@@ -74,9 +75,15 @@ private:
 	/** Delegate handle for the menu entry registration */
 	FDelegateHandle MenuEntryHandle;
 
+	/** Delegate handle for OnRegisterTabs (defers tab spawner registration) */
+	FDelegateHandle OnRegisterTabsHandle;
+
 	/** Whether the module has been fully initialized */
 	bool bIsInitialized;
 
 	/** Whether UE's built-in MCP server was started successfully */
 	static bool bMCPServerStarted;
+
+	/** Tab name for the dock tab */
+	static const FName MCPToolboxTabName;
 };

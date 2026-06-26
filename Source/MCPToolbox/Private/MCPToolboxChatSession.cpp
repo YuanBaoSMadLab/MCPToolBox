@@ -162,6 +162,7 @@ FMCPToolboxChatSession* FMCPToolboxChatSessionManager::CreateNewSession(const FS
 	FMCPToolboxChatSession* Ptr = NewSession.Get();
 	Sessions.Insert(MoveTemp(NewSession), 0);
 	CurrentSessionId = Ptr->SessionId;
+	SaveSession(*Ptr);
 	return Ptr;
 }
 
@@ -245,6 +246,16 @@ void FMCPToolboxChatSessionManager::SaveSession(FMCPToolboxChatSession& Session)
 	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
 	
 	FFileHelper::SaveStringToFile(JsonStr, *FilePath);
+}
+
+void FMCPToolboxChatSessionManager::SaveCurrentSession()
+{
+	FMCPToolboxChatSession* Session = GetCurrentSession();
+	if (Session)
+	{
+		Session->UpdatedAt = FDateTime::Now();
+		SaveSession(*Session);
+	}
 }
 
 void FMCPToolboxChatSessionManager::LoadAllSessions()

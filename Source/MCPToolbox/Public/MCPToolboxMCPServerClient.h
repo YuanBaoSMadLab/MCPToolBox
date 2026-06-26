@@ -39,6 +39,10 @@ public:
 	/** Get the list of discovered tools */
 	TArray<TSharedPtr<FJsonObject>>& GetTools() { return Tools; }
 
+	/** O(1) check if a tool name is an MCP tool */
+	bool IsMCPTool(const FString& Name) const { return McpToolNameSet.Contains(Name); }
+	void RebuildToolNameSet();
+
 	// Delegates
 	FOnMCPConnected OnConnected;
 	FOnMCPDisconnected OnDisconnected;
@@ -68,4 +72,5 @@ private:
 	FString McpSessionId; // from Mcp-Session-Id response header
 
 	TArray<TSharedPtr<FJsonObject>> Tools;
+	TSet<FString> McpToolNameSet;
 };

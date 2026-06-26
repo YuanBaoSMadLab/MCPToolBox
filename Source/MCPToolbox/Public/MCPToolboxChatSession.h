@@ -61,6 +61,7 @@ public:
 	FMCPToolboxChatSession* GetSessionById(const FString& SessionId) const;
 	
 	void SaveSession(FMCPToolboxChatSession& Session);
+	void SaveCurrentSession();
 	void LoadAllSessions();
 	
 	void AddMessageToCurrentSession(const FMCPToolboxChatMessage& Message);

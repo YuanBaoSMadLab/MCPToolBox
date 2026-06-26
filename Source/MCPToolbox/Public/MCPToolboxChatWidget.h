@@ -3,6 +3,7 @@
 #include <memory>
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
+#include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SComboBox.h"
@@ -92,7 +93,7 @@ private:
 	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message);
 	
 	/** Create a message bubble widget and optionally return the content text box for streaming updates */
-	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBox);
+	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<STextBlock>& OutTextBlock);
 
 	/** Generate a row for the session list view */
 	TSharedRef<ITableRow> GenerateSessionRow(TSharedPtr<FString> SessionId, const TSharedRef<STableViewBase>& OwnerTable);
@@ -258,6 +259,9 @@ private:
 	/** Cached JSON representations of Messages (built once, reused in OnSendMessage) */
 	TArray<TSharedPtr<FJsonValue>> CachedMessagesJson;
 
+	/** Cached MCP tool descriptions as Markdown — injected into system prompt to avoid repeated queries */
+	FString CachedMCPToolDescriptionsMD;
+
 	/** Scroll box for the chat area (to auto-scroll on new messages) */
 	TSharedPtr<SScrollBox> ChatScrollBox;
 
@@ -307,7 +311,7 @@ private:
 	TSharedPtr<STextBlock> StreamingTextBlock;
 
 	/** Multi-line text box for the streaming message (to update in place) */
-	TSharedPtr<SMultiLineEditableTextBox> StreamingMessageBox;
+	TSharedPtr<STextBlock> StreamingMessageBox;
 
 	/** Local FunctionTable for tool registration */
 	TUniquePtr<assistant::FunctionTable> ToolFunctionTable;

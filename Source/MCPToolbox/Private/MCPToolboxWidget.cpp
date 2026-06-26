@@ -335,13 +335,13 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateAPIManagementTab()
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("Step3", "3. 填写API密钥"))
+				.Text(LOCTEXT("Step3", "3. 填写API密钥（本地模型可选）"))
 				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
 			[
 				SAssignNew(APIKeyInput, SEditableTextBox)
-				.HintText(LOCTEXT("APIKeyHint", "sk-xxxxxxxxxxxxxxxx"))
+				.HintText(LOCTEXT("APIKeyHint", "sk-xxxxxxxxxxxxxxxx（本地模型可留空）"))
 				.IsPassword_Lambda([]() { return true; })
 			]
 
@@ -518,13 +518,6 @@ FReply SMCPToolboxWidget::OnAddEntry()
 	FString ApiKey;
 	if (APIKeyInput.IsValid())
 		ApiKey = APIKeyInput->GetText().ToString().TrimStartAndEnd();
-	if (ApiKey.IsEmpty())
-	{
-		FNotificationInfo Info(LOCTEXT("NoKey", "请填写API密钥"));
-		Info.ExpireDuration = 3.0f;
-		FSlateNotificationManager::Get().AddNotification(Info);
-		return FReply::Handled();
-	}
 
 	FMCPToolboxAPIManager::Get().AddEntry(CurrentProviderId, ModelId, ApiKey);
 

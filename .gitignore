@@ -4,6 +4,10 @@ AuxiliaryModule/
 # BuildPlugin packaging symlink
 Resources/
 
+# Keep generated MCP tool docs
+!Resources/mcp-tools/
+!Resources/mcp-tools/**
+
 # Build outputs
 Binaries/
 Intermediate/

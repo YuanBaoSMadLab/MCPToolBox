@@ -1,0 +1,234 @@
+{
+  "ToolsetRegistry.AgentSkillToolset": [
+    {
+      "name": "UpdateSkill",
+      "desc": "更新现有AgentSkill。\n这应该只在获得用户的明确指示或许可后才调用。"
+    },
+    {
+      "name": "ListSkills",
+      "desc": "获取项目中所有AgentSkills的摘要。"
+    },
+    {
+      "name": "GetSkills",
+      "desc": "返回关于特定AgentSkills集的详细信息。"
+    },
+    {
+      "name": "CreateSkill",
+      "desc": "创建一个新的AgentSkill。\n这应该只在获得用户的明确指示或许可后才调用。"
+    }
+  ],
+  "GameFeaturesToolset.GameFeaturesToolset": [
+    {
+      "name": "RequestDeactivateGameFeature",
+      "desc": "请求停用游戏功能插件。\n如果停用请求成功提交，则返回true。实际的停用\n是异步发生的——轮询GetGameFeatureState()以确认完成。\n如果子系统不可用或未找到插件，则会引发错误。"
+    },
+    {
+      "name": "RequestActivateGameFeature",
+      "desc": "请求激活游戏功能插件。\n如果激活请求成功提交，则返回true。实际激活是异步\n发生的——通过轮询GetGameFeatureState()或IsGameFeatureActive()来确认完成。如果子系统不可用或未找到插件，\n则会引发错误。"
+    },
+    {
+      "name": "ListEnabledGameFeaturePlugins",
+      "desc": "列出所有已启用的游戏功能插件，按名称排序。除了判断一个插件是否为\n游戏功能插件之外，已启用的插件是游戏功能系统唯一了解的插件。\n使用插件工具集执行常规插件启用/禁用任务。"
+    },
+    {
+      "name": "ListDiscoveredGameFeaturePlugins",
+      "desc": "列出所有已发现的游戏功能插件，按名称排序。这包括已启用和已禁用的\n插件。除了判断一个插件是否为\n游戏功能插件之外，游戏功能系统只了解已启用的插件。\n使用插件工具集执行常规插件启用/禁用任务。"
+    },
+    {
+      "name": "IsGameFeaturePlugin",
+      "desc": "返回插件是否为游戏功能插件。如果插件管理器找不到此\n名称的插件，将会报错。"
+    },
+    {
+      "name": "IsGameFeatureActive",
+      "desc": "检查游戏功能插件是否处于激活状态。如果子系统不可用或未找到插件，\n则会引发错误。\n如果需要在插件未激活时获取当前状态，请使用GetGameFeatureState。"
+    },
+    {
+      "name": "GetGameFeatureState",
+      "desc": "获取游戏功能插件的当前状态。"
+    }
+  ],
+  "EditorToolset.EditorAppToolset": [
+    {
+      "name": "WorldPosToScreenCoords",
+      "desc": "基于编辑器视口摄像机，将世界空间位置转换为归一化的屏幕空间坐标。"
+    },
+    {
+      "name": "StopPIE",
+      "desc": "停止当前运行的游戏会话（PIE或模拟）。\n如果没有正在运行的游玩会话，则会引发错误。"
+    },
+    {
+      "name": "StartPIE",
+      "desc": "开始一个使用当前关卡的Play-In-Editor或Simulate-In-Editor会话。在引擎触发PostPIEStarted（会话已完全启动，\nBeginPlay已调用）之后完成，并在 Options.WarmupSeconds经过后生效，从而在代理检查状态或记录日志之前，为项目\n特定的初始化（如服务、认证、插件预热）\n提供稳定的收尾时间。\n如果游戏会话已在运行，则会引发错误。"
+    },
+    {
+      "name": "SetContentBrowserPath",
+      "desc": "将活动的内容浏览器导航到指定的文件夹路径。"
+    },
+    {
+      "name": "SetCameraTransform",
+      "desc": "设置关卡视口摄像机的位置和旋转。"
+    },
+    {
+      "name": "SelectAssets",
+      "desc": "在内容浏览器中选择指定资产。\n内容浏览器应用该选项后即为完成。"
+    },
+    {
+      "name": "SelectActors",
+      "desc": "选择当前场景中的指定Actor。"
+    },
+    {
+      "name": "SearchCVars",
+      "desc": "查找所有包含给定名称的控制台变量。"
+    },
+    {
+      "name": "ScreenCoordsToWorld",
+      "desc": "在给定的归一化视图空间坐标处，找到最近实心Object的世界位置。"
+    },
+    {
+      "name": "OpenEditorForAsset",
+      "desc": "为指定资产打开资产编辑器。"
+    },
+    {
+      "name": "IsPIERunning",
+      "desc": "返回当前是否正在运行编辑器会话。"
+    },
+    {
+      "name": "GetVisibleActors",
+      "desc": "返回当前关卡中边界与视口视锥体相交的所有Actor。"
+    },
+    {
+      "name": "GetSelectedAssets",
+      "desc": "获取在内容浏览器中选择的资产列表。"
+    },
+    {
+      "name": "GetSelectedActors",
+      "desc": "获取关卡编辑器中当前选定的Actor。"
+    },
+    {
+      "name": "GetOpenAssets",
+      "desc": "获取当前在资产编辑器中打开的资产列表。"
+    },
+    {
+      "name": "GetContentBrowserPath",
+      "desc": "获取激活的内容浏览器的当前路径。"
+    },
+    {
+      "name": "GetCameraTransform",
+      "desc": "返回关卡视口摄像机的位置和旋转。"
+    },
+    {
+      "name": "FocusOnActors",
+      "desc": "重新定位关卡编辑器摄像机，使其聚焦于指定Actor。\nPIE激活时无法调用。"
+    },
+    {
+      "name": "CaptureViewport",
+      "desc": "捕获带可选注释的关卡视口。\n\n注释渲染在可见Actor上叠加一个投影的3D世界空间网格，\n以及名称和位置标签。网格绘制在可配置的\n地面平面Z处，并通过摄像机投影，交点处\n有坐标数字（以米为单位显示）。每个带标签的Actor在其\n投影的屏幕位置处得到一个准星，并放置一个引导线标注以避免重叠。这赋予了\n具备视觉能力的代理空间感知能力：它可以引用网格\n坐标来指导放置，并通过标签识别场景内容。"
+    },
+    {
+      "name": "CaptureEditorImage",
+      "desc": "捕获整个编辑器应用程序的用户可见图像。"
+    },
+    {
+      "name": "CaptureAssetImage",
+      "desc": "为指定资产渲染缩略图（例如静态网格体、骨骼网格体、\n骨架、动画、蒙太奇、材质、纹理）。"
+    }
+  ],
+  "EditorToolset.LogsToolset": [
+    {
+      "name": "SetVerbosity",
+      "desc": "设置日志类别的冗长度级别。"
+    },
+    {
+      "name": "GetVerbosity",
+      "desc": "返回日志类别的当前冗长度级别。"
+    },
+    {
+      "name": "GetLogEntries",
+      "desc": "返回来自当前会话的日志文件的日志条目。"
+    },
+    {
+      "name": "GetLogCategories",
+      "desc": "返回已注册日志类别的排序列表。"
+    }
+  ],
+  "PhysicsToolsets.PhysicsAssetToolset": [
+    {
+      "name": "SetSphere",
+      "desc": "在形体上添加或替换Sphere碰撞图元。\n如果形体上已存在拥有给定名称的任何形状，则先将其移除。"
+    },
+    {
+      "name": "SetConstraintLimits",
+      "desc": "更新现有约束的角限制。"
+    },
+    {
+      "name": "SetCapsule",
+      "desc": "在形体上添加或替换胶囊体碰撞图元。\n如果形体上已存在拥有给定名称的任何形状，则先将其移除。\n应用旋转之后，胶囊体的长轴是其局部Z轴。"
+    },
+    {
+      "name": "SetBox",
+      "desc": "在形体上添加或替换盒体碰撞图元。\n如果形体上已存在拥有给定名称的任何形状，则先将其移除。"
+    },
+    {
+      "name": "SetBodyPhysicsMode",
+      "desc": "设置给定形体的物理模拟模式。"
+    },
+    {
+      "name": "SetBodyMassScale",
+      "desc": "设置给定形体的质量比例乘数。"
+    },
+    {
+      "name": "RemoveShape",
+      "desc": "按名称从形体中移除碰撞图元。"
+    },
+    {
+      "name": "RemoveConstraint",
+      "desc": "移除两个形体之间的约束。"
+    },
+    {
+      "name": "RemoveBody",
+      "desc": "移除给定骨骼的形体以及引用它的所有约束。\n如果PhysicsAsset为空或BoneName不存在形体，则引发脚本错误。"
+    },
+    {
+      "name": "GetConstraints",
+      "desc": "返回物理资产中的所有约束及其当前角限制。"
+    },
+    {
+      "name": "GetBodyShapes",
+      "desc": "返回分配给形体的所有碰撞形状。"
+    },
+    {
+      "name": "GetBodyPhysicsMode",
+      "desc": "返回给定形体的物理模拟模式。"
+    },
+    {
+      "name": "GetBodyNames",
+      "desc": "返回物理资产中每个刚体的骨骼名称。"
+    },
+    {
+      "name": "GetBodyMassScale",
+      "desc": "返回给定形体的质量缩放倍数。"
+    },
+    {
+      "name": "CreateFromMesh",
+      "desc": "从骨骼网格体创建物理资产，为每个骨骼自动生成\n碰撞体。资产放置在与网格体相同的文件夹中，后缀为\n“_PhysicsAsset”。"
+    },
+    {
+      "name": "AddConstraint",
+      "desc": "在两个形体之间添加一个新约束。两个形体必须已经存在。"
+    },
+    {
+      "name": "AddBody",
+      "desc": "为给定骨骼添加一个新的空形体。"
+    }
+  ],
+  "editor_toolset.toolsets.programmatic.ProgrammaticToolset": [
+    {
+      "name": "execute_tool_script",
+      "desc": "Execute a Python script against the toolset APIs.\n\n        Use this to batch multiple tool calls into a single script execution,\n        reducing round-trips and context usage.\n\n        IMPORTANT: Available modules and usage instructions are described by the\n        value returned by `get_execution_environment`. You MUST call\n        `get_execution_environment` once in the conversation before using this\n        tool. Read the value in the `instructions` field in the returned\n        environment info prior to calling this function, so that you understand\n        what APIs are available and how to use them.\n\n        Before writing a script that calls multiple tools, look up the output\n        schemas (if available) for any tools you plan to use. This returns the\n        JSON schema describing each tool's return value, so you know how to\n        parse results and pass data between calls.\n\n        Args:\n            script: Python script to execute. Must define a `run()` function\n                that returns a `Dict[str, Any]`.\n\n        Returns:\n            JSON-encoded dict returned by the script's `run()` function.\n\n        Raises:\n            SyntaxError: If the script has invalid syntax.\n            ValueError: If the script imports a disallowed module or does not\n                define a `run()` function.\n            TypeError: If `run()` does not return a dict.\n            Exception: Any unhandled exception raised by the script."
+    },
+    {
+      "name": "get_execution_environment",
+      "desc": "Get details about execution environment.\n\n        This includes instructions on how to write scripts, and constraints,\n        such as what modules may be imported and the script entrypoint and\n        function signature.\n\n        Returns:\n            Returns the current execution environment."
+    }
+  ]
+}

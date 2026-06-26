@@ -262,11 +262,11 @@ void SMCPToolboxChatWidget::AddMessage(const FMCPToolboxChatMessage& Message)
 // ============================================================================
 TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message)
 {
-	TSharedPtr<SMultiLineEditableTextBox> Dummy;
+	TSharedPtr<STextBlock> Dummy;
 	return CreateMessageBubble(Message, Dummy);
 }
 
-TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBox)
+TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<STextBlock>& OutTextBlock)
 {
 	FLinearColor BgColor = GetMessageColor(Message.Role);
 	FString RoleLabel;
@@ -290,9 +290,8 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 		bool bIsResult = Message.Role == EMCPToolboxMessageRole::System;
 		if (DisplayContent.Len() > 500) DisplayContent = DisplayContent.Left(500) + TEXT("...");
 
-		TSharedPtr<SMultiLineEditableTextBox> TextBox;
+		TSharedPtr<STextBlock> TextBlock;
 		auto Result = SNew(SBox)
-			.MaxDesiredWidth(700)
 			.HAlign(HAlign_Left)
 			[
 				SNew(SBorder)
@@ -327,23 +326,21 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 4, 0, 0))
 					[
-						SAssignNew(TextBox, SMultiLineEditableTextBox)
+						SAssignNew(TextBlock, STextBlock)
 						.Text(FText::FromString(DisplayContent))
-						.IsReadOnly(true)
-						.BackgroundColor(FLinearColor::Transparent)
 						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
 						.AutoWrapText(true)
+						.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
 					]
 				]
 			];
-		OutTextBox = TextBox;
+		OutTextBlock = TextBlock;
 		return Result;
 	}
 
-	TSharedPtr<SMultiLineEditableTextBox> TextBox;
+	TSharedPtr<STextBlock> TextBlock;
 	auto Result = SNew(SBox)
 		.HAlign(bAlignRight ? HAlign_Right : HAlign_Left)
-		.MaxDesiredWidth(700)
 		[
 			SNew(SBorder)
 			.BorderBackgroundColor(BgColor)
@@ -369,16 +366,15 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 6, 0, 0))
 				[
-					SAssignNew(TextBox, SMultiLineEditableTextBox)
+					SAssignNew(TextBlock, STextBlock)
 					.Text(FText::FromString(DisplayContent))
-					.IsReadOnly(true)
-					.BackgroundColor(FLinearColor::Transparent)
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 10))
 					.AutoWrapText(true)
+					.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
 				]
 			]
 		];
-	OutTextBox = TextBox;
+	OutTextBlock = TextBlock;
 	return Result;
 }
 
@@ -589,15 +585,8 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 	// analyze images locally and replace with text descriptions
 	auto DoPruneAndSend = [this, &AuxMgr](const TArray<TSharedPtr<FJsonValue>>& ProcessedMessages)
 	{
-		if (AuxMgr.IsReady() && ProcessedMessages.Num() > 15)
-		{
-			ApplyPruningBeforeSend(ProcessedMessages,
-				[this](const TArray<TSharedPtr<FJsonValue>>& PrunedMessages)
-			{
-				SendAIRequestInternal(PrunedMessages);
-			});
-			return;
-		}
+		// SWE-Pruner disabled: 2B model too weak for yes/no relevance, always returns all-yes.
+		// Keep code for future model upgrade. Skip pruning, go directly to send.
 		SendAIRequestInternal(ProcessedMessages);
 	};
 
@@ -904,14 +893,14 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			FMCPToolboxChatMessage* StreamPtr = &Messages.Last();
 			
 			// Add the message bubble to the chat area and get the text box reference
-			TSharedPtr<SMultiLineEditableTextBox> TextBox;
+			TSharedPtr<STextBlock> TextBlock;
 			if (ChatScrollBox.IsValid())
 			{
-				TSharedRef<SWidget> Bubble = CreateMessageBubble(*StreamPtr, TextBox);
+				TSharedRef<SWidget> Bubble = CreateMessageBubble(*StreamPtr, TextBlock);
 				ChatScrollBox->AddSlot().Padding(FMargin(4))[Bubble];
 				ChatScrollBox->ScrollToEnd();
 			}
-			StreamingMessageBox = TextBox;
+			StreamingMessageBox = TextBlock;
 
 			// Use ticker to progressively show chunks
 			TSharedPtr<int32> ChunkIndex = MakeShareable(new int32(0));
@@ -1403,6 +1392,27 @@ void SMCPToolboxChatWidget::RefreshMCPTools()
 			}
 
 			MergeMCPTools();
+
+			// Build cached MCP tool descriptions markdown — avoids repeated list_toolsets/describe_toolset queries
+			CachedMCPToolDescriptionsMD.Empty();
+			if (DiscoveredTools.Num() > 0)
+			{
+				CachedMCPToolDescriptionsMD += TEXT("## 已发现MCP工具\n\n");
+				CachedMCPToolDescriptionsMD += TEXT("以下工具已可用，直接调用 call_tool 即可。\n\n");
+				for (const auto& Tool : DiscoveredTools)
+				{
+					FString Name, Desc;
+					Tool->TryGetStringField(TEXT("name"), Name);
+					if (const TSharedPtr<FJsonObject>* Schema; Tool->TryGetObjectField(TEXT("inputSchema"), Schema))
+						(*Schema)->TryGetStringField(TEXT("description"), Desc);
+					if (Name.IsEmpty()) continue;
+					CachedMCPToolDescriptionsMD += FString::Printf(TEXT("- **%s**"), *Name);
+					if (!Desc.IsEmpty())
+						CachedMCPToolDescriptionsMD += FString::Printf(TEXT(": %s"), *Desc);
+					CachedMCPToolDescriptionsMD += TEXT("\n");
+				}
+				UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] MCP tool cache built (%d tools, %d chars)"), DiscoveredTools.Num(), CachedMCPToolDescriptionsMD.Len());
+			}
 		});
 }
 
@@ -1496,7 +1506,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("3. **非工具不可**：创建材质/执行命令/截图/选择Actor—这些操作必须且只能通过工具完成\n");
 	Prompt += TEXT("4. **工具参数必填且正确**：路径加/Game/前缀，命令写完整\n");
 	Prompt += TEXT("5. **🚫 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
-	Prompt += TEXT("6. **MCP是唯一正途**：本插件的核心功能就是MCP集成。所有UE编辑器操作必须通过 list_toolsets → describe_toolset → call_tool 链路完成。\n");
+	Prompt += TEXT("6. **MCP工具已就绪**：启动时已自动发现所有MCP工具集和工具（见下方'已发现MCP工具'列表）。直接通过 call_tool 调用，无需再 list_toolsets/describe_toolset。\n");
 	Prompt += TEXT("7. **command仅限控制台命令**：command只用于 HighResShot、stat fps 等纯控制台命令，绝不用于Python脚本。\n");
 	Prompt += TEXT("8. **主动记忆**：每次对话后，用\"记住：xxx\"保存MCP工具使用经验和用户偏好。\n");
 	Prompt += TEXT("9. **👁 视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
@@ -1516,15 +1526,13 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("   - 任务ID：使用 t1, t2, t3... 作为任务标识，在参数中用 $tN.field 引用\n\n");
 
 	Prompt += TEXT("## 工具优先级（从高到低，严格按此顺序）\n");
-	Prompt += TEXT("1. **MCP工具**：list_toolsets → describe_toolset → call_tool（唯一正途！）\n");
+	Prompt += TEXT("1. **MCP call_tool（直接调用！）**：工具已在下方列出，直接用 call_tool 调用。多个独立调用时一次性批量发出（多个tool_calls）\n");
 	Prompt += TEXT("2. **本地工具**：screenshot, select, inspect\n");
 	Prompt += TEXT("3. **command**：仅限控制台命令(HighResShot, stat等)，🚫禁止py脚本\n\n");
 
 	Prompt += TEXT("## 工具列表\n");
-	Prompt += TEXT("### MCP工具（必须优先使用）\n");
-	Prompt += TEXT("- **list_toolsets** — 列出所有可用工具集。MCP连接后第一时间调用。\n");
-	Prompt += TEXT("- **describe_toolset** — 查看工具集的工具列表和参数。参数: toolset_name (string)\n");
-	Prompt += TEXT("- **call_tool** — 调用MCP工具。参数: toolset_name (string), tool_name (string), arguments (object)\n");
+	Prompt += TEXT("### MCP工具（直接调用，无需发现）\n");
+	Prompt += TEXT("- **call_tool** — 调用MCP工具。参数: toolset_name (string), tool_name (string), arguments (object)。工具集和工具名见下方'已发现MCP工具'列表\n");
 	Prompt += TEXT("### 本地高效工具（优先使用，节省时间）\n");
 	Prompt += TEXT("- **batch_read_files** — ⚡ 批量读取多个文件。参数: file_paths (array of strings)。**读取多个文件时必须用这个，禁止逐个读**\n");
 	Prompt += TEXT("- **search_codebase** — ⚡ 搜索整个代码库。参数: pattern (string), path (可选), file_pattern (可选,默认*.cpp,*.h), max_results (可选,默认50)。**找代码先用这个**\n");
@@ -1534,6 +1542,13 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("- **screenshot** — 截取屏幕图片，你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
 	Prompt += TEXT("- **select** — 选择Actor。参数: name (string)\n");
 	Prompt += TEXT("- **inspect** — 检查选中Actor属性\n");
+
+	// Inject cached MCP tool descriptions (built once, avoids repeated list_toolsets queries)
+	if (!CachedMCPToolDescriptionsMD.IsEmpty())
+	{
+		Prompt += TEXT("\n");
+		Prompt += CachedMCPToolDescriptionsMD;
+	}
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
 	Prompt += TEXT("- **command** — 🚫 禁止用于py脚本。仅限纯控制台命令。\n\n");
 
@@ -1609,9 +1624,9 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			Height = FMath::Clamp(Height, 240, 1080);
 
 			FString Base64Image;
-			if (Mode == "desktop" || Mode == "fullscreen")
+			if (Mode == TEXT("desktop") || Mode == TEXT("fullscreen"))
 			{
-				Base64Image = ScreenshotModule.CaptureScreenshot(true, false, Width, Height);
+				Base64Image = ScreenshotModule.CaptureFullDesktop();
 			}
 			else
 			{

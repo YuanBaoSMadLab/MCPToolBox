@@ -7,6 +7,8 @@
 #include "MCPToolboxAPIManager.h"
 #include "MCPToolboxSettings.h"
 #include "MCPToolboxMemoryManager.h"
+#include "MCPToolboxChatSession.h"
+#include "MCPToolboxAuxModelManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Layout/SSpacer.h"
@@ -29,12 +31,7 @@
 DEFINE_LOG_CATEGORY(LogMCPToolbox);
 
 bool FMCPToolboxModule::bMCPServerStarted = false;
-
-// ============================================================================
-// Static Helpers
-// ============================================================================
-
-static const FName MCPToolboxTabName("MCPToolbox");
+const FName FMCPToolboxModule::MCPToolboxTabName("MCPToolbox");
 
 // ============================================================================
 // FMCPToolboxModule::StartupModule
@@ -69,6 +66,21 @@ void FMCPToolboxModule::StartupModule()
 	// Step 6: Register menu entry
 	RegisterMenuEntry();
 
+	// Step 7: Register tab spawner (deferred via OnRegisterTabs — TabManager may not be ready during PostEngineInit)
+	if (FModuleManager::Get().IsModuleLoaded("LevelEditor"))
+	{
+		FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
+		OnRegisterTabsHandle = LevelEditorModule.OnRegisterTabs().AddLambda([this](TSharedPtr<FTabManager>)
+		{
+			RegisterTabSpawner();
+		});
+		UE_LOG(LogMCPToolbox, Log, TEXT("Tab spawner registration deferred via OnRegisterTabs"));
+	}
+	else
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("LevelEditor not loaded, cannot register tab spawner"));
+	}
+
 	bIsInitialized = true;
 
 	UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox Module Started Successfully"));
@@ -82,15 +94,31 @@ void FMCPToolboxModule::ShutdownModule()
 {
 	UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox Module Shutting Down..."));
 
-	// Close the window if it is open
-	if (MCPToolboxWindow.IsValid())
-	{
-		MCPToolboxWindow->RequestDestroyWindow();
-		MCPToolboxWindow.Reset();
-	}
+	// Save current session before shutdown
+	FMCPToolboxChatSessionManager::Get().SaveCurrentSession();
+	FMCPToolboxAuxModelManager::Get().StopServer();
 
 	// Clean up the widget
 	MCPToolboxWidget.Reset();
+
+	// Unregister tab spawner
+	if (FModuleManager::Get().IsModuleLoaded("LevelEditor"))
+	{
+		FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
+		
+		// Remove deferred registration delegate
+		if (OnRegisterTabsHandle.IsValid())
+		{
+			LevelEditorModule.OnRegisterTabs().Remove(OnRegisterTabsHandle);
+			OnRegisterTabsHandle.Reset();
+		}
+
+		TSharedPtr<FTabManager> TabManager = LevelEditorModule.GetLevelEditorTabManager();
+		if (TabManager.IsValid())
+		{
+			TabManager->UnregisterTabSpawner(MCPToolboxTabName);
+		}
+	}
 
 	// Unregister commands
 	FMCPToolboxCommands::Unregister();
@@ -128,57 +156,49 @@ void FMCPToolboxModule::ShutdownModule()
 }
 
 // ============================================================================
-// FMCPToolboxModule::CreateMCPToolboxWindow
+// FMCPToolboxModule::RegisterTabSpawner
 // ============================================================================
 
-TSharedPtr<SWindow> FMCPToolboxModule::CreateMCPToolboxWindow()
+void FMCPToolboxModule::RegisterTabSpawner()
 {
-	if (MCPToolboxWindow.IsValid())
+	if (!FModuleManager::Get().IsModuleLoaded("LevelEditor"))
 	{
-		// Window already exists, bring it to front
-		MCPToolboxWindow->BringToFront();
-		return MCPToolboxWindow;
+		UE_LOG(LogMCPToolbox, Warning, TEXT("LevelEditor module not loaded, cannot register tab spawner"));
+		return;
 	}
 
-	// Load window dimensions from settings
-	const UMCPToolboxSettings* Settings = GetDefault<UMCPToolboxSettings>();
-	int32 WindowWidth = Settings ? Settings->WindowWidth : 800;
-	int32 WindowHeight = Settings ? Settings->WindowHeight : 600;
+	FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
+	TSharedPtr<FTabManager> TabManager = LevelEditorModule.GetLevelEditorTabManager();
+	
+	if (!TabManager.IsValid())
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("Level editor tab manager not available"));
+		return;
+	}
 
+	TabManager->RegisterTabSpawner(MCPToolboxTabName, FOnSpawnTab::CreateRaw(this, &FMCPToolboxModule::OnSpawnMCPToolboxTab))
+		.SetDisplayName(LOCTEXT("MCPToolbox_TabTitle", "MCP Toolbox"))
+		.SetTooltipText(LOCTEXT("MCPToolbox_TabTooltip", "Open MCP Toolbox AI Assistant"))
+		.SetIcon(FSlateIcon(FMCPToolboxStyle::GetStyleSetName(), "MCPToolbox.OpenMCPToolboxWindow"));
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("Tab spawner registered"));
+}
+
+// ============================================================================
+// FMCPToolboxModule::OnSpawnMCPToolboxTab
+// ============================================================================
+
+TSharedRef<SDockTab> FMCPToolboxModule::OnSpawnMCPToolboxTab(const FSpawnTabArgs& Args)
+{
 	// Create the main widget
 	SAssignNew(MCPToolboxWidget, SMCPToolboxWidget);
 
-	// Create the window
-	TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(LOCTEXT("MCPToolbox_WindowTitle", "MCP Toolbox"))
-		.ClientSize(FVector2D(WindowWidth, WindowHeight))
-		.SupportsMaximize(true)
-		.SupportsMinimize(true)
-		.SizingRule(ESizingRule::UserSized)
-		.IsTopmostWindow(false)
+	return SNew(SDockTab)
+		.TabRole(ETabRole::PanelTab)
+		.Label(LOCTEXT("MCPToolbox_TabTitle", "MCP Toolbox"))
 		[
 			MCPToolboxWidget.ToSharedRef()
 		];
-
-	// Store the window reference in the widget
-	MCPToolboxWidget->SetParentWindow(Window);
-
-	// Add the window to the slate application
-	FSlateApplication::Get().AddWindow(Window);
-
-	// Register for window closed notification
-	Window->GetOnWindowClosedEvent().AddLambda([this](const TSharedRef<SWindow>&)
-	{
-		MCPToolboxWindow.Reset();
-		MCPToolboxWidget.Reset();
-		UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox window closed"));
-	});
-
-	MCPToolboxWindow = Window;
-
-	UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox window created (%dx%d)"), WindowWidth, WindowHeight);
-
-	return Window;
 }
 
 // ============================================================================
@@ -193,7 +213,16 @@ void FMCPToolboxModule::OpenMCPToolboxWindow()
 		return;
 	}
 
-	CreateMCPToolboxWindow();
+	if (!FModuleManager::Get().IsModuleLoaded("LevelEditor"))
+		return;
+
+	FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
+	TSharedPtr<FTabManager> TabManager = LevelEditorModule.GetLevelEditorTabManager();
+	
+	if (TabManager.IsValid())
+	{
+		TabManager->TryInvokeTab(MCPToolboxTabName);
+	}
 }
 
 // ============================================================================
@@ -208,24 +237,7 @@ void FMCPToolboxModule::ToggleMCPToolboxWindow()
 		return;
 	}
 
-	if (MCPToolboxWindow.IsValid())
-	{
-		if (MCPToolboxWindow->IsVisible())
-		{
-			MCPToolboxWindow->HideWindow();
-			UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox window hidden"));
-		}
-		else
-		{
-			MCPToolboxWindow->ShowWindow();
-			MCPToolboxWindow->BringToFront();
-			UE_LOG(LogMCPToolbox, Log, TEXT("MCPToolbox window shown"));
-		}
-	}
-	else
-	{
-		CreateMCPToolboxWindow();
-	}
+	OpenMCPToolboxWindow();
 }
 
 // ============================================================================
