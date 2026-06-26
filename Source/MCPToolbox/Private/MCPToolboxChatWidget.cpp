@@ -625,22 +625,49 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 
-	// Local VL preprocessing: if vision mode is OFF and aux VL is available,
-	// analyze images locally and replace with text descriptions
-	auto DoPruneAndSend = [this, &AuxMgr](const TArray<TSharedPtr<FJsonValue>>& ProcessedMessages)
-	{
-		// SWE-Pruner disabled: 2B model too weak for yes/no relevance, always returns all-yes.
-		// Keep code for future model upgrade. Skip pruning, go directly to send.
-		SendAIRequestInternal(ProcessedMessages);
-	};
+	// ── Determine if current model supports vision ──
+	const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+	bool bModelSupportsVision = ActiveEntry &&
+		(ActiveEntry->ProviderId == TEXT("openai") ||
+		 ActiveEntry->ProviderId == TEXT("google") ||
+		 ActiveEntry->ProviderId == TEXT("anthropic"));
 
-	if (!bVisionModeEnabled && AuxMgr.IsReady())
+	// Auto-fallback: vision ON but model doesn't support images → preprocess locally
+	bool bNeedLocalVL = (bVisionModeEnabled && !bModelSupportsVision) || (!bVisionModeEnabled && AuxMgr.IsReady());
+	bool bHasImages = false;
+
+	for (const auto& V : ApiMessages)
 	{
-		PreprocessImagesLocally(ApiMessages, DoPruneAndSend);
+		TSharedPtr<FJsonObject> Obj = V->AsObject();
+		if (!Obj.IsValid()) continue;
+		const TArray<TSharedPtr<FJsonValue>>* Content;
+		if (Obj->TryGetArrayField(TEXT("content"), Content))
+		{
+			for (const auto& C : *Content)
+			{
+				TSharedPtr<FJsonObject> CObj = C->AsObject();
+				if (CObj.IsValid())
+				{
+					FString Type;
+					if (CObj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("image_url"))
+						{ bHasImages = true; break; }
+				}
+			}
+		}
+		if (bHasImages) break;
+	}
+
+	if (bNeedLocalVL && bHasImages)
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Auto-preprocessing images: vision=%s, model_supports_vision=%s"),
+			bVisionModeEnabled ? TEXT("ON") : TEXT("OFF"),
+			bModelSupportsVision ? TEXT("yes") : TEXT("no"));
+		PreprocessImagesLocally(ApiMessages,
+			[this](const TArray<TSharedPtr<FJsonValue>>& Processed) { SendAIRequestInternal(Processed); });
 		return;
 	}
 
-	DoPruneAndSend(ApiMessages);
+	SendAIRequestInternal(ApiMessages);
 }
 
 void SMCPToolboxChatWidget::SendAIRequestInternal(const TArray<TSharedPtr<FJsonValue>>& ApiMessages)
@@ -3124,11 +3151,11 @@ void SMCPToolboxChatWidget::PreprocessImagesLocally(
 {
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 
-	// Find the last user message with image content
-	int32 TargetIdx = -1;
-	FString Base64Data;
+	// ── Step 1: Collect ALL messages with image_url (not just the last one) ──
+	struct FImageTarget { int32 Index; FString Base64; FString UserText; };
+	TArray<FImageTarget> Targets;
 
-	for (int32 i = Msgs.Num() - 1; i >= 0; --i)
+	for (int32 i = 0; i < Msgs.Num(); ++i)
 	{
 		TSharedPtr<FJsonObject> Obj = Msgs[i]->AsObject();
 		FString Role;
@@ -3136,66 +3163,109 @@ void SMCPToolboxChatWidget::PreprocessImagesLocally(
 		if (Role != TEXT("user")) continue;
 
 		const TArray<TSharedPtr<FJsonValue>>* Arr;
-		if (Obj->TryGetArrayField(TEXT("content"), Arr))
+		if (!Obj->TryGetArrayField(TEXT("content"), Arr)) continue;
+
+		for (const auto& Part : *Arr)
 		{
-			for (const auto& Part : *Arr)
+			TSharedPtr<FJsonObject> PartObj = Part->AsObject();
+			if (!PartObj.IsValid()) continue;
+			FString Type;
+			if (PartObj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("image_url"))
 			{
-				TSharedPtr<FJsonObject> PartObj = Part->AsObject();
-				if (!PartObj.IsValid()) continue;
-				FString Type;
-				if (PartObj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("image_url"))
+				FImageTarget Target;
+				Target.Index = i;
+				const TSharedPtr<FJsonObject>* ImgUrlObj = nullptr;
+				if (PartObj->TryGetObjectField(TEXT("image_url"), ImgUrlObj) && ImgUrlObj)
 				{
-					TargetIdx = i;
-					const TSharedPtr<FJsonObject>* ImgUrlObj = nullptr;
-					if (PartObj->TryGetObjectField(TEXT("image_url"), ImgUrlObj) && ImgUrlObj)
-					{
-						FString URL;
-						(*ImgUrlObj)->TryGetStringField(TEXT("url"), URL);
-						int32 Comma = URL.Find(TEXT("base64,"));
-						Base64Data = (Comma != INDEX_NONE) ? URL.Mid(Comma + 7) : URL;
-					}
-					break;
+					FString URL;
+					(*ImgUrlObj)->TryGetStringField(TEXT("url"), URL);
+					int32 Comma = URL.Find(TEXT("base64,"));
+					Target.Base64 = (Comma != INDEX_NONE) ? URL.Mid(Comma + 7) : URL;
 				}
+				// Also capture text part
+				for (const auto& TP : *Arr)
+				{
+					TSharedPtr<FJsonObject> TPObj = TP->AsObject();
+					if (!TPObj.IsValid()) continue;
+					FString TType;
+					if (TPObj->TryGetStringField(TEXT("type"), TType) && TType == TEXT("text"))
+						TPObj->TryGetStringField(TEXT("text"), Target.UserText);
+				}
+				Targets.Add(Target);
+				break;
 			}
 		}
-		if (TargetIdx >= 0) break;
 	}
 
-	if (TargetIdx < 0 || Base64Data.IsEmpty())
+	if (Targets.Num() == 0)
 	{
 		if (OnDone) OnDone(Msgs);
 		return;
 	}
 
-	UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Analyzing image locally (vision OFF, aux VL available)..."));
-	double StartTime = FPlatformTime::Seconds();
+	// ── Step 2: Process each image target sequentially ──
+	TSharedPtr<TArray<TSharedPtr<FJsonValue>>> Modified = MakeShared<TArray<TSharedPtr<FJsonValue>>>(Msgs);
+	TSharedPtr<int32> Remaining = MakeShared<int32>(Targets.Num());
 
-	AuxMgr.AnalyzeImage(Base64Data, TEXT("Please describe this image in detail, including all visible text, UI elements, and important details."),
-		[this, Msgs = TArray<TSharedPtr<FJsonValue>>(Msgs), TargetIdx, OnDone, StartTime](const FString& Description)
+	UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Preprocessing %d images locally (vision OFF)..."), Targets.Num());
+
+	for (const auto& Target : Targets)
 	{
-		double ElapsedSec = FPlatformTime::Seconds() - StartTime;
-		TArray<TSharedPtr<FJsonValue>> Modified(Msgs);
-		if (!Description.IsEmpty())
+		if (Target.Base64.IsEmpty())
 		{
-			// Shallow-copy only the target message and replace its content
-			TSharedPtr<FJsonObject> Target = MakeShareable(new FJsonObject(*Modified[TargetIdx]->AsObject()));
+			// No image data — just strip image_url, keep text only
+			TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject(*(*Modified)[Target.Index]->AsObject()));
+			TArray<TSharedPtr<FJsonValue>> TextOnly;
+			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+			TextPart->SetStringField(TEXT("type"), TEXT("text"));
+			TextPart->SetStringField(TEXT("text"), Target.UserText.IsEmpty() ? TEXT("[Image - no data]") : Target.UserText);
+			TextOnly.Add(MakeShareable(new FJsonValueObject(TextPart)));
+			NewObj->SetArrayField(TEXT("content"), TextOnly);
+			(*Modified)[Target.Index] = MakeShareable(new FJsonValueObject(NewObj));
+			(*Remaining)--;
+			continue;
+		}
+
+		double StartTime = FPlatformTime::Seconds();
+		AuxMgr.AnalyzeImage(Target.Base64,
+			TEXT("Describe what you actually see in this image in detail. Focus on visible objects, people, text, colors, layout. Be specific and objective. Reply in Chinese."),
+			[this, Modified, Target, Remaining, OnDone, StartTime](const FString& Description)
+		{
+			double ElapsedSec = FPlatformTime::Seconds() - StartTime;
+			TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject(*(*Modified)[Target.Index]->AsObject()));
 			TArray<TSharedPtr<FJsonValue>> NewContent;
 			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
 			TextPart->SetStringField(TEXT("type"), TEXT("text"));
-			TextPart->SetStringField(TEXT("text"),
-				FString::Printf(TEXT("[Image description via local VL model (%.1fs)]\n%s"), ElapsedSec, *Description));
-			NewContent.Add(MakeShareable(new FJsonValueObject(TextPart)));
-			Target->SetArrayField(TEXT("content"), NewContent);
-			Modified[TargetIdx] = MakeShareable(new FJsonValueObject(Target));
-			UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Local image analysis complete (%.1fs): %s"), ElapsedSec, *Description.Left(80));
-		}
-		else
-		{
-			UE_LOG(LogMCPToolbox, Warning, TEXT("[VL] Local image analysis failed, falling back to raw message"));
-		}
 
-		if (OnDone) OnDone(Modified);
-	});
+			FString TextContent;
+			if (!Description.IsEmpty())
+			{
+				TextContent = FString::Printf(TEXT("[本地VL图像分析 (%.1fs)]\n%s"), ElapsedSec, *Description);
+				UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Image analyzed (%.1fs): %s"), ElapsedSec, *Description.Left(100));
+			}
+			else
+			{
+				TextContent = Target.UserText.IsEmpty() ? TEXT("[用户上传了图片]") : Target.UserText;
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[VL] Image analysis returned empty"));
+			}
+			TextPart->SetStringField(TEXT("text"), TextContent);
+			NewContent.Add(MakeShareable(new FJsonValueObject(TextPart)));
+			NewObj->SetArrayField(TEXT("content"), NewContent);
+			(*Modified)[Target.Index] = MakeShareable(new FJsonValueObject(NewObj));
+
+			(*Remaining)--;
+			if (*Remaining <= 0 && OnDone)
+			{
+				OnDone(*Modified);
+			}
+		});
+	}
+
+	// If all targets had no base64 (handled synchronously), call done now
+	if (*Remaining <= 0 && OnDone)
+	{
+		// Already called from the sync path above if remaining hit 0
+	}
 }
 
 /** Try to auto-execute the speculated tool call — skip LLM round entirely.
