@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
- * UE5 MCP 全工具集探测 → 输出数个 MD 文件
+ * UE5 MCP 全工具集探测 -> 输出 MD 文件
  * 用法: node scripts/discover-ue5-mcp-tools.mjs [port] [outDir]
- * 默认: port=8000, outDir=./Resources/mcp-tools
  */
 
 import * as fs from "fs";
@@ -12,78 +11,74 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.argv[2]) || 8000;
 const OUT_DIR = process.argv[3] || path.join(__dirname, "..", "Resources", "mcp-tools");
-const BASE = `http://127.0.0.1:${PORT}/mcp`;
+const BASE = "http://127.0.0.1:" + PORT + "/mcp";
 let sessionId = null;
 
 async function req(method, params = {}, timeout = 15000) {
   const id = Math.floor(Math.random() * 90000) + 10000;
   const controller = new AbortController();
-  setTimeout(() => controller.abort(), timeout);
+  setTimeout(function() { controller.abort(); }, timeout);
 
   try {
-    const res = await fetch(BASE, {
+    const opts = {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
       signal: controller.signal,
-    });
+    };
+    if (sessionId) opts.headers["Mcp-Session-Id"] = sessionId;
+
+    const res = await fetch(BASE, opts);
     const sid = res.headers.get("mcp-session-id");
     if (sid) sessionId = sid;
     const ct = res.headers.get("content-type") || "";
 
     if (ct.includes("application/json")) {
       const d = await res.json();
-      return d.error ? `ERROR: ${d.error.message}` : d.result || d;
+      return d.error ? "ERROR: " + d.error.message : d.result || d;
     }
     if (ct.includes("text/event-stream") && res.body) {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = "";
+      let buf = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const norm = buffer.replace(/\r\n/g, "\n");
+        buf += decoder.decode(value, { stream: true });
+        const norm = buf.replace(/\r\n/g, "\n");
         const lines = norm.split("\n");
-        buffer = lines.pop() || "";
-        let eventData = "";
+        buf = lines.pop() || "";
+        let ed = "";
         for (const line of lines) {
           const t = line.trimEnd();
-          if (t.startsWith("data:")) eventData = t.slice(5).trim();
-          else if (t === "" && eventData) {
+          if (t.startsWith("data:")) ed = t.slice(5).trim();
+          else if (t === "" && ed) {
             reader.releaseLock();
-            return parseSSEEvent(eventData);
+            return parseSSEEvent(ed);
           }
         }
       }
       reader.releaseLock();
       return "SSE stream ended";
     }
-    return `Unknown type: ${ct}`;
+    return "Unknown: " + ct;
   } catch (e) {
-    return `FAIL: ${e.message}`;
+    return "FAIL: " + e.message;
   }
 }
 
 function parseSSEEvent(data) {
   try {
     const p = JSON.parse(data);
-    if (p.result?.content) {
-      return p.result.content
-        .filter(c => c.type === "text")
-        .map(c => c.text)
-        .join("\n");
+    if (p.result && p.result.content) {
+      return p.result.content.filter(function(c) { return c.type === "text"; }).map(function(c) { return c.text; }).join("\n");
     }
-    return p.error ? `ERROR: ${p.error.message}` : JSON.stringify(p.result);
-  } catch {
+    return p.error ? "ERROR: " + p.error.message : JSON.stringify(p.result);
+  } catch (e) {
     return data;
   }
 }
 
-// ====== Parse tool output ======
 function parseToolsetList(text) {
   const names = [];
   for (const line of text.split("\n")) {
@@ -95,146 +90,197 @@ function parseToolsetList(text) {
 
 function parseToolDescriptions(text) {
   const tools = [];
-
-  // Try JSON first (newer UE MCP versions return structured JSON)
   try {
     const parsed = JSON.parse(text);
     if (parsed.tools && Array.isArray(parsed.tools)) {
       for (const t of parsed.tools) {
-        const name = (t.name || "").split(".").pop(); // short name
-        tools.push({ name, desc: t.description || "" });
+        const name = (t.name || "").split(".").pop();
+        tools.push({ name: name, desc: t.description || "" });
       }
       return tools;
     }
-  } catch {}
-
-  // Fallback: text format "- toolName: description"
+  } catch (e) {}
   for (const line of text.split("\n")) {
-    const t = line.trim();
-    let m = t.match(/^-\s*(\S+)\s*[:：]\s*(.+)/);
-    if (m) { tools.push({ name: m[1], desc: m[2].trim() }); continue; }
-    m = t.match(/^-\s*(\S+)\s*$/);
-    if (m) { tools.push({ name: m[1], desc: "" }); }
+    const m = line.trim().match(/^-\s*(\S+)\s*[:：]\s*(.+)/);
+    if (m) { tools.push({ name: m[1], desc: m[2].trim() }); break; }
   }
   return tools;
 }
 
+// ====== Known toolsets (not currently loaded) ======
+const KNOWN_TOOLSETS = [
+  { plugin: "MVCBlueprintToolset", desc: "蓝图工具 - 创建/编辑蓝图、节点图、变量、组件、GAS" },
+  { plugin: "ScriptBlueprintToolset", desc: "脚本蓝图工具" },
+  { plugin: "EditorScriptingToolset", desc: "编辑器脚本" },
+  { plugin: "StaticMeshToolset", desc: "静态网格工具" },
+  { plugin: "GeometryScriptingToolset", desc: "几何体脚本" },
+  { plugin: "ModelingModeToolset", desc: "建模模式" },
+  { plugin: "PCGToolset", desc: "PCG 程序化生成" },
+  { plugin: "AnimationAssistantToolset", desc: "动画工具" },
+  { plugin: "ConversationToolset", desc: "对话系统" },
+  { plugin: "GameplayCueToolset", desc: "GameplayCue" },
+  { plugin: "LayerToolset", desc: "图层管理" },
+  { plugin: "SmartObjectToolset", desc: "SmartObject" },
+  { plugin: "WorldConditionToolset", desc: "世界条件" },
+  { plugin: "RigVMBlueprintToolset", desc: "RigVM 蓝图" },
+  { plugin: "SlateUICalloutToolset", desc: "UI 工具" },
+  { plugin: "UIFrontendToolset", desc: "UI 前端" },
+  { plugin: "MVCComponentToolset", desc: "组件工具" },
+  { plugin: "AIModuleToolset", desc: "AI 模块" },
+];
+
+const NEED_PLUGIN_MAP = [
+  ["创建/编辑蓝图", "MVCBlueprintToolset"],
+  ["创建关卡", "EditorAppToolset (built-in)"],
+  ["创建/编辑静态网格", "StaticMeshToolset"],
+  ["编辑器脚本/Python", "EditorScriptingToolset"],
+  ["几何体操作", "GeometryScriptingToolset"],
+  ["建模", "ModelingModeToolset"],
+  ["PCG 程序化生成", "PCGToolset"],
+  ["动画", "AnimationAssistantToolset"],
+  ["AI 技能管理", "AgentSkillToolset (built-in)"],
+  ["材质创建/编辑", "editor_toolset.toolsets.material (MaterialTools plugin)"],
+];
+
 // ====== Main ======
 async function main() {
   console.log("=".repeat(60));
-  console.log("  UE5 MCP 全工具集探测");
+  console.log("  UE5 MCP Tool Discovery");
   console.log("=".repeat(60));
 
-  // 1. Initialize
-  console.log("\n[1/4] 初始化 MCP 会话...");
+  console.log("\n[1/4] Init MCP...");
   await req("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "tool-discover", version: "1.0" } });
-  console.log(`       Session: ${sessionId}`);
+  console.log("       Session: " + sessionId);
 
-  // 2. Get top-level tools
-  console.log("\n[2/4] 获取顶层工具...");
+  console.log("\n[2/4] Top-level tools...");
   const topTools = await req("tools/list");
-  const topCount = topTools?.tools?.length || 0;
-  console.log(`       顶层工具: ${topCount}`);
+  console.log("       Top-level: " + (topTools && topTools.tools ? topTools.tools.length : 0));
 
-  // 3. List toolsets
-  console.log("\n[3/4] 获取工具集列表...");
+  console.log("\n[3/4] List toolsets...");
   const listText = await req("tools/call", { name: "list_toolsets", arguments: {} });
   if (typeof listText !== "string") {
-    console.error("ERROR: 无法获取工具集列表。请确认 UE 编辑器和 MCP 服务已启动。");
+    console.error("ERROR: Cannot get toolset list. Is UE running with MCP?");
     process.exit(1);
   }
-  console.log(`       原始: ${listText.substring(0, 100)}...`);
 
   const tsNames = parseToolsetList(listText);
-  console.log(`       解析到 ${tsNames.length} 个工具集: ${tsNames.join(", ")}`);
+  console.log("       Found: " + tsNames.length + " toolsets");
 
-  // 4. Describe each toolset
-  console.log("\n[4/4] 获取工具集详情...");
+  console.log("\n[4/4] Describe each toolset...");
   const allToolsets = {};
   let totalTools = 0;
 
   for (const name of tsNames) {
-    process.stdout.write(`       ${name}... `);
+    process.stdout.write("       " + name + "... ");
     const desc = await req("tools/call", { name: "describe_toolset", arguments: { toolset_name: name } });
-    if (typeof desc !== "string") {
-      console.log("FAIL");
-      continue;
-    }
+    if (typeof desc !== "string") { console.log("FAIL"); continue; }
     const tools = parseToolDescriptions(desc);
     allToolsets[name] = tools;
     totalTools += tools.length;
-    console.log(`${tools.length} tools`);
+    console.log(tools.length + " tools");
   }
 
-  console.log(`\n       总计: ${Object.keys(allToolsets).length} 工具集, ${totalTools} 工具\n`);
+  console.log("\n       Total: " + Object.keys(allToolsets).length + " toolsets, " + totalTools + " tools\n");
 
-  // Ensure output dir
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const timestamp = new Date().toISOString().replace("T", " ").substring(0, 19);
 
-  // ----- 1. Full catalog -----
-  const catalogLines = [];
-  catalogLines.push(`# UE5 MCP 工具集目录`);
-  catalogLines.push(``);
-  catalogLines.push(`> 自动生成: ${timestamp} | 工具集: ${Object.keys(allToolsets).length} | 工具: ${totalTools}`);
-  catalogLines.push(``);
+  // ===== 1. Full catalog =====
+  const cat = [];
+  cat.push("# UE5 MCP Toolset Catalog");
+  cat.push("");
+  cat.push("> Generated: " + timestamp + " | Loaded: " + Object.keys(allToolsets).length + " sets | Tools: " + totalTools);
+  cat.push("");
+  cat.push("## Loaded Toolsets");
+  cat.push("");
 
   for (const [tsName, tools] of Object.entries(allToolsets).sort()) {
-    catalogLines.push(`### ${tsName}`);
-    catalogLines.push(``);
-    catalogLines.push(`| 工具名 | 说明 |`);
-    catalogLines.push(`|--------|------|`);
+    cat.push("### " + tsName);
+    cat.push("");
+    cat.push("| Tool | Description |");
+    cat.push("|------|-------------|");
     for (const t of tools) {
-      catalogLines.push(`| \`${t.name}\` | ${t.desc} |`);
+      cat.push("| " + t.name + " | " + t.desc.split("\n")[0] + " |");
     }
-    catalogLines.push(``);
+    cat.push("");
   }
-  const catalogPath = path.join(OUT_DIR, "ue5-mcp-tools-catalog.md");
-  fs.writeFileSync(catalogPath, catalogLines.join("\n"), "utf8");
-  console.log(`已生成: ${catalogPath}`);
 
-  // ----- 2. Quick reference (compact, for system prompt) -----
-  const quickLines = [];
-  quickLines.push(`## 已发现MCP工具 (${totalTools}个)`);
-  quickLines.push(``);
-  quickLines.push(`直接 \`call_tool(toolset_name="...", tool_name="...", arguments=\{\})\` 调用。`);
-  quickLines.push(``);
+  cat.push("---");
+  cat.push("");
+  cat.push("## Known Toolsets (Not Loaded - Enable Plugin)");
+  cat.push("");
+  cat.push("These toolsets are documented but not loaded in the current UE instance.");
+  cat.push("Go to Edit > Plugins, search for the plugin, enable it, restart UE.");
+  cat.push("");
+  cat.push("| Plugin | Function |");
+  cat.push("|--------|----------|");
+  for (const k of KNOWN_TOOLSETS) {
+    cat.push("| " + k.plugin + " | " + k.desc + " |");
+  }
+  cat.push("");
+  cat.push("## Requirement -> Plugin Map");
+  cat.push("");
+  cat.push("| User Need | Required Plugin |");
+  cat.push("|-----------|-----------------|");
+  for (const [need, plugin] of NEED_PLUGIN_MAP) {
+    cat.push("| " + need + " | " + plugin + " |");
+  }
+
+  const catalogPath = path.join(OUT_DIR, "ue5-mcp-tools-catalog.md");
+  fs.writeFileSync(catalogPath, cat.join("\n"), "utf8");
+  console.log("OK: " + catalogPath);
+
+  // ===== 2. Quick reference =====
+  const qk = [];
+  qk.push("## Loaded MCP Tools (" + totalTools + " tools)");
+  qk.push("");
+  qk.push("Call: call_tool(toolset_name=\"...\", tool_name=\"...\", arguments={})");
+  qk.push("");
 
   for (const [tsName, tools] of Object.entries(allToolsets).sort()) {
-    const names = tools.map(t => t.name).join(", ");
-    quickLines.push(`- **${tsName}**: ${names}`);
+    const names = tools.map(function(t) { return t.name; }).join(", ");
+    qk.push("- **" + tsName + "**: " + names);
   }
-  const quickPath = path.join(OUT_DIR, "ue5-mcp-tools-quick.md");
-  fs.writeFileSync(quickPath, quickLines.join("\n"), "utf8");
-  console.log(`已生成: ${quickPath}`);
 
-  // ----- 3. Per-toolset detail -----
+  qk.push("");
+  qk.push("## Known Toolsets (not loaded, enable plugin)");
+  qk.push("");
+  qk.push("| Plugin | Function |");
+  qk.push("|--------|----------|");
+  for (const k of KNOWN_TOOLSETS) {
+    qk.push("| " + k.plugin + " | " + k.desc + " |");
+  }
+  qk.push("");
+  qk.push("Enable: Edit > Plugins > search Toolsets > enable plugin > restart UE");
+
+  const quickPath = path.join(OUT_DIR, "ue5-mcp-tools-quick.md");
+  fs.writeFileSync(quickPath, qk.join("\n"), "utf8");
+  console.log("OK: " + quickPath);
+
+  // ===== 3. Per-toolset detail =====
   const detailDir = path.join(OUT_DIR, "toolsets");
   fs.mkdirSync(detailDir, { recursive: true });
   for (const [tsName, tools] of Object.entries(allToolsets).sort()) {
     const shortName = tsName.split(".").pop();
-    const lines = [];
-    lines.push(`# ${tsName}`);
-    lines.push(``);
-    lines.push(`${tools.length} 个工具`);
-    lines.push(``);
-    lines.push(`| 工具名 | 说明 |`);
-    lines.push(`|--------|------|`);
+    const d = [];
+    d.push("# " + tsName);
+    d.push("");
+    d.push(tools.length + " tools");
+    d.push("");
+    d.push("| Tool | Description |");
+    d.push("|------|-------------|");
     for (const t of tools) {
-      lines.push(`| \`${t.name}\` | ${t.desc} |`);
+      d.push("| " + t.name + " | " + t.desc.split("\n")[0] + " |");
     }
-    const p = path.join(detailDir, `${shortName}.md`);
-    fs.writeFileSync(p, lines.join("\n"), "utf8");
+    fs.writeFileSync(path.join(detailDir, shortName + ".md"), d.join("\n"), "utf8");
   }
-  console.log(`已生成: ${detailDir}/ (${Object.keys(allToolsets).length} 个文件)`);
+  console.log("OK: " + detailDir + " (" + Object.keys(allToolsets).length + " files)");
 
-  // ----- 4. JSON dump for programmatic use -----
-  const jsonPath = path.join(OUT_DIR, "ue5-mcp-tools.json");
-  fs.writeFileSync(jsonPath, JSON.stringify(allToolsets, null, 2), "utf8");
-  console.log(`已生成: ${jsonPath}`);
+  // ===== 4. JSON dump =====
+  fs.writeFileSync(path.join(OUT_DIR, "ue5-mcp-tools.json"), JSON.stringify(allToolsets, null, 2), "utf8");
+  console.log("OK: " + path.join(OUT_DIR, "ue5-mcp-tools.json"));
 
-  console.log(`\n完成！`);
-  console.log(`  输出目录: ${OUT_DIR}`);
+  console.log("\nDone! Output: " + OUT_DIR);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(function(e) { console.error(e); process.exit(1); });
