@@ -597,32 +597,6 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 
 	UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] → %s (%s)"), *Method, *Url);
 
-	// ── Use OnRequestProgress for incremental SSE processing ──
-	// Accumulate SSE data as it arrives instead of waiting for full body
-	TSharedPtr<FString> AccumulatedBuffer = MakeShared<FString>();
-	AccumulatedBuffer->Reserve(65536);
-
-	Request->OnRequestProgress().BindLambda(
-		[this, Method, OnComplete, AccumulatedBuffer](FHttpRequestPtr Req, int32 BytesSent, int32 BytesReceived)
-		{
-			// On each progress tick, try to get partial content and parse SSE
-			FHttpResponsePtr PartialResp = Req->GetResponse();
-			if (!PartialResp.IsValid()) return;
-
-			// Only process if we have new data
-			FString NewContent = PartialResp->GetContentAsString();
-			if (NewContent.Len() <= AccumulatedBuffer->Len()) return;
-
-			FString Delta = NewContent.RightChop(AccumulatedBuffer->Len());
-			*AccumulatedBuffer = NewContent;
-
-			// Try to find complete SSE events in the delta
-			if (!Delta.IsEmpty())
-			{
-				UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] SSE progress: +%d bytes (total %d)"), Delta.Len(), AccumulatedBuffer->Len());
-			}
-		});
-
 	Request->OnProcessRequestComplete().BindLambda(
 		[this, Method, OnComplete, Url](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bSuccess)
 		{
