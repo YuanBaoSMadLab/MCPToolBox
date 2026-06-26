@@ -2,6 +2,8 @@
 #include "MCPToolbox.h"
 #include "MCPToolboxAPIManager.h"
 #include "MCPToolboxMemoryManager.h"
+#include "MCPToolboxScreenshot.h"
+#include "MCPToolboxAuxModelManager.h"
 
 // Assistant library — only FunctionBuilder/FunctionTable (no HTTP layer)
 #include "assistant/function.hpp"
@@ -27,6 +29,9 @@
 
 #define LOCTEXT_NAMESPACE "MCPToolboxChat"
 
+// Forward declare helper
+static void InjectSpeculationHint(TArray<TSharedPtr<FJsonValue>>& PendingMsgs, const FSpeculativeResult& Spec, bool& bSpeculationPending);
+
 // ============================================================================
 // Construction
 // ============================================================================
@@ -36,6 +41,14 @@ void SMCPToolboxChatWidget::Construct(const FArguments& InArgs)
 	bVisionModeEnabled = false;
 	bIsStreaming = false;
 	bIsWaiting = false;
+
+	// Refresh auxiliary model status and start llama-server
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+	AuxMgr.RefreshStatus();
+	if (AuxMgr.GetStatus() == EMCPToolboxAuxModelStatus::Ready)
+	{
+		AuxMgr.StartServer();
+	}
 
 	ToolFunctionTable = MakeUnique<assistant::FunctionTable>();
 	RegisterMCPTools();
@@ -249,6 +262,12 @@ void SMCPToolboxChatWidget::AddMessage(const FMCPToolboxChatMessage& Message)
 // ============================================================================
 TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message)
 {
+	TSharedPtr<SMultiLineEditableTextBox> Dummy;
+	return CreateMessageBubble(Message, Dummy);
+}
+
+TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBox)
+{
 	FLinearColor BgColor = GetMessageColor(Message.Role);
 	FString RoleLabel;
 	bool bAlignRight = false;
@@ -271,7 +290,8 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 		bool bIsResult = Message.Role == EMCPToolboxMessageRole::System;
 		if (DisplayContent.Len() > 500) DisplayContent = DisplayContent.Left(500) + TEXT("...");
 
-		return SNew(SBox)
+		TSharedPtr<SMultiLineEditableTextBox> TextBox;
+		auto Result = SNew(SBox)
 			.MaxDesiredWidth(700)
 			.HAlign(HAlign_Left)
 			[
@@ -307,7 +327,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 4, 0, 0))
 					[
-						SNew(SMultiLineEditableTextBox)
+						SAssignNew(TextBox, SMultiLineEditableTextBox)
 						.Text(FText::FromString(DisplayContent))
 						.IsReadOnly(true)
 						.BackgroundColor(FLinearColor::Transparent)
@@ -316,9 +336,12 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 					]
 				]
 			];
+		OutTextBox = TextBox;
+		return Result;
 	}
 
-	return SNew(SBox)
+	TSharedPtr<SMultiLineEditableTextBox> TextBox;
+	auto Result = SNew(SBox)
 		.HAlign(bAlignRight ? HAlign_Right : HAlign_Left)
 		.MaxDesiredWidth(700)
 		[
@@ -346,7 +369,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 6, 0, 0))
 				[
-					SNew(SMultiLineEditableTextBox)
+					SAssignNew(TextBox, SMultiLineEditableTextBox)
 					.Text(FText::FromString(DisplayContent))
 					.IsReadOnly(true)
 					.BackgroundColor(FLinearColor::Transparent)
@@ -355,6 +378,8 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 				]
 			]
 		];
+	OutTextBox = TextBox;
+	return Result;
 }
 
 // ============================================================================
@@ -383,12 +408,19 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildInputArea()
 				SNew(SButton)
 				.Text(LOCTEXT("UploadBtn", "上传"))
 				.OnClicked(this, &SMCPToolboxChatWidget::OnUploadFile)
-				.IsEnabled_Lambda([this]() { return bVisionModeEnabled; })
+				.IsEnabled_Lambda([this]() {
+					return bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady();
+				})
 				.ToolTipText_Lambda([this]() {
-					return bVisionModeEnabled ? LOCTEXT("UploadTooltip", "上传图片") : LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式以使用图片上传功能");
+					if (bVisionModeEnabled)
+						return LOCTEXT("UploadTooltip", "上传图片 (云端视觉)");
+					if (FMCPToolboxAuxModelManager::Get().IsReady())
+						return LOCTEXT("UploadVLMode", "上传图片 (本地 VL 分析)");
+					return LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式或确保辅助模型可用");
 				})
 				.ButtonColorAndOpacity_Lambda([this]() {
-					return bVisionModeEnabled ? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
+					return (bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady())
+						? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
 				})
 			]
 			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
@@ -421,14 +453,6 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 
 	FString ApiKey;
 	FBase64::Decode(ActiveEntry->EncryptedKey, ApiKey);
-	if (ApiKey.IsEmpty())
-	{
-		FMCPToolboxChatMessage Err;
-		Err.Role = EMCPToolboxMessageRole::System;
-		Err.Content = TEXT("API密钥为空，请重新添加密钥。");
-		AddMessage(Err);
-		return FReply::Handled();
-	}
 
 	// Add user message to chat
 	FMCPToolboxChatMessage UserMsg;
@@ -468,15 +492,85 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		default: RoleStr = TEXT("user");
 		}
 		MsgObj->SetStringField(TEXT("role"), RoleStr);
-		MsgObj->SetStringField(TEXT("content"), Msg.Content);
+
+		if (Msg.bHasImageAttachment && Msg.ImageDataURIs.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+			TextPart->SetStringField(TEXT("type"), TEXT("text"));
+			TextPart->SetStringField(TEXT("text"), Msg.Content);
+			ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+			for (const FString& ImageURI : Msg.ImageDataURIs)
+			{
+				TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+				ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+				TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+				ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
+				ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+				ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+			}
+
+			MsgObj->SetArrayField(TEXT("content"), ContentArray);
+		}
+		else
+		{
+			MsgObj->SetStringField(TEXT("content"), Msg.Content);
+		}
+
 		Msgs.Add(MakeShareable(new FJsonValueObject(MsgObj)));
 	}
 
 	// Add new user message (the one just entered)
-	TSharedPtr<FJsonObject> UsrMsg = MakeShareable(new FJsonObject());
-	UsrMsg->SetStringField(TEXT("role"), TEXT("user"));
-	UsrMsg->SetStringField(TEXT("content"), UserText);
-	Msgs.Add(MakeShareable(new FJsonValueObject(UsrMsg)));
+	{
+		TSharedPtr<FJsonObject> UsrMsg = MakeShareable(new FJsonObject());
+		UsrMsg->SetStringField(TEXT("role"), TEXT("user"));
+
+		bool bHasImages = false;
+		// Check if last message has images (in case of file upload)
+		if (Messages.Num() > 0)
+		{
+			const FMCPToolboxChatMessage& LastMsg = Messages.Last();
+			if (LastMsg.Role == EMCPToolboxMessageRole::User && LastMsg.bHasImageAttachment && LastMsg.ImageDataURIs.Num() > 0)
+			{
+				bHasImages = true;
+			}
+		}
+
+		if (bHasImages && Messages.Num() > 0)
+		{
+			const FMCPToolboxChatMessage& LastMsg = Messages.Last();
+			TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+			TextPart->SetStringField(TEXT("type"), TEXT("text"));
+			TextPart->SetStringField(TEXT("text"), UserText.IsEmpty() ? LastMsg.Content : UserText);
+			ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+			for (const FString& ImageURI : LastMsg.ImageDataURIs)
+			{
+				TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+				ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+				TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+				ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
+				ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+				ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+			}
+
+			UsrMsg->SetArrayField(TEXT("content"), ContentArray);
+		}
+		else
+		{
+			UsrMsg->SetStringField(TEXT("content"), UserText);
+		}
+
+		Msgs.Add(MakeShareable(new FJsonValueObject(UsrMsg)));
+	}
 
 	SendAIRequest(Msgs);
 	return FReply::Handled();
@@ -486,6 +580,37 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 // Send AI Request — reusable, called from OnSendMessage and tool loops
 // ============================================================================
 void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& ApiMessages)
+{
+	if (bInterrupted) { bIsWaiting = false; return; }
+
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+
+	// Local VL preprocessing: if vision mode is OFF and aux VL is available,
+	// analyze images locally and replace with text descriptions
+	auto DoPruneAndSend = [this, &AuxMgr](const TArray<TSharedPtr<FJsonValue>>& ProcessedMessages)
+	{
+		if (AuxMgr.IsReady() && ProcessedMessages.Num() > 15)
+		{
+			ApplyPruningBeforeSend(ProcessedMessages,
+				[this](const TArray<TSharedPtr<FJsonValue>>& PrunedMessages)
+			{
+				SendAIRequestInternal(PrunedMessages);
+			});
+			return;
+		}
+		SendAIRequestInternal(ProcessedMessages);
+	};
+
+	if (!bVisionModeEnabled && AuxMgr.IsReady())
+	{
+		PreprocessImagesLocally(ApiMessages, DoPruneAndSend);
+		return;
+	}
+
+	DoPruneAndSend(ApiMessages);
+}
+
+void SMCPToolboxChatWidget::SendAIRequestInternal(const TArray<TSharedPtr<FJsonValue>>& ApiMessages)
 {
 	if (bInterrupted) { bIsWaiting = false; return; }
 
@@ -521,27 +646,66 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 		ApiUrl += TEXT("/chat/completions");
 	}
 
+	// Fast/Deep thinking hybrid: detect tool-calling loops → suppress reasoning
+	const TArray<TSharedPtr<FJsonValue>>* EffectiveMessages = &ApiMessages;
+	TArray<TSharedPtr<FJsonValue>> FastModeMsgs;
+	{
+		int32 ConsecutiveToolPairs = 0;
+		for (int32 i = ApiMessages.Num() - 1; i >= 0; --i)
+		{
+			TSharedPtr<FJsonObject> Obj = ApiMessages[i]->AsObject();
+			if (!Obj.IsValid()) break;
+			FString Role;
+			Obj->TryGetStringField(TEXT("role"), Role);
+			if (Role == TEXT("tool")) { ConsecutiveToolPairs++; continue; }
+			if (Role == TEXT("assistant"))
+			{
+				const TArray<TSharedPtr<FJsonValue>>* TCs;
+				if (Obj->TryGetArrayField(TEXT("tool_calls"), TCs) && TCs->Num() > 0) continue;
+			}
+			break;
+		}
+		if (ConsecutiveToolPairs >= 2)
+		{
+			// DeepSeek thinking mode requires reasoning_content on ALL assistant msgs.
+			// Ensure every assistant message has it (empty = fast mode, no actual reasoning).
+			for (const auto& V : ApiMessages)
+			{
+				TSharedPtr<FJsonObject> Obj = V->AsObject();
+				FString Role;
+				Obj->TryGetStringField(TEXT("role"), Role);
+				if (Role == TEXT("assistant") && !Obj->Values.Contains(TEXT("reasoning_content")))
+				{
+					// Need to modify: deep-copy and add empty reasoning
+					FString Ser;
+					TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Ser);
+					FJsonSerializer::Serialize(Obj.ToSharedRef(), W);
+					TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(Ser);
+					TSharedPtr<FJsonObject> Copy = MakeShareable(new FJsonObject());
+					FJsonSerializer::Deserialize(R, Copy);
+					Copy->SetStringField(TEXT("reasoning_content"), TEXT(""));
+					FastModeMsgs.Add(MakeShareable(new FJsonValueObject(Copy)));
+				}
+				else
+				{
+					FastModeMsgs.Add(V);
+				}
+			}
+			EffectiveMessages = &FastModeMsgs;
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Fast-thinking mode: %d tool pairs, ensured reasoning fields"), ConsecutiveToolPairs);
+		}
+	}
+
 	// Build request body
 	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
 	Body->SetStringField(TEXT("model"), ActiveEntry->ModelId);
-	Body->SetBoolField(TEXT("stream"), true); // Enable SSE streaming
-	Body->SetArrayField(TEXT("messages"), ApiMessages);
+	Body->SetBoolField(TEXT("stream"), true);
+	Body->SetArrayField(TEXT("messages"), *EffectiveMessages);
 
-	// Add tools
-	if (ToolFunctionTable.IsValid() && ToolFunctionTable->GetFunctionsCount() > 0)
+	// Add tools (cached, rebuilt when tools change)
+	if (CachedToolsArray.Num() > 0)
 	{
-		assistant::json ToolsJson = ToolFunctionTable->ToJSON(assistant::EndpointKind::ollama, assistant::CachePolicy::kNone);
-		TArray<TSharedPtr<FJsonValue>> ToolsArray;
-		for (const auto& tool : ToolsJson)
-		{
-			FString ToolStr = UTF8_TO_TCHAR(tool.dump().c_str());
-			TSharedPtr<FJsonObject> ToolObj;
-			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ToolStr);
-			if (FJsonSerializer::Deserialize(Reader, ToolObj) && ToolObj.IsValid())
-				ToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObj)));
-		}
-		if (ToolsArray.Num() > 0)
-			Body->SetArrayField(TEXT("tools"), ToolsArray);
+		Body->SetArrayField(TEXT("tools"), CachedToolsArray);
 	}
 
 	// Add tool_choice to encourage tool use
@@ -557,7 +721,10 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 	Request->SetURL(ApiUrl);
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ApiKey));
+	if (!ApiKey.IsEmpty())
+	{
+		Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ApiKey));
+	}
 	Request->SetContentAsString(BodyStr);
 	Request->SetTimeout(120.0f); // 2 minute timeout for tool calls
 
@@ -733,8 +900,18 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			StreamMsg.Role = EMCPToolboxMessageRole::Assistant;
 			StreamMsg.Content = TEXT("");
 			StreamMsg.bIsStreaming = true;
-			AddMessage(StreamMsg);
+			Messages.Add(StreamMsg);
 			FMCPToolboxChatMessage* StreamPtr = &Messages.Last();
+			
+			// Add the message bubble to the chat area and get the text box reference
+			TSharedPtr<SMultiLineEditableTextBox> TextBox;
+			if (ChatScrollBox.IsValid())
+			{
+				TSharedRef<SWidget> Bubble = CreateMessageBubble(*StreamPtr, TextBox);
+				ChatScrollBox->AddSlot().Padding(FMargin(4))[Bubble];
+				ChatScrollBox->ScrollToEnd();
+			}
+			StreamingMessageBox = TextBox;
 
 			// Use ticker to progressively show chunks
 			TSharedPtr<int32> ChunkIndex = MakeShareable(new int32(0));
@@ -752,6 +929,10 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 						bIsWaiting = false;
 						// Final rebuild to show cleaned markdown
 						RebuildChatDisplay();
+						// Save the completed message to session
+						FMCPToolboxChatSessionManager::Get().SaveCurrentSession();
+						RefreshSessionList();
+						StreamingMessageBox.Reset();
 						UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Stream done, %d chars"), DisplayBuffer->Len());
 						return false;
 					}
@@ -765,8 +946,18 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 					}
 					StreamPtr->Content = *DisplayBuffer;
 
-					// Only rebuild every batch (~150ms between updates)
-					RebuildChatDisplay();
+					// Update the text box directly instead of rebuilding everything
+					if (StreamingMessageBox.IsValid())
+					{
+						StreamingMessageBox->SetText(FText::FromString(*DisplayBuffer));
+						if (ChatScrollBox.IsValid())
+							ChatScrollBox->ScrollToEnd();
+					}
+					else
+					{
+						// Fallback: rebuild if text box reference is lost
+						RebuildChatDisplay();
+					}
 
 					return true;
 				}),
@@ -910,6 +1101,13 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 		ToolMsg.Content = FString::Printf(TEXT("⚙ 调用工具: %s"), *ToolNames);
 		AddMessage(ToolMsg);
 
+		// Check if tool calls have DAG dependencies (LLMCompiler-style)
+		if (HasDAGDependencies(*ToolCalls))
+		{
+			ExecuteToolCallsDAG(*ToolCalls, SentMessages, *Msg);
+			return;
+		}
+
 		// Build new messages: old messages + assistant(tool_calls) + tool results
 		TArray<TSharedPtr<FJsonValue>> NewMsgs = SentMessages;
 
@@ -939,15 +1137,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			(*Func)->TryGetStringField(TEXT("arguments"), FuncArgs);
 
 			// Check if this is an MCP tool that needs async execution
-			bool bIsMCP = false;
-			if (MCPServerClient.IsConnected())
-			{
-				for (const auto& T : MCPServerClient.GetTools())
-				{
-					FString N;
-					if (T->TryGetStringField(TEXT("name"), N) && N == FuncName) { bIsMCP = true; break; }
-				}
-			}
+			bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(FuncName);
 
 			if (bIsMCP)
 			{
@@ -955,6 +1145,9 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 				(*PendingMCP)++;
 				FString NameCap = FuncName;
 				FString IdCap = TCId;
+
+				// IdleSpec: launch speculative execution while tool is busy
+				LaunchIdleSpec(FuncName);
 
 				MCPServerClient.ExecuteTool(FuncName, FuncArgs,
 					[this, PendingMCP, PendingMsgs, NameCap, IdCap](bool bOk, const FString& R)
@@ -975,11 +1168,20 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 						(*PendingMCP)--;
 
-						// All MCP calls done → continue conversation
+						// All MCP calls done → continue when speculation resolves
 						if (*PendingMCP <= 0)
 						{
-							UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 工具调用完成(MCP), 继续对话"));
-							SendAIRequest(*PendingMsgs);
+							if (bSpeculationPending && LastSpeculation.IsValid() == false)
+							{
+								// Speculation still in-flight: defer continuation to speculation callback.
+								// Store PendingMsgs so the callback can pick up where we left off.
+								// (The speculation lambda will call TrySpeculativeOrContinue)
+								bPendingToolCompletion = true;
+							}
+							else
+							{
+								TrySpeculativeOrContinue(PendingMsgs);
+							}
 						}
 					});
 			}
@@ -999,6 +1201,49 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 				ToolResultMsg->SetStringField(TEXT("name"), FuncName);
 				ToolResultMsg->SetStringField(TEXT("content"), Result);
 				PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+				// If this is a screenshot tool result with image data, add a user message with the image
+				if (FuncName == TEXT("screenshot"))
+				{
+					TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+					TSharedPtr<FJsonObject> ResultObj;
+					if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+					{
+						FString DataURI;
+						if (ResultObj->TryGetStringField(TEXT("data_uri"), DataURI) && !DataURI.IsEmpty())
+						{
+							// Build content array with text + image
+							TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+							TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+							TextPart->SetStringField(TEXT("type"), TEXT("text"));
+							TextPart->SetStringField(TEXT("text"), TEXT("Here is the screenshot you requested. Please analyze it."));
+							ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+							TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+							ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+							TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+							ImageUrlObj->SetStringField(TEXT("url"), DataURI);
+							ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+							ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+
+							TSharedPtr<FJsonObject> ScreenshotUserMsg = MakeShareable(new FJsonObject());
+							ScreenshotUserMsg->SetStringField(TEXT("role"), TEXT("user"));
+							ScreenshotUserMsg->SetArrayField(TEXT("content"), ContentArray);
+							PendingMsgs->Add(MakeShareable(new FJsonValueObject(ScreenshotUserMsg)));
+
+							// Also add a visible message to the chat
+							FMCPToolboxChatMessage ScreenshotMsg;
+							ScreenshotMsg.Role = EMCPToolboxMessageRole::User;
+							ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
+							ScreenshotMsg.bHasImageAttachment = true;
+							ScreenshotMsg.ImageDataURIs.Add(DataURI);
+							AddMessage(ScreenshotMsg);
+						}
+					}
+				}
 			}
 		}
 
@@ -1154,6 +1399,7 @@ void SMCPToolboxChatWidget::RefreshMCPTools()
 			{
 				MCPServerClient.GetTools().Empty();
 				MCPServerClient.GetTools().Append(DiscoveredTools);
+				MCPServerClient.RebuildToolNameSet();
 			}
 
 			MergeMCPTools();
@@ -1190,6 +1436,18 @@ void SMCPToolboxChatWidget::MergeMCPTools()
 	}
 
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Total tools after MCP merge: %d"), ToolFunctionTable->GetFunctionsCount());
+
+	// Rebuild cached tools array
+	CachedToolsArray.Empty();
+	assistant::json ToolsJson = ToolFunctionTable->ToJSON(assistant::EndpointKind::ollama, assistant::CachePolicy::kNone);
+	for (const auto& tool : ToolsJson)
+	{
+		FString ToolStr = UTF8_TO_TCHAR(tool.dump().c_str());
+		TSharedPtr<FJsonObject> ToolObj;
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ToolStr);
+		if (FJsonSerializer::Deserialize(Reader, ToolObj) && ToolObj.IsValid())
+			CachedToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObj)));
+	}
 }
 FReply SMCPToolboxChatWidget::OnInterrupt()
 {
@@ -1218,11 +1476,14 @@ FReply SMCPToolboxChatWidget::OnInterrupt()
 // ============================================================================
 FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 {
+	// Pre-allocate to avoid 30+ reallocations
+	FString Prompt;
+	Prompt.Reserve(8192);
+
 	// Get project Content path
 	FString ContentPath = FPaths::ProjectContentDir();
 	FString ProjectName = FApp::GetProjectName();
 
-	FString Prompt;
 	Prompt += TEXT("你是 MCP Toolbox AI助手，运行在 Unreal Engine 5.8 编辑器内部。必须用中文回复。\n\n");
 	Prompt += FString::Printf(TEXT("## 工作环境\n"));
 	Prompt += FString::Printf(TEXT("- 项目: %s\n"), *ProjectName);
@@ -1237,7 +1498,22 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("5. **🚫 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
 	Prompt += TEXT("6. **MCP是唯一正途**：本插件的核心功能就是MCP集成。所有UE编辑器操作必须通过 list_toolsets → describe_toolset → call_tool 链路完成。\n");
 	Prompt += TEXT("7. **command仅限控制台命令**：command只用于 HighResShot、stat fps 等纯控制台命令，绝不用于Python脚本。\n");
-	Prompt += TEXT("8. **主动记忆**：每次对话后，用\"记住：xxx\"保存MCP工具使用经验和用户偏好。\n\n");
+	Prompt += TEXT("8. **主动记忆**：每次对话后，用\"记住：xxx\"保存MCP工具使用经验和用户偏好。\n");
+	Prompt += TEXT("9. **👁 视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
+
+	Prompt += TEXT("## ⚡ 效率规则（必须严格遵守！目标：减少round-trip，提高速度）\n");
+	Prompt += TEXT("1. **批量读取**：需要读取多个文件时，使用 batch_read_files 一次性读取，禁止逐个调用 read_file\n");
+	Prompt += TEXT("2. **并行工具调用**：如果有多个独立的工具需要调用（如搜索+读取、截图+inspect），在同一次响应中并行调用多个tool_calls，不要分多次\n");
+	Prompt += TEXT("3. **先搜索再读取**：需要找代码时，先用 search_codebase 搜索定位，再用 batch_read_files 批量读取，避免盲目读取大量文件\n");
+	Prompt += TEXT("4. **一次思考完整方案**：不要每次只想一步。先在脑海中规划好完整方案，然后一次性调用所有需要的工具\n");
+	Prompt += TEXT("5. **减少对话轮数**：目标是用最少的轮数完成任务。能一轮完成的绝不两轮，能两轮完成的绝不三轮\n");
+	Prompt += TEXT("6. **善用 glob_search**：找文件用 glob_search，比逐个目录 list_directory 快得多\n");
+	Prompt += TEXT("7. **工具调用是免费的**：不要因为怕调用工具而省着用。但要聪明地用——批量用、并行用、一次用对\n");
+	Prompt += TEXT("8. **🔥 DAG 依赖式并行（LLMCompiler）**：当工具调用有依赖关系时，使用 $tN.xxx 引用语法声明依赖，系统会自动构建DAG并按层并行执行！\n");
+	Prompt += TEXT("   - 格式：每个工具调用可通过参数中的 $t1.result、$t2.data 等引用前面任务的结果\n");
+	Prompt += TEXT("   - 示例：t1=search_codebase(\"bug\"), t2=read_file(path=$t1.result[0]), t3=analyze(data=$t2.content)\n");
+	Prompt += TEXT("   - 执行方式：系统自动检测依赖，构建DAG，无依赖的任务并行执行，大幅提速\n");
+	Prompt += TEXT("   - 任务ID：使用 t1, t2, t3... 作为任务标识，在参数中用 $tN.field 引用\n\n");
 
 	Prompt += TEXT("## 工具优先级（从高到低，严格按此顺序）\n");
 	Prompt += TEXT("1. **MCP工具**：list_toolsets → describe_toolset → call_tool（唯一正途！）\n");
@@ -1249,8 +1525,13 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("- **list_toolsets** — 列出所有可用工具集。MCP连接后第一时间调用。\n");
 	Prompt += TEXT("- **describe_toolset** — 查看工具集的工具列表和参数。参数: toolset_name (string)\n");
 	Prompt += TEXT("- **call_tool** — 调用MCP工具。参数: toolset_name (string), tool_name (string), arguments (object)\n");
+	Prompt += TEXT("### 本地高效工具（优先使用，节省时间）\n");
+	Prompt += TEXT("- **batch_read_files** — ⚡ 批量读取多个文件。参数: file_paths (array of strings)。**读取多个文件时必须用这个，禁止逐个读**\n");
+	Prompt += TEXT("- **search_codebase** — ⚡ 搜索整个代码库。参数: pattern (string), path (可选), file_pattern (可选,默认*.cpp,*.h), max_results (可选,默认50)。**找代码先用这个**\n");
+	Prompt += TEXT("- **glob_search** — ⚡ 按文件名模式搜索文件。参数: pattern (string, 如 *.cpp, **/*.h), path (可选)。**找文件用这个**\n");
+	Prompt += TEXT("- **list_directory** — 列出目录内容。参数: path (string)\n");
 	Prompt += TEXT("### 本地辅助工具\n");
-	Prompt += TEXT("- **screenshot** — 截图\n");
+	Prompt += TEXT("- **screenshot** — 截取屏幕图片，你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
 	Prompt += TEXT("- **select** — 选择Actor。参数: name (string)\n");
 	Prompt += TEXT("- **inspect** — 检查选中Actor属性\n");
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
@@ -1261,6 +1542,19 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("❌ 错误: 直接用 command(cmd=\"py ...\") (绕开MCP)\n");
 	Prompt += TEXT("✅ 正确: 先调 list_toolsets → 找到材质相关工具集 → describe_toolset → call_tool 创建材质\n");
 	Prompt += TEXT("✅ 正确(MCP不可用时): command(cmd=\"py ...创建自发光材质...\")\n\n");
+
+	Prompt += TEXT("## ⚡ 效率示例（快 vs 慢）\n");
+	Prompt += TEXT("用户: 帮我看看MCPToolboxChatWidget.h和MCPToolboxChatWidget.cpp里的工具调用相关代码\n");
+	Prompt += TEXT("🐢 慢: 先list_directory找文件 → read_file读.h → read_file读.cpp → 读了5轮\n");
+	Prompt += TEXT("⚡ 快: search_codebase(\"ToolCall\") → 定位到相关行 → batch_read_files([两个文件]) → 1-2轮搞定\n\n");
+
+	Prompt += TEXT("用户: 帮我修改5个文件\n");
+	Prompt += TEXT("🐢 慢: 读文件1 → 改文件1 → 读文件2 → 改文件2 → ... 10轮\n");
+	Prompt += TEXT("⚡ 快: batch_read_files(5个文件) → 一次性看完 → 并行调用5个call_tool改文件 → 2-3轮搞定\n\n");
+
+	Prompt += TEXT("用户: 搜索bug→读文件→分析→生成修复方案\n");
+	Prompt += TEXT("🐢 慢: search → read → analyze → report → 4轮\n");
+	Prompt += TEXT("⚡ 快(DAG并行): t1=search, t2=search2(另一个关键词), t3=read(path=$t1.result[0]), t4=analyze(data=$t3.content) → 1轮(t1/t2并行, t3等t1, t4等t3)\n\n");
 
 	if (!MemoryContext.IsEmpty())
 	{
@@ -1289,28 +1583,58 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 
 	// Screenshot tool
 	ToolFunctionTable->Add(assistant::FunctionBuilder("screenshot")
-		.SetDescription("Capture a screenshot of the entire Unreal Engine editor window. Requires vision mode to be enabled.")
-		.AddOptionalParam("mode", "Capture mode: 'viewport' for viewport only, 'editor' for full editor window", "string")
+		.SetDescription("Capture a screenshot of the screen and return the image data. Only available when vision mode is enabled. The AI can see and analyze the screenshot.")
+		.AddOptionalParam("mode", "Capture mode: 'desktop' for full screen (default), 'editor' for editor window", "string")
+		.AddOptionalParam("width", "Target width (default: 1920, max: 1920)", "number")
+		.AddOptionalParam("height", "Target height (default: 1080, max: 1080)", "number")
 		.SetCallback([this](const assistant::json& args) -> assistant::FunctionResult {
-			if (!bVisionModeEnabled)
+			if (!bVisionModeEnabled && !FMCPToolboxAuxModelManager::Get().IsReady())
 			{
-				return {.isError = true, .text = R"({"error":"Vision mode is not enabled. Please enable vision mode first."})"};
+				return {.isError = true, .text = R"RAW({"error":"Vision mode is not enabled. Please enable vision mode first."})RAW"};
 			}
-			
-			std::string Mode = args.value("mode", "editor");
-			if (GEditor)
+
+			if (!FModuleManager::Get().IsModuleLoaded(TEXT("MCPToolboxScreenshot")))
 			{
-				if (Mode == "viewport")
-				{
-					GEditor->Exec(nullptr, TEXT("HighResShot 1920x1080"));
-				}
-				else
-				{
-					GEditor->Exec(nullptr, TEXT("HighResShot"));
-				}
-				return {.isError = false, .text = R"({"status":"ok","message":"Screenshot saved to Saved/Screenshots/"})"};
+				FModuleManager::Get().LoadModule(TEXT("MCPToolboxScreenshot"));
 			}
-			return {.isError = true, .text = R"({"error":"Editor not available"})"};
+
+			FMCPToolboxScreenshotModule& ScreenshotModule = 
+				FModuleManager::GetModuleChecked<FMCPToolboxScreenshotModule>(TEXT("MCPToolboxScreenshot"));
+
+			std::string Mode = args.value("mode", "desktop");
+			int32 Width = args.value("width", 1280);
+			int32 Height = args.value("height", 720);
+
+			Width = FMath::Clamp(Width, 320, 1920);
+			Height = FMath::Clamp(Height, 240, 1080);
+
+			FString Base64Image;
+			if (Mode == "desktop" || Mode == "fullscreen")
+			{
+				Base64Image = ScreenshotModule.CaptureScreenshot(true, false, Width, Height);
+			}
+			else
+			{
+				Base64Image = ScreenshotModule.CaptureScreenshot(true, false, Width, Height);
+			}
+
+			if (Base64Image.IsEmpty())
+			{
+				return {.isError = true, .text = R"RAW({"error":"Failed to capture screenshot"})RAW"};
+			}
+
+			// Avoid FString::Printf copying large base64; concat manually
+			FString ResultJson;
+			ResultJson.Reserve(Base64Image.Len() + 128);
+			ResultJson += TEXT("{\"status\":\"ok\",\"format\":\"jpeg\",\"width\":");
+			ResultJson.AppendInt(Width);
+			ResultJson += TEXT(",\"height\":");
+			ResultJson.AppendInt(Height);
+			ResultJson += TEXT(",\"data_uri\":\"data:image/jpeg;base64,");
+			ResultJson += Base64Image;
+			ResultJson += TEXT("\"}");
+
+			return {.isError = false, .text = TCHAR_TO_UTF8(*ResultJson)};
 		}).Build());
 
 	// Command tool
@@ -1394,6 +1718,182 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			return {.isError = false, .text = Result};
 		}).Build());
 
+	// Batch read files tool
+	ToolFunctionTable->Add(assistant::FunctionBuilder("batch_read_files")
+		.SetDescription("Read multiple files at once. Returns contents of all files in a single response. Use this instead of reading files one by one to save time.")
+		.AddRequiredParam("file_paths", "Array of absolute file paths to read", "array")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			if (!args.contains("file_paths") || !args["file_paths"].is_array())
+			return {.isError = true, .text = R"RAW({"error":"Missing file_paths parameter (must be array)"})RAW"};
+
+			std::string Result = R"({"status":"ok","files":[)";
+			bool bFirst = true;
+			
+			for (const auto& PathItem : args["file_paths"])
+			{
+				if (!PathItem.is_string()) continue;
+				std::string StdPath = PathItem.get<std::string>();
+				FString FilePath = UTF8_TO_TCHAR(StdPath.c_str());
+				
+				FString Content;
+				bool bSuccess = FFileHelper::LoadFileToString(Content, *FilePath);
+				
+				if (!bFirst) Result += ",";
+				bFirst = false;
+				
+				Result += R"({"path":")" + StdPath + R"(",)";
+				if (bSuccess)
+				{
+					std::string StdContent = TCHAR_TO_UTF8(*Content);
+					Result += R"("success":true,"content":")" + StdContent + R"("})";
+				}
+				else
+				{
+					Result += R"("success":false,"error":"Failed to read file"})";
+				}
+			}
+			Result += "]}";
+			return {.isError = false, .text = Result};
+		}).Build());
+
+	// Search codebase tool
+	ToolFunctionTable->Add(assistant::FunctionBuilder("search_codebase")
+		.SetDescription("Search for code patterns across the entire codebase using regex. Returns matching files and line numbers.")
+		.AddRequiredParam("pattern", "Regex pattern to search for", "string")
+		.AddOptionalParam("path", "Directory to search in (defaults to project source directory)", "string")
+		.AddOptionalParam("file_pattern", "File glob pattern, e.g. *.cpp, *.h (defaults to *.cpp,*.h)", "string")
+		.AddOptionalParam("max_results", "Maximum number of results to return (default 50)", "number")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Pattern = args.value("pattern", "");
+			if (Pattern.empty())
+				return {.isError = true, .text = R"({"error":"Missing pattern parameter"})"};
+
+			std::string SearchPath = args.value("path", "");
+			FString BaseDir = SearchPath.empty() ? FPaths::ProjectDir() / TEXT("Source") : UTF8_TO_TCHAR(SearchPath.c_str());
+			
+			std::string FilePattern = args.value("file_pattern", "*.cpp,*.h");
+			int32 MaxResults = args.value("max_results", 50);
+			
+			TArray<FString> FileTypes;
+			FString FilePatternStr = UTF8_TO_TCHAR(FilePattern.c_str());
+			FilePatternStr.ParseIntoArray(FileTypes, TEXT(","), true);
+			
+			TArray<FString> AllFiles;
+			for (const FString& Ext : FileTypes)
+			{
+				TArray<FString> FoundFiles;
+				IFileManager::Get().FindFilesRecursive(FoundFiles, *BaseDir, *Ext.TrimStartAndEnd(), true, false);
+				AllFiles.Append(FoundFiles);
+			}
+			
+			std::string Result = R"({"status":"ok","pattern":")" + Pattern + R"(","results":[)";
+			int32 ResultCount = 0;
+			bool bFirst = true;
+			
+			FString SearchPattern = UTF8_TO_TCHAR(Pattern.c_str());
+			
+			for (const FString& FilePath : AllFiles)
+			{
+				if (ResultCount >= MaxResults) break;
+				
+				FString Content;
+				if (!FFileHelper::LoadFileToString(Content, *FilePath)) continue;
+				
+				TArray<FString> Lines;
+				Content.ParseIntoArrayLines(Lines);
+				
+				for (int32 i = 0; i < Lines.Num() && ResultCount < MaxResults; ++i)
+				{
+					if (Lines[i].Contains(SearchPattern))
+					{
+						if (!bFirst) Result += ",";
+						bFirst = false;
+						
+						std::string StdPath = TCHAR_TO_UTF8(*FilePath);
+						std::string StdLine = TCHAR_TO_UTF8(*Lines[i].TrimStartAndEnd());
+						
+						Result += R"({"file":")" + StdPath + R"(",)"
+							+ R"("line":)" + std::to_string(i + 1) + R"(,)"
+							+ R"("content":")" + StdLine + R"("})";
+						ResultCount++;
+					}
+				}
+			}
+			Result += R"(],"total":)" + std::to_string(ResultCount) + "}";
+			return {.isError = false, .text = Result};
+		}).Build());
+
+	// Glob search tool
+	ToolFunctionTable->Add(assistant::FunctionBuilder("glob_search")
+		.SetDescription("Search for files matching a glob pattern. Returns list of matching file paths.")
+		.AddRequiredParam("pattern", "Glob pattern to match, e.g. *.cpp, **/*.h", "string")
+		.AddOptionalParam("path", "Base directory to search from (defaults to project directory)", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Pattern = args.value("pattern", "");
+			if (Pattern.empty())
+				return {.isError = true, .text = R"({"error":"Missing pattern parameter"})"};
+
+			std::string BasePath = args.value("path", "");
+			FString BaseDir = BasePath.empty() ? FPaths::ProjectDir() : UTF8_TO_TCHAR(BasePath.c_str());
+			FString SearchPattern = UTF8_TO_TCHAR(Pattern.c_str());
+			
+			TArray<FString> FoundFiles;
+			
+			if (SearchPattern.Contains(TEXT("**")))
+			{
+				FString LeafPattern = FPaths::GetCleanFilename(SearchPattern);
+				if (LeafPattern.IsEmpty()) LeafPattern = TEXT("*");
+				IFileManager::Get().FindFilesRecursive(FoundFiles, *BaseDir, *LeafPattern, true, false);
+			}
+			else
+			{
+				IFileManager::Get().FindFiles(FoundFiles, *(BaseDir / SearchPattern), false, false);
+			}
+			
+			std::string Result = R"({"status":"ok","pattern":")" + Pattern + R"(","files":[)";
+			for (int32 i = 0; i < FoundFiles.Num(); ++i)
+			{
+				if (i > 0) Result += ",";
+				FString FullPath = BaseDir / FoundFiles[i];
+				Result += R"(")" + std::string(TCHAR_TO_UTF8(*FullPath)) + R"(")";
+			}
+			Result += R"(],"count":)" + std::to_string(FoundFiles.Num()) + "}";
+			return {.isError = false, .text = Result};
+		}).Build());
+
+	// List directory tool
+	ToolFunctionTable->Add(assistant::FunctionBuilder("list_directory")
+		.SetDescription("List contents of a directory. Returns files and subdirectories.")
+		.AddRequiredParam("path", "Directory path to list", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Path = args.value("path", "");
+			if (Path.empty())
+				return {.isError = true, .text = R"({"error":"Missing path parameter"})"};
+
+			FString DirPath = UTF8_TO_TCHAR(Path.c_str());
+			
+			TArray<FString> Files;
+			TArray<FString> Dirs;
+			
+			IFileManager::Get().FindFiles(Files, *(DirPath / TEXT("*")), true, false);
+			IFileManager::Get().FindFiles(Dirs, *(DirPath / TEXT("*")), false, true);
+			
+			std::string Result = R"({"status":"ok","path":")" + Path + R"(","directories":[)";
+			for (int32 i = 0; i < Dirs.Num(); ++i)
+			{
+				if (i > 0) Result += ",";
+				Result += R"(")" + std::string(TCHAR_TO_UTF8(*Dirs[i])) + R"(")";
+			}
+			Result += R"(],"files":[)";
+			for (int32 i = 0; i < Files.Num(); ++i)
+			{
+				if (i > 0) Result += ",";
+				Result += R"(")" + std::string(TCHAR_TO_UTF8(*Files[i])) + R"(")";
+			}
+			Result += "]}";
+			return {.isError = false, .text = Result};
+		}).Build());
+
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 已注册 %d 个MCP工具"), ToolFunctionTable->GetFunctionsCount());
 }
 
@@ -1461,12 +1961,27 @@ FReply SMCPToolboxChatWidget::OnClearChat()
 FReply SMCPToolboxChatWidget::OnToggleVisionMode()
 {
 	bVisionModeEnabled = !bVisionModeEnabled;
-	
-	FNotificationInfo Info(bVisionModeEnabled ? LOCTEXT("VisionModeEnabled", "视觉模式已开启 - 截图和图片上传功能可用") : LOCTEXT("VisionModeDisabled", "视觉模式已关闭"));
+
+	bool bHasLocalVL = FMCPToolboxAuxModelManager::Get().IsReady();
+	FString Note;
+	if (bVisionModeEnabled)
+		Note = TEXT("视觉模式已开启 — 图片由云端 AI 处理");
+	else if (bHasLocalVL)
+		Note = TEXT("视觉模式已关闭 — 图片由本地辅助模型 (Qwen3VL) 分析");
+	else
+		Note = TEXT("视觉模式已关闭 — 图片功能不可用");
+
+	FNotificationInfo Info(FText::FromString(Note));
 	Info.ExpireDuration = 3.0f;
 	FSlateNotificationManager::Get().AddNotification(Info);
 	
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Vision mode %s"), bVisionModeEnabled ? TEXT("enabled") : TEXT("disabled"));
+	return FReply::Handled();
+}
+
+FReply SMCPToolboxChatWidget::OnToggleSidebar()
+{
+	bSidebarCollapsed = !bSidebarCollapsed;
 	return FReply::Handled();
 }
 // ============================================================================
@@ -1535,6 +2050,22 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 						return FLinearColor(0.5f, 0.5f, 0.5f);
 					})
 				]
+				// Aux Model status
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 12, 0))
+				[
+					SNew(STextBlock)
+					.Text_Lambda([]() -> FText
+					{
+						return FText::FromString(FMCPToolboxAuxModelManager::Get().GetStatusText());
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity_Lambda([]() -> FLinearColor
+					{
+						return FMCPToolboxAuxModelManager::Get().IsReady()
+							? FLinearColor(0.3f, 0.85f, 0.4f)
+							: FLinearColor(0.45f, 0.45f, 0.45f);
+					})
+				]
 				// AI status
 				+ SHorizontalBox::Slot().AutoWidth()
 				[
@@ -1565,6 +2096,24 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 						.Text_Lambda([this]() -> FText
 						{
 							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "👁 视觉模式") : LOCTEXT("VisionDisabled", "视觉: 关闭");
+						})
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					]
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
+				[
+					SNew(SButton)
+					.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
+					{
+						return bSidebarCollapsed ? FLinearColor(0.2f, 0.2f, 0.25f) : FLinearColor(0.15f, 0.15f, 0.18f);
+					})
+					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+					.Content()
+					[
+						SNew(STextBlock)
+						.Text_Lambda([this]() -> FText
+						{
+							return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 显示对话") : LOCTEXT("SidebarHide", "☰ 隐藏对话");
 						})
 						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					]
@@ -1653,6 +2202,437 @@ FLinearColor SMCPToolboxChatWidget::GetMessageColor(EMCPToolboxMessageRole Role)
 	case EMCPToolboxMessageRole::Thinking:   return FLinearColor(0.08f, 0.08f, 0.12f);
 	default:                                 return FLinearColor(0.1f, 0.1f, 0.1f);
 	}
+}
+
+// ============================================================================
+// DAG Parallel Execution
+// ============================================================================
+
+bool SMCPToolboxChatWidget::HasDAGDependencies(const TArray<TSharedPtr<FJsonValue>>& ToolCalls) const
+{
+	// 有多个工具调用就启用 DAG 路径（用于可视化+并行执行）
+	// 无依赖的任务会在同一批次并行执行，和原来效率一样
+	if (ToolCalls.Num() >= 2)
+	{
+		return true;
+	}
+
+	// 单个工具调用也检查是否有显式依赖
+	for (const TSharedPtr<FJsonValue>& TC : ToolCalls)
+	{
+		TSharedPtr<FJsonObject> TCObj = TC->AsObject();
+		if (!TCObj.IsValid()) continue;
+
+		const TSharedPtr<FJsonObject>* Func = nullptr;
+		if (!TCObj->TryGetObjectField(TEXT("function"), Func) || !Func->IsValid())
+			continue;
+
+		FString ArgsStr;
+		(*Func)->TryGetStringField(TEXT("arguments"), ArgsStr);
+
+		if (ArgsStr.Contains(TEXT("$t")))
+		{
+			return true;
+		}
+
+		if (TCObj->HasField(TEXT("depends_on")) || TCObj->HasField(TEXT("task_id")))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void SMCPToolboxChatWidget::ConvertToolCallsToDAGFormat(
+	const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
+	TArray<TSharedPtr<FJsonObject>>& OutDAGCalls) const
+{
+	OutDAGCalls.Empty();
+
+	for (int32 i = 0; i < ToolCalls.Num(); ++i)
+	{
+		TSharedPtr<FJsonObject> TCObj = ToolCalls[i]->AsObject();
+		if (!TCObj.IsValid()) continue;
+
+		const TSharedPtr<FJsonObject>* Func = nullptr;
+		if (!TCObj->TryGetObjectField(TEXT("function"), Func) || !Func->IsValid())
+			continue;
+
+		FString FuncName;
+		FString ArgsStr;
+		(*Func)->TryGetStringField(TEXT("name"), FuncName);
+		(*Func)->TryGetStringField(TEXT("arguments"), ArgsStr);
+
+		TSharedPtr<FJsonObject> DAGCall = MakeShareable(new FJsonObject());
+
+		FString TaskId;
+		if (!TCObj->TryGetStringField(TEXT("id"), TaskId) || TaskId.IsEmpty())
+		{
+			TaskId = FString::Printf(TEXT("t%d"), i + 1);
+		}
+		DAGCall->SetStringField(TEXT("task_id"), TaskId);
+		DAGCall->SetStringField(TEXT("tool_id"), FuncName);
+
+		TSharedPtr<FJsonObject> Params = MakeShareable(new FJsonObject());
+		if (!ArgsStr.IsEmpty())
+		{
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgsStr);
+			TSharedPtr<FJsonObject> ParsedArgs;
+			if (FJsonSerializer::Deserialize(Reader, ParsedArgs) && ParsedArgs.IsValid())
+			{
+				Params = ParsedArgs;
+			}
+		}
+		DAGCall->SetObjectField(TEXT("parameters"), Params);
+
+		TArray<FString> Dependencies;
+		const TArray<TSharedPtr<FJsonValue>>* DepsArray = nullptr;
+		if (TCObj->TryGetArrayField(TEXT("depends_on"), DepsArray))
+		{
+			for (const TSharedPtr<FJsonValue>& DepVal : *DepsArray)
+			{
+				Dependencies.Add(DepVal->AsString());
+			}
+		}
+		else
+		{
+			for (const auto& Pair : Params->Values)
+			{
+				if (Pair.Value->Type == EJson::String)
+				{
+					FString ValStr = Pair.Value->AsString();
+					if (ValStr.StartsWith(TEXT("$")))
+					{
+						FString Ref = ValStr.Mid(1);
+						int32 DotIdx;
+						if (Ref.FindChar(TEXT('.'), DotIdx))
+						{
+							Ref = Ref.Left(DotIdx);
+						}
+						if (!Dependencies.Contains(Ref) && Ref.StartsWith(TEXT("t")))
+						{
+							Dependencies.Add(Ref);
+						}
+					}
+				}
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> DepsJson;
+		for (const FString& Dep : Dependencies)
+		{
+			DepsJson.Add(MakeShareable(new FJsonValueString(Dep)));
+		}
+		DAGCall->SetArrayField(TEXT("depends_on"), DepsJson);
+
+		OutDAGCalls.Add(DAGCall);
+	}
+}
+
+void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
+	const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
+	const TArray<TSharedPtr<FJsonValue>>& SentMessages,
+	const TSharedPtr<FJsonObject>& AssistantMsg)
+{
+	UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] Starting DAG execution for %d tool calls"), ToolCalls.Num());
+
+	TArray<TSharedPtr<FJsonObject>> DAGCalls;
+	ConvertToolCallsToDAGFormat(ToolCalls, DAGCalls);
+
+	TSet<FString> AvailableToolIds;
+	if (MCPServerClient.IsConnected())
+	{
+		for (const TSharedPtr<FJsonObject>& Tool : MCPServerClient.GetTools())
+		{
+			FString ToolName;
+			if (Tool->TryGetStringField(TEXT("name"), ToolName))
+				AvailableToolIds.Add(ToolName);
+		}
+	}
+
+	// 添加本地工具到可用列表
+	{
+		// Use GetAllFunctions() directly (avoids JSON serialization round-trip)
+		for (const auto& Pair : ToolFunctionTable->GetAllFunctions())
+			AvailableToolIds.Add(FString(Pair.first.c_str()));
+	}
+
+	FExecutionPlan Plan;
+	FString PlanError;
+	if (!ExecutionPlanner.CreatePlan(DAGCalls, AvailableToolIds, Plan, PlanError))
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[DAG] Plan failed: %s, fallback to original path"), *PlanError);
+		return;
+	}
+
+	// 显示 DAG 可视化
+	FString DAGVisual = ExecutionPlanner.VisualizeDAG(Plan);
+	UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] Plan:\n%s"), *DAGVisual);
+
+	FMCPToolboxChatMessage DAGMsg;
+	DAGMsg.Role = EMCPToolboxMessageRole::Thinking;
+	DAGMsg.Content = FString::Printf(TEXT("⚡ DAG 并行执行 (加速比: %.1fx)\n```\n%s\n```"),
+		ExecutionPlanner.EstimateSpeedup(Plan), *DAGVisual);
+	AddMessage(DAGMsg);
+
+	// 准备消息列表
+	TSharedPtr<TArray<TSharedPtr<FJsonValue>>> NewMsgs = MakeShared<TArray<TSharedPtr<FJsonValue>>>(SentMessages);
+	NewMsgs->Add(MakeShareable(new FJsonValueObject(AssistantMsg)));
+
+	// 构建 ID 映射
+	TMap<FString, FString> DAGToOrigId;
+	TMap<FString, FString> DAGToToolName;
+	TMap<FString, FString> DAGToArgs;
+	for (int32 i = 0; i < ToolCalls.Num() && i < DAGCalls.Num(); ++i)
+	{
+		FString OrigId;
+		ToolCalls[i]->AsObject()->TryGetStringField(TEXT("id"), OrigId);
+		FString DAGId;
+		DAGCalls[i]->TryGetStringField(TEXT("task_id"), DAGId);
+		FString ToolName;
+		DAGCalls[i]->TryGetStringField(TEXT("tool_id"), ToolName);
+
+		const TSharedPtr<FJsonObject>* ParamsObj = nullptr;
+		FString ArgsStr;
+		if (DAGCalls[i]->TryGetObjectField(TEXT("parameters"), ParamsObj) && ParamsObj->IsValid())
+		{
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ArgsStr);
+			FJsonSerializer::Serialize(ParamsObj->ToSharedRef(), Writer);
+		}
+
+		DAGToOrigId.Add(DAGId, OrigId.IsEmpty() ? DAGId : OrigId);
+		DAGToToolName.Add(DAGId, ToolName);
+		DAGToArgs.Add(DAGId, ArgsStr);
+	}
+
+	// 获取并行批次
+	TArray<TArray<FDAGTaskNode>> Batches;
+	ExecutionPlanner.GetParallelBatches(Plan, Batches);
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] %d batches to execute"), Batches.Num());
+
+	// 批次执行状态
+	TSharedPtr<TMap<FString, FTaskExecutionResult>> AllResults = MakeShared<TMap<FString, FTaskExecutionResult>>();
+	TSharedPtr<int32> CurrentBatch = MakeShared<int32>(0);
+
+	TSharedPtr<TFunction<void()>> ExecuteNextBatchPtr = MakeShared<TFunction<void()>>();
+	TWeakPtr<TFunction<void()>> WeakNextBatch = ExecuteNextBatchPtr;
+
+	*ExecuteNextBatchPtr = [this, Batches, CurrentBatch, AllResults, NewMsgs, DAGToOrigId, DAGToToolName, WeakNextBatch]()
+	{
+		TSharedPtr<TFunction<void()>> ExecuteNextBatch = WeakNextBatch.Pin();
+		if (!ExecuteNextBatch)
+			return;
+
+		if (*CurrentBatch >= Batches.Num())
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] All batches complete, total tasks: %d"), AllResults->Num());
+
+			for (const auto& Pair : *AllResults)
+			{
+				const FTaskExecutionResult& Res = Pair.Value;
+				const FString& DAGId = Res.TaskId;
+
+				const FString* OrigId = DAGToOrigId.Find(DAGId);
+				const FString* ToolName = DAGToToolName.Find(DAGId);
+
+				FString CallId = OrigId ? *OrigId : DAGId;
+				FString Name = ToolName ? *ToolName : DAGId;
+
+				// 结果消息
+				FMCPToolboxChatMessage ResultMsg;
+				ResultMsg.Role = EMCPToolboxMessageRole::System;
+				FString Status = Res.bSuccess ? TEXT("✓") : TEXT("✗");
+				ResultMsg.Content = FString::Printf(
+					TEXT("**%s %s** (%dms)\n```\n%s\n```"),
+					*Status, *Name,
+					FMath::RoundToInt(Res.LatencyMs),
+					*Res.ResultJson.Left(500));
+				AddMessage(ResultMsg);
+
+				// 构建 tool 消息
+				TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+				ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+				ToolResultMsg->SetStringField(TEXT("tool_call_id"), CallId);
+				ToolResultMsg->SetStringField(TEXT("name"), Name);
+				ToolResultMsg->SetStringField(TEXT("content"), Res.ResultJson);
+				NewMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+				// 截图结果处理：添加用户消息包含图片
+				if (Name == TEXT("screenshot") && Res.bSuccess)
+				{
+					TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Res.ResultJson);
+					TSharedPtr<FJsonObject> ResultObj;
+					if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+					{
+						FString DataURI;
+						if (ResultObj->TryGetStringField(TEXT("data_uri"), DataURI) && !DataURI.IsEmpty())
+						{
+							TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+							TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+							TextPart->SetStringField(TEXT("type"), TEXT("text"));
+							TextPart->SetStringField(TEXT("text"), TEXT("Here is the screenshot you requested. Please analyze it."));
+							ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+							TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+							ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+							TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+							ImageUrlObj->SetStringField(TEXT("url"), DataURI);
+							ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+							ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+
+							TSharedPtr<FJsonObject> ScreenshotUserMsg = MakeShareable(new FJsonObject());
+							ScreenshotUserMsg->SetStringField(TEXT("role"), TEXT("user"));
+							ScreenshotUserMsg->SetArrayField(TEXT("content"), ContentArray);
+							NewMsgs->Add(MakeShareable(new FJsonValueObject(ScreenshotUserMsg)));
+
+							FMCPToolboxChatMessage ScreenshotMsg;
+							ScreenshotMsg.Role = EMCPToolboxMessageRole::User;
+							ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
+							ScreenshotMsg.bHasImageAttachment = true;
+							ScreenshotMsg.ImageDataURIs.Add(DataURI);
+							AddMessage(ScreenshotMsg);
+						}
+					}
+				}
+			}
+
+			// IdleSpec: inject speculation hint to accelerate next round
+			InjectSpeculationHint(*NewMsgs, LastSpeculation, bSpeculationPending);
+
+			UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] Done, continuing conversation"));
+			SendAIRequest(*NewMsgs);
+			return;
+		}
+
+		const TArray<FDAGTaskNode>& Batch = Batches[*CurrentBatch];
+		(*CurrentBatch)++;
+
+		UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] Executing batch %d with %d tasks"), *CurrentBatch, Batch.Num());
+
+		if (Batch.Num() == 0)
+		{
+			(*ExecuteNextBatch)();
+			return;
+		}
+
+		TSharedPtr<int32> Pending = MakeShared<int32>(Batch.Num());
+
+		for (const FDAGTaskNode& Task : Batch)
+		{
+			FString TaskId = Task.TaskId;
+			FString ToolId = Task.ToolId;
+
+			// 解析参数依赖
+			TSharedPtr<FJsonObject> ResolvedParams = MakeShareable(new FJsonObject());
+			if (Task.Parameters.IsValid())
+			{
+				for (const auto& ParamPair : Task.Parameters->Values)
+				{
+					const FString Key(ParamPair.Key);
+					const TSharedPtr<FJsonValue>& Val = ParamPair.Value;
+
+					if (Val->Type == EJson::String)
+					{
+						FString StrVal = Val->AsString();
+						if (StrVal.StartsWith(TEXT("$")))
+						{
+							FString Ref = StrVal.Mid(1);
+							FString RefTaskId = Ref;
+							int32 DotIdx;
+							if (Ref.FindChar(TEXT('.'), DotIdx))
+								RefTaskId = Ref.Left(DotIdx);
+
+							const FTaskExecutionResult* DepResult = AllResults->Find(RefTaskId);
+							if (DepResult)
+							{
+								ResolvedParams->SetStringField(Key, DepResult->ResultJson);
+								continue;
+							}
+						}
+					}
+					ResolvedParams->SetField(Key, Val);
+				}
+			}
+
+			FString ArgsJson;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ArgsJson);
+			FJsonSerializer::Serialize(ResolvedParams.ToSharedRef(), Writer);
+
+			double StartTime = FDateTime::Now().ToUnixTimestamp() * 1000.0;
+
+			// 判断工具类型
+			bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(ToolId);
+
+			if (bIsMCP)
+			{
+				// IdleSpec: speculative execution for DAG mode
+				LaunchIdleSpec(ToolId);
+
+				MCPServerClient.ExecuteTool(ToolId, ArgsJson,
+					[this, TaskId, Pending, StartTime, AllResults, ExecuteNextBatch](bool bOk, const FString& Result)
+					{
+						FTaskExecutionResult Res;
+						Res.TaskId = TaskId;
+						Res.bSuccess = bOk;
+						Res.ResultJson = Result;
+						Res.LatencyMs = FDateTime::Now().ToUnixTimestamp() * 1000.0 - StartTime;
+						Res.Attempts = 1;
+						AllResults->Add(TaskId, Res);
+
+						(*Pending)--;
+						if (*Pending <= 0)
+						{
+							(*ExecuteNextBatch)();
+						}
+					});
+			}
+			else
+			{
+				// 本地工具：放到后台线程执行
+				AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
+					[this, TaskId, ToolId, ArgsJson, Pending, StartTime, AllResults, ExecuteNextBatch]()
+					{
+						FString Result;
+						bool bSuccess = false;
+						try
+						{
+							Result = ExecuteToolCall(ToolId, ArgsJson);
+							bSuccess = true;
+						}
+						catch (...)
+						{
+							Result = TEXT("Exception during tool execution");
+							bSuccess = false;
+						}
+
+						double Latency = FDateTime::Now().ToUnixTimestamp() * 1000.0 - StartTime;
+
+						AsyncTask(ENamedThreads::GameThread,
+							[TaskId, bSuccess, Result, Latency, Pending, AllResults, ExecuteNextBatch]()
+							{
+								FTaskExecutionResult Res;
+								Res.TaskId = TaskId;
+								Res.bSuccess = bSuccess;
+								Res.ResultJson = Result;
+								Res.LatencyMs = Latency;
+								Res.Attempts = 1;
+								AllResults->Add(TaskId, Res);
+
+								(*Pending)--;
+								if (*Pending <= 0)
+								{
+									(*ExecuteNextBatch)();
+								}
+							});
+					});
+			}
+		}
+	};
+
+	(*ExecuteNextBatchPtr)();
 }
 
 FString SMCPToolboxChatWidget::EncodeFileToDataURI(const FString& FilePath) const
@@ -1875,6 +2855,430 @@ FReply SMCPToolboxChatWidget::ToggleSidebar()
 {
 	bSidebarCollapsed = !bSidebarCollapsed;
 	return FReply::Handled();
+}
+
+// ============================================================================
+// Auxiliary Model Integration — IdleSpec + SWE-Pruner
+// ============================================================================
+
+void SMCPToolboxChatWidget::LaunchIdleSpec(const FString& CurrentToolName)
+{
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+	if (!AuxMgr.IsReady()) return;
+
+	// Build conversation context from Messages array
+	FString ContextStr;
+	for (const FMCPToolboxChatMessage& Msg : Messages)
+	{
+		FString RoleName;
+		switch (Msg.Role)
+		{
+		case EMCPToolboxMessageRole::User:      RoleName = TEXT("user"); break;
+		case EMCPToolboxMessageRole::Assistant:  RoleName = TEXT("assistant"); break;
+		case EMCPToolboxMessageRole::System:     RoleName = TEXT("system"); break;
+		case EMCPToolboxMessageRole::Thinking:   RoleName = TEXT("thinking"); break;
+		}
+		FString Truncated = Msg.Content.Len() > 300 ? Msg.Content.Left(300) + TEXT("...") : Msg.Content;
+		ContextStr += FString::Printf(TEXT("<%s>: %s\n"), *RoleName, *Truncated);
+	}
+
+	bSpeculationPending = true;
+
+	// Store the tool name so the deferred continuation can use it when speculation completes
+	PendingSpecToolName = CurrentToolName;
+
+	// Collect available tool names for better prediction
+	TArray<FString> AvailableTools;
+	if (ToolFunctionTable)
+	{
+		for (const auto& Pair : ToolFunctionTable->GetAllFunctions())
+			AvailableTools.Add(FString(Pair.first.c_str()));
+	}
+
+	AuxMgr.LaunchSpeculation(ContextStr, CurrentToolName, AvailableTools,
+		[this](const FSpeculativeResult& Result)
+	{
+		bSpeculationPending = false;
+		LastSpeculation = Result;
+
+		if (Result.IsValid())
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[IdleSpec] Predicted: %s → %s (%.0fms)"),
+				*Result.PredictedToolName, *Result.PredictedReasoning, Result.InferenceTimeMs);
+		}
+
+		// If tool completion is waiting for the speculation, continue now
+		if (bPendingToolCompletion)
+		{
+			bPendingToolCompletion = false;
+			TrySpeculativeOrContinue(DeferredPendingMsgs);
+		}
+	});
+}
+
+void SMCPToolboxChatWidget::TrySpeculativeOrContinue(TSharedPtr<TArray<TSharedPtr<FJsonValue>>> PendingMsgs)
+{
+	if (bSpeculationPending)
+	{
+		// Still waiting — store for later
+		bPendingToolCompletion = true;
+		DeferredPendingMsgs = PendingMsgs;
+		return;
+	}
+
+	bool bSpecExecuted = false;
+	if (LastSpeculation.IsValid())
+	{
+		bSpecExecuted = TrySpeculativeExecution(*PendingMsgs);
+	}
+
+	if (!bSpecExecuted)
+	{
+		InjectSpeculationHint(*PendingMsgs, LastSpeculation, bSpeculationPending);
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 工具调用完成(MCP), 继续对话"));
+		SendAIRequest(*PendingMsgs);
+	}
+}
+
+/** Preprocess images in messages through local VL model (when vision mode is OFF but aux VL available) */
+void SMCPToolboxChatWidget::PreprocessImagesLocally(
+	const TArray<TSharedPtr<FJsonValue>>& Msgs,
+	TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnDone)
+{
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+
+	// Find the last user message with image content
+	int32 TargetIdx = -1;
+	FString Base64Data;
+
+	for (int32 i = Msgs.Num() - 1; i >= 0; --i)
+	{
+		TSharedPtr<FJsonObject> Obj = Msgs[i]->AsObject();
+		FString Role;
+		Obj->TryGetStringField(TEXT("role"), Role);
+		if (Role != TEXT("user")) continue;
+
+		const TArray<TSharedPtr<FJsonValue>>* Arr;
+		if (Obj->TryGetArrayField(TEXT("content"), Arr))
+		{
+			for (const auto& Part : *Arr)
+			{
+				TSharedPtr<FJsonObject> PartObj = Part->AsObject();
+				if (!PartObj.IsValid()) continue;
+				FString Type;
+				if (PartObj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("image_url"))
+				{
+					TargetIdx = i;
+					const TSharedPtr<FJsonObject>* ImgUrlObj = nullptr;
+					if (PartObj->TryGetObjectField(TEXT("image_url"), ImgUrlObj) && ImgUrlObj)
+					{
+						FString URL;
+						(*ImgUrlObj)->TryGetStringField(TEXT("url"), URL);
+						int32 Comma = URL.Find(TEXT("base64,"));
+						Base64Data = (Comma != INDEX_NONE) ? URL.Mid(Comma + 7) : URL;
+					}
+					break;
+				}
+			}
+		}
+		if (TargetIdx >= 0) break;
+	}
+
+	if (TargetIdx < 0 || Base64Data.IsEmpty())
+	{
+		if (OnDone) OnDone(Msgs);
+		return;
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Analyzing image locally (vision OFF, aux VL available)..."));
+	double StartTime = FPlatformTime::Seconds();
+
+	AuxMgr.AnalyzeImage(Base64Data, TEXT("Please describe this image in detail, including all visible text, UI elements, and important details."),
+		[this, Msgs = TArray<TSharedPtr<FJsonValue>>(Msgs), TargetIdx, OnDone, StartTime](const FString& Description)
+	{
+		double ElapsedSec = FPlatformTime::Seconds() - StartTime;
+		TArray<TSharedPtr<FJsonValue>> Modified(Msgs);
+		if (!Description.IsEmpty())
+		{
+			// Shallow-copy only the target message and replace its content
+			TSharedPtr<FJsonObject> Target = MakeShareable(new FJsonObject(*Modified[TargetIdx]->AsObject()));
+			TArray<TSharedPtr<FJsonValue>> NewContent;
+			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+			TextPart->SetStringField(TEXT("type"), TEXT("text"));
+			TextPart->SetStringField(TEXT("text"),
+				FString::Printf(TEXT("[Image description via local VL model (%.1fs)]\n%s"), ElapsedSec, *Description));
+			NewContent.Add(MakeShareable(new FJsonValueObject(TextPart)));
+			Target->SetArrayField(TEXT("content"), NewContent);
+			Modified[TargetIdx] = MakeShareable(new FJsonValueObject(Target));
+			UE_LOG(LogMCPToolbox, Log, TEXT("[VL] Local image analysis complete (%.1fs): %s"), ElapsedSec, *Description.Left(80));
+		}
+		else
+		{
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[VL] Local image analysis failed, falling back to raw message"));
+		}
+
+		if (OnDone) OnDone(Modified);
+	});
+}
+
+/** Try to auto-execute the speculated tool call — skip LLM round entirely.
+ *  This is the CPU branch-prediction equivalent for LLM agents.
+ *  If the speculation is wrong, the tool execution just returns an error, harmless. */
+bool SMCPToolboxChatWidget::TrySpeculativeExecution(TArray<TSharedPtr<FJsonValue>>& PendingMsgs)
+{
+	if (!LastSpeculation.IsValid() || bSpeculationPending) return false;
+
+	FString PredictedTool = LastSpeculation.PredictedToolName;
+	bSpeculationPending = false; // consumed
+
+	// Verify predicted tool exists in our function table
+	assistant::FunctionTable& FT = GetFunctionTable();
+	bool bToolExists = false;
+	for (const auto& Pair : FT.GetAllFunctions())
+	{
+		if (FString(Pair.first.c_str()).Equals(PredictedTool, ESearchCase::IgnoreCase))
+		{
+			bToolExists = true;
+			break;
+		}
+	}
+
+	if (!bToolExists)
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[IdleSpec] Predicted '%s' not in function table, fallback to LLM"), *PredictedTool);
+		return false;
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[IdleSpec] Speculative execute: %s (skip LLM round)"), *PredictedTool);
+
+	// Build tool call object
+	TSharedPtr<FJsonObject> TCObj = MakeShareable(new FJsonObject());
+	FString SpecId = FString::Printf(TEXT("spec_%s_%d"), *PredictedTool, FMath::Rand());
+	TCObj->SetStringField(TEXT("id"), SpecId);
+	TCObj->SetStringField(TEXT("type"), TEXT("function"));
+
+	TSharedPtr<FJsonObject> FuncObj = MakeShareable(new FJsonObject());
+	FuncObj->SetStringField(TEXT("name"), PredictedTool);
+	FuncObj->SetStringField(TEXT("arguments"), TEXT("{}"));
+	TCObj->SetObjectField(TEXT("function"), FuncObj);
+
+	// Inject fake assistant message with tool_calls
+	TArray<TSharedPtr<FJsonValue>> SpecToolCallsArr;
+	SpecToolCallsArr.Add(MakeShareable(new FJsonValueObject(TCObj)));
+
+	TSharedPtr<FJsonObject> SpecMsg = MakeShareable(new FJsonObject());
+	SpecMsg->SetStringField(TEXT("role"), TEXT("assistant"));
+	SpecMsg->SetStringField(TEXT("content"), TEXT(""));
+	SpecMsg->SetStringField(TEXT("reasoning_content"), TEXT("")); // Required by DeepSeek thinking mode
+	SpecMsg->SetArrayField(TEXT("tool_calls"), SpecToolCallsArr);
+	PendingMsgs.Add(MakeShareable(new FJsonValueObject(SpecMsg)));
+
+	// Execute the tool: MCP or local
+	bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(PredictedTool);
+
+	TSharedPtr<TArray<TSharedPtr<FJsonValue>>> SharedMsgs = MakeShared<TArray<TSharedPtr<FJsonValue>>>(MoveTemp(PendingMsgs));
+	TSharedPtr<int32> Pending = MakeShared<int32>(0);
+
+	if (bIsMCP)
+	{
+		(*Pending)++;
+		MCPServerClient.ExecuteTool(PredictedTool, TEXT("{}"),
+			[this, SharedMsgs, Pending, SpecId, PredictedTool](bool bOk, const FString& R)
+		{
+			TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+			ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+			ToolResultMsg->SetStringField(TEXT("tool_call_id"), SpecId);
+			ToolResultMsg->SetStringField(TEXT("name"), PredictedTool);
+			ToolResultMsg->SetStringField(TEXT("content"), R);
+			SharedMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+			FMCPToolboxChatMessage ResultMsg;
+			ResultMsg.Role = EMCPToolboxMessageRole::System;
+			ResultMsg.Content = FString::Printf(TEXT("[IdleSpec] **%s** 结果:\n```\n%s\n```"), *PredictedTool, *R.Left(500));
+			AddMessage(ResultMsg);
+
+			(*Pending)--;
+			if (*Pending <= 0)
+			{
+				UE_LOG(LogMCPToolbox, Log, TEXT("[IdleSpec] Speculative execution complete, continuing"));
+				SendAIRequest(*SharedMsgs);
+			}
+		});
+	}
+	else
+	{
+		FString R = ExecuteToolCall(PredictedTool, TEXT("{}"));
+
+		TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+		ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+		ToolResultMsg->SetStringField(TEXT("tool_call_id"), SpecId);
+		ToolResultMsg->SetStringField(TEXT("name"), PredictedTool);
+		ToolResultMsg->SetStringField(TEXT("content"), R);
+		SharedMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+		FMCPToolboxChatMessage ResultMsg;
+		ResultMsg.Role = EMCPToolboxMessageRole::System;
+		ResultMsg.Content = FString::Printf(TEXT("[IdleSpec] **%s** 结果:\n```\n%s\n```"), *PredictedTool, *R.Left(500));
+		AddMessage(ResultMsg);
+
+		UE_LOG(LogMCPToolbox, Log, TEXT("[IdleSpec] Speculative execution complete, continuing"));
+		SendAIRequest(*SharedMsgs);
+	}
+
+	return true;
+}
+
+/** Inject a speculation hint into PendingMsgs if IdleSpec made a valid prediction */
+static void InjectSpeculationHint(
+	TArray<TSharedPtr<FJsonValue>>& PendingMsgs,
+	const FSpeculativeResult& Spec,
+	bool& bSpeculationPending)
+{
+	if (!Spec.IsValid() || bSpeculationPending) return;
+
+	// Add a system message with the speculation hint to guide the main model
+	TSharedPtr<FJsonObject> HintMsg = MakeShareable(new FJsonObject());
+	HintMsg->SetStringField(TEXT("role"), TEXT("system"));
+	HintMsg->SetStringField(TEXT("content"),
+		FString::Printf(TEXT("[Hint] The next step likely needs tool: %s. Reason: %s"),
+			*Spec.PredictedToolName, *Spec.PredictedReasoning));
+	PendingMsgs.Add(MakeShareable(new FJsonValueObject(HintMsg)));
+}
+
+void SMCPToolboxChatWidget::ApplyPruningBeforeSend(
+	const TArray<TSharedPtr<FJsonValue>>& ApiMessages,
+	TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnPruned)
+{
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+	if (!AuxMgr.IsReady() || ApiMessages.Num() <= 15)
+	{
+		if (OnPruned) OnPruned(ApiMessages);
+		return;
+	}
+
+	// Build numbered message list for the pruner (role + first 200 chars)
+	FString NumberedMsgs;
+	TArray<int32> MsgIndexToOriginal; // maps numbered index → ApiMessages index
+	for (int32 i = 0; i < ApiMessages.Num(); ++i)
+	{
+		TSharedPtr<FJsonObject> Obj = ApiMessages[i]->AsObject();
+		if (!Obj.IsValid()) continue;
+
+		FString Role;
+		Obj->TryGetStringField(TEXT("role"), Role);
+		FString Content;
+		Obj->TryGetStringField(TEXT("content"), Content);
+
+		// Handle array content (multimodal messages)
+		if (Content.IsEmpty())
+		{
+			const TArray<TSharedPtr<FJsonValue>>* ContentArr = nullptr;
+			if (Obj->TryGetArrayField(TEXT("content"), ContentArr))
+			{
+				for (const auto& Part : *ContentArr)
+				{
+					TSharedPtr<FJsonObject> PartObj = Part->AsObject();
+					if (PartObj.IsValid())
+					{
+						FString PartText;
+						if (PartObj->TryGetStringField(TEXT("text"), PartText))
+							Content += PartText + TEXT(" ");
+					}
+				}
+			}
+		}
+
+		FString Truncated = Content.Len() > 200 ? Content.Left(200) + TEXT("...") : Content;
+		Truncated.ReplaceInline(TEXT("\n"), TEXT(" "));
+		Truncated.ReplaceInline(TEXT("\r"), TEXT(""));
+
+		NumberedMsgs += FString::Printf(TEXT("[%d] %s: %s\n"),
+			MsgIndexToOriginal.Num(), *Role, *Truncated);
+		MsgIndexToOriginal.Add(i);
+	}
+
+	// Split into TArray<FString> for structured PruneContext
+	TArray<FString> NumberedBlocks;
+	NumberedMsgs.ParseIntoArray(NumberedBlocks, TEXT("\n"), false);
+	NumberedBlocks.RemoveAll([](const FString& S) { return S.IsEmpty(); });
+
+	// Extract task goal from last user message
+	FString TaskGoal = TEXT("Continue the conversation and assist the user");
+	for (int32 i = ApiMessages.Num() - 1; i >= 0; --i)
+	{
+		TSharedPtr<FJsonObject> Obj = ApiMessages[i]->AsObject();
+		if (Obj.IsValid())
+		{
+			FString Role;
+			if (Obj->TryGetStringField(TEXT("role"), Role) && Role == TEXT("user"))
+			{
+				Obj->TryGetStringField(TEXT("content"), TaskGoal);
+				TaskGoal = TaskGoal.Left(200);
+				break;
+			}
+		}
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[SWE-Pruner] Pruning %d messages, goal=%s"), ApiMessages.Num(), *TaskGoal.Left(60));
+
+	AuxMgr.PruneContext(NumberedBlocks, TaskGoal,
+		[ApiMessages, MsgIndexToOriginal, OnPruned](const FPruningResult& Result)
+	{
+		// Use RemoveIndices directly from pruner (no fragile re-parsing needed)
+		TSet<int32> KeptNumberedIndices;
+		for (int32 i = 0; i < MsgIndexToOriginal.Num(); ++i)
+			KeptNumberedIndices.Add(i);
+
+		for (int32 RemoveIdx : Result.RemoveIndices)
+			KeptNumberedIndices.Remove(RemoveIdx);
+
+		if (Result.ReductionPercent() < 5.0 || KeptNumberedIndices.Num() == 0)
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[SWE-Pruner] Skipped (%.1f%% reduction)"), Result.ReductionPercent());
+			if (OnPruned) OnPruned(ApiMessages);
+			return;
+		}
+
+		// Always keep system message and last 2 messages
+		for (int32 i = 0; i < MsgIndexToOriginal.Num(); ++i)
+		{
+			int32 OrigIdx = MsgIndexToOriginal[i];
+			TSharedPtr<FJsonObject> Obj = ApiMessages[OrigIdx]->AsObject();
+			if (!Obj.IsValid()) continue;
+			FString Role;
+			Obj->TryGetStringField(TEXT("role"), Role);
+			if (Role == TEXT("system"))
+				KeptNumberedIndices.Add(i);
+		}
+		int32 LastIdx = MsgIndexToOriginal.Num() - 1;
+		KeptNumberedIndices.Add(LastIdx);
+		if (LastIdx > 0) KeptNumberedIndices.Add(LastIdx - 1);
+
+		TArray<TSharedPtr<FJsonValue>> PrunedMessages;
+		for (int32 i = 0; i < MsgIndexToOriginal.Num(); ++i)
+		{
+			if (KeptNumberedIndices.Contains(i))
+			{
+				int32 OrigIdx = MsgIndexToOriginal[i];
+				if (OrigIdx >= 0 && OrigIdx < ApiMessages.Num())
+					PrunedMessages.Add(ApiMessages[OrigIdx]);
+			}
+		}
+
+		int32 OldCount = ApiMessages.Num();
+		int32 NewCount = PrunedMessages.Num();
+		UE_LOG(LogMCPToolbox, Log, TEXT("[SWE-Pruner] %d→%d msgs (%.1f%%)"),
+			OldCount, NewCount, 100.0 * (1.0 - static_cast<double>(NewCount) / FMath::Max(1, OldCount)));
+
+		if (PrunedMessages.Num() < 2)
+		{
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[SWE-Pruner] Too aggressive, passing through"));
+			if (OnPruned) OnPruned(ApiMessages);
+			return;
+		}
+
+		if (OnPruned) OnPruned(PrunedMessages);
+	});
 }
 
 #undef LOCTEXT_NAMESPACE

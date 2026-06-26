@@ -1,0 +1,14 @@
+# Auxiliary model files (llama.cpp + Qwen3VL model) — too large for Git
+AuxiliaryModule/
+
+# BuildPlugin packaging symlink
+Resources/
+
+# Build outputs
+Binaries/
+Intermediate/
+MCPToolbox_Output/
+
+# IDE
+.vs/
+*.user

@@ -26,6 +26,13 @@
 #include "MCPToolboxChatMessage.h"
 #include "MCPToolboxChatSession.h"
 
+// DAG Parallel Execution
+#include "MCPToolboxDAGTypes.h"
+#include "MCPToolboxExecutionPlanner.h"
+
+// Auxiliary Model Manager (IdleSpec + SWE-Pruner)
+#include "MCPToolboxAuxModelManager.h"
+
 // ---- Forward declarations ----
 class FMCPToolboxMCPClient;
 struct FMCPToolboxChatSession;
@@ -83,6 +90,9 @@ private:
 
 	/** Create a message bubble widget for the given message */
 	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message);
+	
+	/** Create a message bubble widget and optionally return the content text box for streaming updates */
+	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBox);
 
 	/** Generate a row for the session list view */
 	TSharedRef<ITableRow> GenerateSessionRow(TSharedPtr<FString> SessionId, const TSharedRef<STableViewBase>& OwnerTable);
@@ -124,6 +134,9 @@ private:
 	/** Toggle vision/image mode */
 	FReply OnToggleVisionMode();
 
+	/** Toggle sidebar visibility */
+	FReply OnToggleSidebar();
+
 	/** Handle typing in the input box (Ctrl+Enter detection) */
 	FReply OnInputKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent);
 
@@ -164,6 +177,9 @@ private:
 	/** Send an AI request with the given messages array */
 	void SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& ApiMessages);
 
+	/** Internal: send AI request after pruning (or directly) */
+	void SendAIRequestInternal(const TArray<TSharedPtr<FJsonValue>>& ApiMessages);
+
 	/** Handle the AI response and tool call loop */
 	void HandleAIResponse(FHttpResponsePtr Resp, const TArray<TSharedPtr<FJsonValue>>& SentMessages);
 
@@ -193,6 +209,24 @@ private:
 	/** Get the local FunctionTable for building requests */
 	assistant::FunctionTable& GetFunctionTable();
 
+	// ---- DAG Parallel Execution ----
+
+	/** Execute tool calls with DAG-based parallel scheduling */
+	void ExecuteToolCallsDAG(
+		const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
+		const TArray<TSharedPtr<FJsonValue>>& SentMessages,
+		const TSharedPtr<FJsonObject>& AssistantMsg
+	);
+
+	/** Check if tool calls contain DAG dependencies (for LLMCompiler-style planning) */
+	bool HasDAGDependencies(const TArray<TSharedPtr<FJsonValue>>& ToolCalls) const;
+
+	/** Convert OpenAI-style tool_calls to DAG task format */
+	void ConvertToolCallsToDAGFormat(
+		const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
+		TArray<TSharedPtr<FJsonObject>>& OutDAGCalls
+	) const;
+
 public:
 	/** Try connecting to MCP server and discovering tools */
 	void ConnectToMCPServer();
@@ -220,6 +254,9 @@ private:
 
 	/** All chat messages */
 	TArray<FMCPToolboxChatMessage> Messages;
+
+	/** Cached JSON representations of Messages (built once, reused in OnSendMessage) */
+	TArray<TSharedPtr<FJsonValue>> CachedMessagesJson;
 
 	/** Scroll box for the chat area (to auto-scroll on new messages) */
 	TSharedPtr<SScrollBox> ChatScrollBox;
@@ -266,8 +303,15 @@ private:
 	/** Reference to the streaming message (updated in place) */
 	FMCPToolboxChatMessage* CurrentStreamingMessage = nullptr;
 
+	/** Text block for the streaming message (to update in place) */
+	TSharedPtr<STextBlock> StreamingTextBlock;
+
+	/** Multi-line text box for the streaming message (to update in place) */
+	TSharedPtr<SMultiLineEditableTextBox> StreamingMessageBox;
+
 	/** Local FunctionTable for tool registration */
 	TUniquePtr<assistant::FunctionTable> ToolFunctionTable;
+	mutable TArray<TSharedPtr<FJsonValue>> CachedToolsArray; // Built once, reused per request
 
 	/** Active HTTP request (for cancellation) */
 	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> ActiveHttpRequest;
@@ -297,4 +341,40 @@ private:
 
 	/** Toggle sidebar visibility */
 	FReply ToggleSidebar();
+
+	// ---- DAG Parallel Execution ----
+
+	/** DAG execution planner for parallel tool calls */
+	FExecutionPlanner ExecutionPlanner;
+
+	// ---- Auxiliary Model Integration ----
+
+	/** Current speculative execution result (IdleSpec) */
+	FSpeculativeResult LastSpeculation;
+	bool bPendingToolCompletion = false;
+	TSharedPtr<TArray<TSharedPtr<FJsonValue>>> DeferredPendingMsgs;
+	FString PendingSpecToolName;
+	bool bSpeculationPending = false;
+
+	/** Previous conversation context (kept for speculative validation rollback) */
+	TArray<TSharedPtr<FJsonValue>> PreSpeculationMessages;
+
+	/** Launch IdleSpec speculation for the given tool name */
+	void LaunchIdleSpec(const FString& CurrentToolName);
+
+	/** Try to auto-execute the speculated tool call, skipping an LLM round.
+	 *  @return true if speculation was executed (caller skips SendAIRequest) */
+	bool TrySpeculativeExecution(TArray<TSharedPtr<FJsonValue>>& PendingMsgs);
+
+	/** Called when both tool and speculation are complete. Tries speculation, falls back to LLM. */
+	void TrySpeculativeOrContinue(TSharedPtr<TArray<TSharedPtr<FJsonValue>>> PendingMsgs);
+
+	/** Preprocess images in messages through local VL model (when vision mode is OFF but aux VL available) */
+	void PreprocessImagesLocally(const TArray<TSharedPtr<FJsonValue>>& Msgs,
+		TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnDone);
+
+	/** Apply SWE-Pruner to messages before sending to AI */
+	void ApplyPruningBeforeSend(
+		const TArray<TSharedPtr<FJsonValue>>& ApiMessages,
+		TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnPruned);
 };
