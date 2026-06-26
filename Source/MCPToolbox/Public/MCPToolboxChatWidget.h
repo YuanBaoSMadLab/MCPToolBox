@@ -144,6 +144,12 @@ private:
 	/** Interrupt the current AI request */
 	FReply OnInterrupt();
 
+	/** Optimize the current prompt using auxiliary model (local LLM) */
+	FReply OnOptimizePrompt();
+
+	/** Revert optimized prompt back to original text */
+	FReply OnUndoOptimization();
+
 	// ---- Provider/Model Selection ----
 
 	/** Rebuild entry list from APIManager saved entries */
@@ -312,6 +318,17 @@ private:
 
 	/** Multi-line text box for the streaming message (to update in place) */
 	TSharedPtr<STextBlock> StreamingMessageBox;
+
+	// ---- Prompt Optimization ----
+
+	/** Undo buffer: stores original prompt text before optimization */
+	FString UndoBuffer;
+
+	/** Whether the current input text has been optimized (to show "退回" button) */
+	bool bPromptOptimized = false;
+
+	/** Whether optimization is in progress */
+	bool bOptimizingPrompt = false;
 
 	/** Local FunctionTable for tool registration */
 	TUniquePtr<assistant::FunctionTable> ToolFunctionTable;

@@ -399,6 +399,42 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildInputArea()
 				.OnClicked_Lambda([this]() { return bIsWaiting ? OnInterrupt() : OnSendMessage(); })
 				.ButtonColorAndOpacity_Lambda([this]() { return bIsWaiting ? FLinearColor(0.8f, 0.2f, 0.2f) : FLinearColor::White; })
 			]
+			// ── Prompt Optimization ──
+			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Text_Lambda([this]() {
+					if (bOptimizingPrompt) return LOCTEXT("OptimizingBtn", "优化中...");
+					return LOCTEXT("OptimizeBtn", "优化提示词");
+				})
+				.OnClicked(this, &SMCPToolboxChatWidget::OnOptimizePrompt)
+				.IsEnabled_Lambda([this]() {
+					return !bIsWaiting && !bOptimizingPrompt && FMCPToolboxAuxModelManager::Get().IsReady();
+				})
+				.ToolTipText_Lambda([this]() {
+					if (!FMCPToolboxAuxModelManager::Get().IsReady())
+						return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型 (llama-server) 运行");
+					if (bPromptOptimized)
+						return LOCTEXT("OptimizeTooltip", "重新优化当前提示词 (会替换上次优化结果)");
+					return LOCTEXT("OptimizeTooltipFirst", "用本地辅助模型优化提示词，使其更清晰准确传达需求");
+				})
+				.ButtonColorAndOpacity_Lambda([this]() {
+					if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
+					return (FMCPToolboxAuxModelManager::Get().IsReady())
+						? FLinearColor(0.3f, 0.15f, 0.5f) : FLinearColor(0.3f, 0.3f, 0.3f);
+				})
+			]
+			// ── Undo Optimization ──
+			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("UndoBtn", "退回"))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnUndoOptimization)
+				.IsEnabled_Lambda([this]() { return bPromptOptimized && !bOptimizingPrompt; })
+				.ToolTipText(LOCTEXT("UndoTooltip", "撤销优化，恢复原始提示词"))
+				.Visibility_Lambda([this]() { return bPromptOptimized ? EVisibility::Visible : EVisibility::Collapsed; })
+				.ButtonColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.2f))
+			]
 			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
 			[
 				SNew(SButton)
@@ -1967,6 +2003,84 @@ FReply SMCPToolboxChatWidget::OnClearChat()
 	W.Role = EMCPToolboxMessageRole::Assistant;
 	W.Content = TEXT("对话已清空。有什么可以帮你的？");
 	AddMessage(W);
+	return FReply::Handled();
+}
+
+// ============================================================================
+// Prompt Optimization — use local auxiliary model to refine user input
+// ============================================================================
+
+FReply SMCPToolboxChatWidget::OnOptimizePrompt()
+{
+	if (!InputTextBox.IsValid() || bOptimizingPrompt) return FReply::Handled();
+
+	FString CurrentText = InputTextBox->GetText().ToString().TrimStartAndEnd();
+	if (CurrentText.IsEmpty()) return FReply::Handled();
+
+	// Save original to undo buffer
+	UndoBuffer = CurrentText;
+	bOptimizingPrompt = true;
+	bPromptOptimized = false;
+
+	// Build optimization prompt for the auxiliary model
+	FString OptPrompt = TEXT("你是提示词优化专家。用户将给你一段原始需求描述，请优化它以更准确地传达意图。\n\n");
+	OptPrompt += TEXT("优化规则：\n");
+	OptPrompt += TEXT("1. 保持原意不变，不要添加额外需求\n");
+	OptPrompt += TEXT("2. 补充必要的技术细节和上下文\n");
+	OptPrompt += TEXT("3. 明确输入/输出格式和约束条件\n");
+	OptPrompt += TEXT("4. 拆分复杂需求为清晰的子任务\n");
+	OptPrompt += TEXT("5. 用中文回复优化后的提示词\n");
+	OptPrompt += TEXT("6. 不要添加解释或建议，只输出优化后的提示词\n\n");
+	OptPrompt += TEXT("原始提示词：\n");
+	OptPrompt += CurrentText;
+	OptPrompt += TEXT("\n\n优化后的提示词：");
+
+	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+	TWeakPtr<SMultiLineEditableTextBox> WeakInput = InputTextBox;
+
+	AuxMgr.InferAsync(OptPrompt, 512,
+		[this, WeakInput](bool bSuccess, const FString& Output)
+		{
+			bOptimizingPrompt = false;
+
+			// Update undo buffer button visibility
+			if (bSuccess && !Output.IsEmpty() && WeakInput.IsValid())
+			{
+				WeakInput.Pin()->SetText(FText::FromString(Output.TrimStartAndEnd()));
+				bPromptOptimized = true;
+
+				FNotificationInfo Info(FText::FromString(TEXT("提示词已优化，不满意可点击「退回」恢复原文")));
+				Info.ExpireDuration = 4.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars)"), UndoBuffer.Len(), Output.TrimStartAndEnd().Len());
+			}
+			else
+			{
+				UndoBuffer.Empty();
+				FNotificationInfo Info(FText::FromString(bSuccess ? TEXT("优化结果为空，无法应用") : TEXT("提示词优化失败，辅助模型可能未就绪")));
+				Info.ExpireDuration = 3.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Prompt optimization %s"), bSuccess ? TEXT("returned empty") : TEXT("failed"));
+			}
+		});
+
+	return FReply::Handled();
+}
+
+FReply SMCPToolboxChatWidget::OnUndoOptimization()
+{
+	if (!InputTextBox.IsValid() || !bPromptOptimized) return FReply::Handled();
+
+	// Restore original text
+	InputTextBox->SetText(FText::FromString(UndoBuffer));
+	UndoBuffer.Empty();
+	bPromptOptimized = false;
+
+	FNotificationInfo Info(FText::FromString(TEXT("已恢复原始提示词")));
+	Info.ExpireDuration = 2.0f;
+	FSlateNotificationManager::Get().AddNotification(Info);
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimization undone"));
 	return FReply::Handled();
 }
 

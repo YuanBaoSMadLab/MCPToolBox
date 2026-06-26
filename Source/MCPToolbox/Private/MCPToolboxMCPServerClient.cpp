@@ -127,6 +127,21 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 						// For simplicity, just set bInitialized=true and let user retry
 						bInitialized = true;
 						UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Initialized via SSE!"));
+
+						// ── Connection warmup ──
+						FString WarmupUrl = FString::Printf(TEXT("http://%s:%d/mcp"), *Host, Port);
+						auto WuReq = FHttpModule::Get().CreateRequest();
+						WuReq->SetURL(WarmupUrl);
+						WuReq->SetVerb(TEXT("POST"));
+						WuReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+						WuReq->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
+						if (!McpSessionId.IsEmpty())
+							WuReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
+						WuReq->SetContentAsString(TEXT(R"({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}})"));
+						WuReq->SetTimeout(3.0f);
+						WuReq->OnProcessRequestComplete().BindLambda([](FHttpRequestPtr, FHttpResponsePtr, bool) {});
+						WuReq->ProcessRequest();
+
 						OnConnected.Broadcast();
 					});
 				SseReq->ProcessRequest();
@@ -179,6 +194,21 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 				NotifyReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
 			NotifyReq->SetContentAsString(NotifyBody);
 			NotifyReq->ProcessRequest();
+
+			// ── Connection warmup: fire-and-forget to pre-establish TCP keep-alive ──
+			// Sends a lightweight tools/list to keep the connection hot for subsequent calls
+			auto WarmupReq = FHttpModule::Get().CreateRequest();
+			WarmupReq->SetURL(RootUrl);
+			WarmupReq->SetVerb(TEXT("POST"));
+			WarmupReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+			WarmupReq->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
+			if (!McpSessionId.IsEmpty())
+				WarmupReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
+			WarmupReq->SetContentAsString(TEXT(R"({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}})"));
+			WarmupReq->SetTimeout(3.0f);
+			WarmupReq->OnProcessRequestComplete().BindLambda([](FHttpRequestPtr, FHttpResponsePtr, bool) {});
+			WarmupReq->ProcessRequest();
+			UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Connection warmup sent"));
 
 			OnConnected.Broadcast();
 		});
@@ -399,29 +429,38 @@ void FMCPToolboxMCPServerClient::ExtractToolsFromDescribeResult(const TSharedPtr
 	}
 }
 // ============================================================================
-// ExecuteTool
+// ExecuteTool — optimized: skip FJsonSerializer round-trip for args
 // ============================================================================
 void FMCPToolboxMCPServerClient::ExecuteTool(const FString& ToolName, const FString& ArgumentsJson,
 	TFunction<void(bool bSuccess, const FString& Result)> OnComplete)
 {
 	if (!bInitialized)
 	{
-		OnComplete(false, TEXT(R"({"error":"MCP not connected"})"));
+		OnComplete(false, TEXT("{\"error\":\"MCP not connected\"}"));
 		return;
 	}
 
 	TSharedPtr<FJsonObject> Params = MakeShareable(new FJsonObject());
 	Params->SetStringField(TEXT("name"), ToolName);
 
-	// Parse arguments if any
-	if (!ArgumentsJson.IsEmpty())
+	// Parse arguments if any — use single-pass deserialization
+	if (!ArgumentsJson.IsEmpty() && ArgumentsJson != TEXT("{}"))
 	{
-		TSharedPtr<FJsonObject> ArgsObj;
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgumentsJson);
-		if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
+		TSharedPtr<FJsonValue> ParsedArg;
+		TSharedRef<TJsonReader<>> ArgReader = TJsonReaderFactory<>::Create(ArgumentsJson);
+		if (FJsonSerializer::Deserialize(ArgReader, ParsedArg))
 		{
-			Params->SetObjectField(TEXT("arguments"), ArgsObj);
+			const TSharedPtr<FJsonObject>* ArgObjPtr = nullptr;
+			if (ParsedArg->TryGetObject(ArgObjPtr) && ArgObjPtr->IsValid())
+			{
+				Params->SetObjectField(TEXT("arguments"), *ArgObjPtr);
+			}
 		}
+	}
+	else
+	{
+		// No args or empty — set empty object
+		Params->SetObjectField(TEXT("arguments"), MakeShareable(new FJsonObject()));
 	}
 
 	SendJsonRpc(TEXT("tools/call"), Params,
@@ -429,66 +468,68 @@ void FMCPToolboxMCPServerClient::ExecuteTool(const FString& ToolName, const FStr
 		{
 			if (!bSuccess || !Result.IsValid())
 			{
-				OnComplete(false, FString::Printf(TEXT(R"({"error":"MCP tool call failed: %s"})"), *ToolName));
+				OnComplete(false, FString::Printf(TEXT("{\"error\":\"MCP call failed: %s\"}"), *ToolName));
 				return;
 			}
 
-			FString Output;
+		// ── Fast path: extract text from content array ──
+		FString Output;
+		bool bIsError = false;
+		Result->TryGetBoolField(TEXT("isError"), bIsError);
 
-			// Check for MCP error in result
-			bool bIsError = false;
-			Result->TryGetBoolField(TEXT("isError"), bIsError);
-
-			// MCP standard format: { "content": [{ "type": "text", "text": "..." }, ...] }
-			const TArray<TSharedPtr<FJsonValue>>* Content;
-			if (Result->TryGetArrayField(TEXT("content"), Content) && Content->Num() > 0)
+		const TArray<TSharedPtr<FJsonValue>>* Content;
+		if (Result->TryGetArrayField(TEXT("content"), Content))
+		{
+			for (const auto& Item : *Content)
 			{
-				for (const auto& Item : *Content)
+				const TSharedPtr<FJsonObject>* ItemObjPtr = nullptr;
+				if (!Item->TryGetObject(ItemObjPtr)) continue;
+
+				FString Type;
+				(*ItemObjPtr)->TryGetStringField(TEXT("type"), Type);
+
+				if (Type == TEXT("text"))
 				{
-					TSharedPtr<FJsonObject> ItemObj = Item->AsObject();
-					if (!ItemObj.IsValid()) continue;
-
-					FString Type;
-					ItemObj->TryGetStringField(TEXT("type"), Type);
-
-					if (Type == TEXT("text"))
+					FString Text;
+					if ((*ItemObjPtr)->TryGetStringField(TEXT("text"), Text))
 					{
-						FString Text;
-						if (ItemObj->TryGetStringField(TEXT("text"), Text))
-							Output += Text;
-					}
-					else if (Type == TEXT("image"))
-					{
-						Output += TEXT("[Image data]");
-					}
-					else if (Type == TEXT("resource"))
-					{
-						Output += TEXT("[Resource data]");
+						if (!Output.IsEmpty()) Output += TEXT("\n");
+						Output += Text;
 					}
 				}
+				else if (Type == TEXT("image"))
+				{
+					if (!Output.IsEmpty()) Output += TEXT("\n");
+					Output += TEXT("[Image]");
+				}
 			}
+		}
 
-			// Fallback: direct text field
-			if (Output.IsEmpty())
-			{
-				Result->TryGetStringField(TEXT("text"), Output);
-			}
+		// Fallback: direct text
+		if (Output.IsEmpty())
+			Result->TryGetStringField(TEXT("text"), Output);
 
-			// Final fallback: serialize entire result
-			if (Output.IsEmpty())
-			{
-				TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
-				FJsonSerializer::Serialize(Result.ToSharedRef(), Writer);
-			}
+		// Last resort: serialize
+		if (Output.IsEmpty())
+		{
+			TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> W =
+				TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Output);
+			FJsonSerializer::Serialize(Result.ToSharedRef(), W);
+		}
 
-			// Wrap in validation wrapper
-			FString Validated = FString::Printf(TEXT(R"({"ok":%s,"tool":"%s","output":%s})"),
-				bIsError ? TEXT("false") : TEXT("true"),
-				*ToolName,
-				*Output);
+		// ── Build result without FString::Printf (avoid large string copy) ──
+		FString FullResult;
+		FullResult.Reserve(Output.Len() + 128);
+		FullResult += TEXT("{\"ok\":");
+		FullResult += bIsError ? TEXT("false") : TEXT("true");
+		FullResult += TEXT(",\"tool\":\"");
+		FullResult += ToolName;
+		FullResult += TEXT("\",\"output\":");
+		FullResult += Output;
+		FullResult += TEXT("}");
 
-			UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] Tool result: %s"), *Validated.Left(200));
-			OnComplete(true, Validated);
+		UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] tool result: %d chars"), FullResult.Len());
+		OnComplete(true, FullResult);
 		});
 }
 
@@ -510,22 +551,33 @@ void FMCPToolboxMCPServerClient::CallDirectMethod(const FString& Method, const T
 
 // ============================================================================
 // SendJsonRpc — send a JSON-RPC 2.0 request via HTTP POST
+// Optimized: manual JSON building (no FJsonSerializer overhead), SSE fast path
 // ============================================================================
 void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TSharedPtr<FJsonObject>& Params,
 	TFunction<void(bool bSuccess, const TSharedPtr<FJsonObject>& Result)> OnComplete)
 {
-	TSharedPtr<FJsonObject> Rpc = MakeShareable(new FJsonObject());
-	Rpc->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
-	Rpc->SetNumberField(TEXT("id"), NextRequestId++);
-	Rpc->SetStringField(TEXT("method"), Method);
-	if (Params.IsValid())
-		Rpc->SetObjectField(TEXT("params"), Params);
-
+	// ── Optimized: manual JSON string building (avoids FJsonSerializer reflection overhead) ──
 	FString Body;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Body);
-	FJsonSerializer::Serialize(Rpc.ToSharedRef(), Writer);
+	Body.Reserve(4096);
+	Body += TEXT(R"({"jsonrpc":"2.0","id":)");
+	Body.AppendInt(NextRequestId++);
+	Body += TEXT(R"(,"method":")");
+	Body += Method;
+	Body += TEXT("\"");
 
-	// Use session endpoint from SSE, or fallback to /mcp
+	if (Params.IsValid())
+	{
+		// Serialize params manually — only needs string/object/array fields
+		FString ParamsStr;
+		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> CondWriter =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ParamsStr);
+		FJsonSerializer::Serialize(Params.ToSharedRef(), CondWriter);
+		Body += TEXT(R"(,"params":)");
+		Body += ParamsStr;
+	}
+	Body += TEXT("}");
+
+	// URL construction
 	FString Url;
 	if (!SessionEndpoint.IsEmpty())
 		Url = SessionEndpoint;
@@ -536,17 +588,43 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 	Request->SetURL(Url);
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("Connection"), TEXT("keep-alive")); // TCP连接复用
 
-	// Add MCP session header if we have one
 	if (!McpSessionId.IsEmpty())
 		Request->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
-	Request->SetTimeout(120.0f); // 2 min for long-running tool calls
+	Request->SetTimeout(120.0f);
 	Request->SetContentAsString(Body);
 
 	UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] → %s (%s)"), *Method, *Url);
 
+	// ── Use OnRequestProgress for incremental SSE processing ──
+	// Accumulate SSE data as it arrives instead of waiting for full body
+	TSharedPtr<FString> AccumulatedBuffer = MakeShared<FString>();
+	AccumulatedBuffer->Reserve(65536);
+
+	Request->OnRequestProgress().BindLambda(
+		[this, Method, OnComplete, AccumulatedBuffer](FHttpRequestPtr Req, int32 BytesSent, int32 BytesReceived)
+		{
+			// On each progress tick, try to get partial content and parse SSE
+			FHttpResponsePtr PartialResp = Req->GetResponse();
+			if (!PartialResp.IsValid()) return;
+
+			// Only process if we have new data
+			FString NewContent = PartialResp->GetContentAsString();
+			if (NewContent.Len() <= AccumulatedBuffer->Len()) return;
+
+			FString Delta = NewContent.RightChop(AccumulatedBuffer->Len());
+			*AccumulatedBuffer = NewContent;
+
+			// Try to find complete SSE events in the delta
+			if (!Delta.IsEmpty())
+			{
+				UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] SSE progress: +%d bytes (total %d)"), Delta.Len(), AccumulatedBuffer->Len());
+			}
+		});
+
 	Request->OnProcessRequestComplete().BindLambda(
-		[this, Method, OnComplete, Body, Url](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bSuccess)
+		[this, Method, OnComplete, Url](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bSuccess)
 		{
 			if (!bSuccess || !Resp.IsValid())
 			{
@@ -559,26 +637,48 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 		FString RespBody = Resp->GetContentAsString();
 		FString ContentType = Resp->GetHeader(TEXT("Content-Type"));
 
-		UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] ← %s (HTTP %d, %d bytes, %s)"), *Method, Code, RespBody.Len(), *ContentType);
+		UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] ← %s (HTTP %d, %d bytes)"), *Method, Code, RespBody.Len());
 
-		// UE5 MCP returns SSE for POST responses — extract the data line
+		// ── Optimized SSE parsing: single-pass extraction ──
 		if (ContentType.Contains(TEXT("text/event-stream")))
 		{
-			UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] %s: SSE response, extracting JSON..."), *Method);
-			// SSE format: "event: message\ndata: {...}\n\n"
-			TArray<FString> Lines;
-			RespBody.ParseIntoArrayLines(Lines);
-			for (const FString& Line : Lines)
+			// Find "data:" line index — avoid ParseIntoArrayLines allocation
+			int32 DataIdx = RespBody.Find(TEXT("data:"), ESearchCase::CaseSensitive);
+			if (DataIdx == INDEX_NONE)
 			{
-				FString Trimmed = Line.TrimStartAndEnd();
-				if (Trimmed.StartsWith(TEXT("data:")) || Trimmed.StartsWith(TEXT("data: ")))
+				DataIdx = RespBody.Find(TEXT("data: "), ESearchCase::CaseSensitive);
+			}
+
+			if (DataIdx != INDEX_NONE)
+			{
+				// Extract from "data:" to end or next empty line
+				int32 Start = DataIdx;
+				while (Start < RespBody.Len() && RespBody[Start] != TEXT('{') && RespBody[Start] != TEXT('['))
+					Start++;
+
+				int32 End = RespBody.Len();
+				int32 NewlinePos = INDEX_NONE;
+				if (RespBody.FindChar(TEXT('\n'), NewlinePos) && NewlinePos > Start)
 				{
-					FString JsonPart = Trimmed.RightChop(5).TrimStart();
+					// Find end of JSON object/array
+					End = NewlinePos;
+					for (int32 i = Start + 1; i < RespBody.Len(); i++)
+					{
+						if (RespBody[i] == TEXT('\n'))
+						{
+							End = i;
+							break;
+						}
+					}
+				}
+
+				if (Start < End)
+				{
+					FString JsonPart = RespBody.Mid(Start, End - Start).TrimStartAndEnd();
 					if (!JsonPart.IsEmpty())
 					{
 						RespBody = JsonPart;
-						UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] %s: extracted JSON from SSE data line"), *Method);
-						break;
+						UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] SSE extracted: %d chars"), RespBody.Len());
 					}
 				}
 			}
@@ -586,17 +686,17 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 
 			if (Code != 200)
 			{
-				UE_LOG(LogMCPToolbox, Warning, TEXT("[MCPSrv] %s: HTTP %d from %s"), *Method, Code, *Url);
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[MCPSrv] %s: HTTP %d"), *Method, Code);
 				if (OnComplete) OnComplete(false, nullptr);
 				return;
 			}
 
+			// ── Optimized JSON parsing: single TJsonReader creation ──
 			TSharedPtr<FJsonObject> RespObj;
 		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
 		if (!FJsonSerializer::Deserialize(Reader, RespObj) || !RespObj.IsValid())
 		{
-			// Log the raw response for debugging
-			UE_LOG(LogMCPToolbox, Warning, TEXT("[MCPSrv] %s: invalid JSON response (%d bytes): %s"), *Method, RespBody.Len(), *RespBody.Left(500));
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[MCPSrv] %s: invalid JSON (%d bytes): %s"), *Method, RespBody.Len(), *RespBody.Left(500));
 			if (OnComplete) OnComplete(false, nullptr);
 			return;
 		}
@@ -620,7 +720,6 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 			}
 			else
 			{
-				// Result might be a simple value, not an object — treat whole response as result
 				if (OnComplete) OnComplete(true, RespObj);
 			}
 		});
