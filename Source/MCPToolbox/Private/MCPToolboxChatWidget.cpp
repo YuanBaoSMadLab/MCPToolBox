@@ -385,80 +385,88 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildInputArea()
 {
 	return SNew(SBorder).Padding(FMargin(4))
 		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().FillWidth(1.0).Padding(FMargin(0, 0, 4, 0))
+			SNew(SVerticalBox)
+			// Row 1: input box + send
+			+ SVerticalBox::Slot().AutoHeight()
 			[
-				SAssignNew(InputTextBox, SMultiLineEditableTextBox)
-				.HintText(LOCTEXT("InputHint", "输入消息... 回车发送, Shift+回车换行"))
-				.OnKeyDownHandler(this, &SMCPToolboxChatWidget::OnInputKeyDown)
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.0).Padding(FMargin(0, 0, 4, 0))
+				[
+					SAssignNew(InputTextBox, SMultiLineEditableTextBox)
+					.HintText(LOCTEXT("InputHint", "输入消息... 回车发送, Shift+回车换行"))
+					.OnKeyDownHandler(this, &SMCPToolboxChatWidget::OnInputKeyDown)
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton)
+					.Text_Lambda([this]() { return bIsWaiting ? LOCTEXT("StopBtn", "停止") : LOCTEXT("SendBtn", "发送"); })
+					.OnClicked_Lambda([this]() { return bIsWaiting ? OnInterrupt() : OnSendMessage(); })
+					.ButtonColorAndOpacity_Lambda([this]() { return bIsWaiting ? FLinearColor(0.8f, 0.2f, 0.2f) : FLinearColor::White; })
+				]
 			]
-			+ SHorizontalBox::Slot().AutoWidth()
+			// Row 2: action buttons (optimize / undo / upload / clear)
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 2, 0, 0))
 			[
-				SNew(SButton)
-				.Text_Lambda([this]() { return bIsWaiting ? LOCTEXT("StopBtn", "停止") : LOCTEXT("SendBtn", "发送"); })
-				.OnClicked_Lambda([this]() { return bIsWaiting ? OnInterrupt() : OnSendMessage(); })
-				.ButtonColorAndOpacity_Lambda([this]() { return bIsWaiting ? FLinearColor(0.8f, 0.2f, 0.2f) : FLinearColor::White; })
-			]
-			// ── Prompt Optimization ──
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-			[
-				SNew(SButton)
-				.Text_Lambda([this]() {
-					if (bOptimizingPrompt) return LOCTEXT("OptimizingBtn", "优化中...");
-					return LOCTEXT("OptimizeBtn", "优化提示词");
-				})
-				.OnClicked(this, &SMCPToolboxChatWidget::OnOptimizePrompt)
-				.IsEnabled_Lambda([this]() {
-					return !bIsWaiting && !bOptimizingPrompt && FMCPToolboxAuxModelManager::Get().IsReady();
-				})
-				.ToolTipText_Lambda([this]() {
-					if (!FMCPToolboxAuxModelManager::Get().IsReady())
-						return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型 (llama-server) 运行");
-					if (bPromptOptimized)
-						return LOCTEXT("OptimizeTooltip", "重新优化当前提示词 (会替换上次优化结果)");
-					return LOCTEXT("OptimizeTooltipFirst", "用本地辅助模型优化提示词，使其更清晰准确传达需求");
-				})
-				.ButtonColorAndOpacity_Lambda([this]() {
-					if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
-					return (FMCPToolboxAuxModelManager::Get().IsReady())
-						? FLinearColor(0.3f, 0.15f, 0.5f) : FLinearColor(0.3f, 0.3f, 0.3f);
-				})
-			]
-			// ── Undo Optimization ──
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-			[
-				SNew(SButton)
-				.Text(LOCTEXT("UndoBtn", "退回"))
-				.OnClicked(this, &SMCPToolboxChatWidget::OnUndoOptimization)
-				.IsEnabled_Lambda([this]() { return bPromptOptimized && !bOptimizingPrompt; })
-				.ToolTipText(LOCTEXT("UndoTooltip", "撤销优化，恢复原始提示词"))
-				.Visibility_Lambda([this]() { return bPromptOptimized ? EVisibility::Visible : EVisibility::Collapsed; })
-				.ButtonColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.2f))
-			]
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-			[
-				SNew(SButton)
-				.Text(LOCTEXT("UploadBtn", "上传"))
-				.OnClicked(this, &SMCPToolboxChatWidget::OnUploadFile)
-				.IsEnabled_Lambda([this]() {
-					return bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady();
-				})
-				.ToolTipText_Lambda([this]() {
-					if (bVisionModeEnabled)
-						return LOCTEXT("UploadTooltip", "上传图片 (云端视觉)");
-					if (FMCPToolboxAuxModelManager::Get().IsReady())
-						return LOCTEXT("UploadVLMode", "上传图片 (本地 VL 分析)");
-					return LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式或确保辅助模型可用");
-				})
-				.ButtonColorAndOpacity_Lambda([this]() {
-					return (bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady())
-						? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
-				})
-			]
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-			[
-				SNew(SButton).Text(LOCTEXT("ClearBtn", "清空"))
-				.OnClicked(this, &SMCPToolboxChatWidget::OnClearChat)
+				SNew(SHorizontalBox)
+				// ── Prompt Optimization ──
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
+				[
+					SNew(SButton)
+					.Text_Lambda([this]() {
+						if (bOptimizingPrompt) return LOCTEXT("OptimizingBtn", "优化中...");
+						return LOCTEXT("OptimizeBtn", "优化");
+					})
+					.OnClicked(this, &SMCPToolboxChatWidget::OnOptimizePrompt)
+					.IsEnabled_Lambda([this]() {
+						return !bIsWaiting && !bOptimizingPrompt && FMCPToolboxAuxModelManager::Get().IsReady();
+					})
+					.ToolTipText_Lambda([this]() {
+						if (!FMCPToolboxAuxModelManager::Get().IsReady())
+							return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型运行");
+						return LOCTEXT("OptimizeTooltipFirst", "用本地模型提炼提示词核心意图");
+					})
+					.ButtonColorAndOpacity_Lambda([this]() {
+						if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
+						return (FMCPToolboxAuxModelManager::Get().IsReady())
+							? FLinearColor(0.3f, 0.15f, 0.5f) : FLinearColor(0.3f, 0.3f, 0.3f);
+					})
+				]
+				// ── Undo Optimization ──
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("UndoBtn", "退回"))
+					.OnClicked(this, &SMCPToolboxChatWidget::OnUndoOptimization)
+					.IsEnabled_Lambda([this]() { return bPromptOptimized && !bOptimizingPrompt; })
+					.ToolTipText(LOCTEXT("UndoTooltip", "撤销优化，恢复原始提示词"))
+					.Visibility_Lambda([this]() { return bPromptOptimized ? EVisibility::Visible : EVisibility::Collapsed; })
+					.ButtonColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.2f))
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("UploadBtn", "上传"))
+					.OnClicked(this, &SMCPToolboxChatWidget::OnUploadFile)
+					.IsEnabled_Lambda([this]() {
+						return bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady();
+					})
+					.ToolTipText_Lambda([this]() {
+						if (bVisionModeEnabled)
+							return LOCTEXT("UploadTooltip", "上传图片 (云端视觉)");
+						if (FMCPToolboxAuxModelManager::Get().IsReady())
+							return LOCTEXT("UploadVLMode", "上传图片 (本地 VL 分析)");
+						return LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式或确保辅助模型可用");
+					})
+					.ButtonColorAndOpacity_Lambda([this]() {
+						return (bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady())
+							? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
+					})
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton).Text(LOCTEXT("ClearBtn", "清空"))
+					.OnClicked(this, &SMCPToolboxChatWidget::OnClearChat)
+				]
 			]
 		];
 }
@@ -2008,6 +2016,8 @@ FReply SMCPToolboxChatWidget::OnClearChat()
 
 // ============================================================================
 // Prompt Optimization — use local auxiliary model to refine user input
+// Uses a simple extraction prompt (2B model can't handle complex optimization)
+// + post-processing validation to reject garbage output
 // ============================================================================
 
 FReply SMCPToolboxChatWidget::OnOptimizePrompt()
@@ -2022,46 +2032,70 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 	bOptimizingPrompt = true;
 	bPromptOptimized = false;
 
-	// Build optimization prompt for the auxiliary model
-	FString OptPrompt = TEXT("你是提示词优化专家。用户将给你一段原始需求描述，请优化它以更准确地传达意图。\n\n");
-	OptPrompt += TEXT("优化规则：\n");
-	OptPrompt += TEXT("1. 保持原意不变，不要添加额外需求\n");
-	OptPrompt += TEXT("2. 补充必要的技术细节和上下文\n");
-	OptPrompt += TEXT("3. 明确输入/输出格式和约束条件\n");
-	OptPrompt += TEXT("4. 拆分复杂需求为清晰的子任务\n");
-	OptPrompt += TEXT("5. 用中文回复优化后的提示词\n");
-	OptPrompt += TEXT("6. 不要添加解释或建议，只输出优化后的提示词\n\n");
-	OptPrompt += TEXT("原始提示词：\n");
+	// ── Simple extraction prompt for small model (2B params) ──
+	// Instead of "optimize" (which 2B model can't do), ask it to extract core intent
+	FString OptPrompt;
+	OptPrompt += TEXT("从以下用户输入中提取核心需求,用1-3句简洁中文总结。不要添加任何额外内容,只输出总结:\n\n");
 	OptPrompt += CurrentText;
-	OptPrompt += TEXT("\n\n优化后的提示词：");
+	OptPrompt += TEXT("\n\n总结:");
 
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 	TWeakPtr<SMultiLineEditableTextBox> WeakInput = InputTextBox;
+	FString OriginalText = CurrentText;
 
-	AuxMgr.InferAsync(OptPrompt, 512,
-		[this, WeakInput](bool bSuccess, const FString& Output)
+	AuxMgr.InferAsync(OptPrompt, 256,
+		[this, WeakInput, OriginalText](bool bSuccess, const FString& Output)
 		{
 			bOptimizingPrompt = false;
 
-			// Update undo buffer button visibility
-			if (bSuccess && !Output.IsEmpty() && WeakInput.IsValid())
-			{
-				WeakInput.Pin()->SetText(FText::FromString(Output.TrimStartAndEnd()));
-				bPromptOptimized = true;
-
-				FNotificationInfo Info(FText::FromString(TEXT("提示词已优化，不满意可点击「退回」恢复原文")));
-				Info.ExpireDuration = 4.0f;
-				FSlateNotificationManager::Get().AddNotification(Info);
-				UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars)"), UndoBuffer.Len(), Output.TrimStartAndEnd().Len());
-			}
-			else
+			if (!bSuccess || Output.IsEmpty())
 			{
 				UndoBuffer.Empty();
-				FNotificationInfo Info(FText::FromString(bSuccess ? TEXT("优化结果为空，无法应用") : TEXT("提示词优化失败，辅助模型可能未就绪")));
+				FNotificationInfo Info(FText::FromString(TEXT("优化失败：辅助模型未响应")));
 				Info.ExpireDuration = 3.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
-				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Prompt optimization %s"), bSuccess ? TEXT("returned empty") : TEXT("failed"));
+				return;
 			}
+
+			FString Cleaned = Output.TrimStartAndEnd();
+
+			// ── Garbage detection ──
+			// Reject if output contains the original text repeated many times (model looping)
+			int32 OrigCount = 0;
+			int32 Pos = 0;
+			FString CheckSub = OriginalText.Left(FMath::Min(20, OriginalText.Len()));
+			while ((Pos = Cleaned.Find(CheckSub, ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos)) != INDEX_NONE)
+			{
+				OrigCount++;
+				Pos += CheckSub.Len();
+			}
+
+			// Reject if: repeated original >2x, or output >3x original length, or output contains Chinese meta-instructions
+			bool bIsGarbage = (OrigCount > 2) ||
+				(Cleaned.Len() > OriginalText.Len() * 3) ||
+				Cleaned.Contains(TEXT("优化规则")) ||
+				Cleaned.Contains(TEXT("以下")) ||
+				Cleaned.Contains(TEXT("原始提示词"));
+
+			if (bIsGarbage || !WeakInput.IsValid())
+			{
+				UndoBuffer.Empty();
+				FNotificationInfo Info(FText::FromString(TEXT("优化结果不可用（模型输出无效），已自动恢复原文")));
+				Info.ExpireDuration = 4.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Prompt optimization rejected (garbage): orig=%d chars, out=%d chars, repeats=%d"),
+					OriginalText.Len(), Cleaned.Len(), OrigCount);
+				return;
+			}
+
+			// ── Acceptable output ──
+			WeakInput.Pin()->SetText(FText::FromString(Cleaned));
+			bPromptOptimized = true;
+
+			FNotificationInfo Info(FText::FromString(TEXT("提示词已精简，不满意可点「退回」恢复原文")));
+			Info.ExpireDuration = 4.0f;
+			FSlateNotificationManager::Get().AddNotification(Info);
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars)"), OriginalText.Len(), Cleaned.Len());
 		});
 
 	return FReply::Handled();
