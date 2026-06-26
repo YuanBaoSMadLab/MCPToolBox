@@ -1464,12 +1464,26 @@ void SMCPToolboxChatWidget::MergeMCPTools()
 {
 	if (!ToolFunctionTable.IsValid()) return;
 
+	// ══ Top-level meta-tools that should NOT be exposed to the LLM ══
+	// list_toolsets/describe_toolset waste ~14s per call — tools are already cached in system prompt
+	static const TSet<FString> BlockedMetaTools = {
+		TEXT("list_toolsets"),
+		TEXT("describe_toolset"),
+	};
+
 	const TArray<TSharedPtr<FJsonObject>>& McpTools = MCPServerClient.GetTools();
 	for (const auto& ToolDef : McpTools)
 	{
 		FString ToolName;
 		ToolDef->TryGetStringField(TEXT("name"), ToolName);
 		if (ToolName.IsEmpty()) continue;
+
+		// Skip meta-tools — LLM should NOT call these (tools are pre-cached in system prompt)
+		if (BlockedMetaTools.Contains(ToolName))
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Skipped meta-tool: %s"), *ToolName);
+			continue;
+		}
 
 		FString ToolDesc;
 		ToolDef->TryGetStringField(TEXT("description"), ToolDesc);
@@ -1550,7 +1564,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("3. **非工具不可**：创建材质/执行命令/截图/选择Actor—这些操作必须且只能通过工具完成\n");
 	Prompt += TEXT("4. **工具参数必填且正确**：路径加/Game/前缀，命令写完整\n");
 	Prompt += TEXT("5. **🚫 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
-	Prompt += TEXT("6. **MCP工具已就绪**：启动时已自动发现所有MCP工具集和工具（见下方'已发现MCP工具'列表）。直接通过 call_tool 调用，无需再 list_toolsets/describe_toolset。\n");
+	Prompt += TEXT("6. **🔴 MCP工具已内置（禁止重复发现！）**：所有MCP工具已在下方'已发现MCP工具'完整列出。直接 call_tool 调用。list_toolsets/describe_toolset 不可用，也不要尝试调用。\n");
 	Prompt += TEXT("7. **command仅限控制台命令**：command只用于 HighResShot、stat fps 等纯控制台命令，绝不用于Python脚本。\n");
 	Prompt += TEXT("8. **主动记忆**：每次对话后，用\"记住：xxx\"保存MCP工具使用经验和用户偏好。\n");
 	Prompt += TEXT("9. **👁 视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
@@ -1599,7 +1613,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("## 行为示例（正确 vs 错误）\n");
 	Prompt += TEXT("用户: 帮我创建自发光白色材质\n");
 	Prompt += TEXT("❌ 错误: 直接用 command(cmd=\"py ...\") (绕开MCP)\n");
-	Prompt += TEXT("✅ 正确: 先调 list_toolsets → 找到材质相关工具集 → describe_toolset → call_tool 创建材质\n");
+	Prompt += TEXT("✅ 正确: 从下方'已发现MCP工具'中找到材质工具 → call_tool 创建材质\n");
 	Prompt += TEXT("✅ 正确(MCP不可用时): command(cmd=\"py ...创建自发光材质...\")\n\n");
 
 	Prompt += TEXT("## ⚡ 效率示例（快 vs 慢）\n");
