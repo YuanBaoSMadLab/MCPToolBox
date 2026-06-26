@@ -1660,7 +1660,7 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			Height = FMath::Clamp(Height, 240, 1080);
 
 			FString Base64Image;
-			if (Mode == TEXT("desktop") || Mode == TEXT("fullscreen"))
+			if (Mode == "desktop" || Mode == "fullscreen")
 			{
 				Base64Image = ScreenshotModule.CaptureFullDesktop();
 			}
