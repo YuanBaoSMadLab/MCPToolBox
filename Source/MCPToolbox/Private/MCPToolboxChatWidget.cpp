@@ -448,10 +448,10 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildInputArea()
 						return !bIsWaiting && !bOptimizingPrompt && FMCPToolboxAuxModelManager::Get().IsReady();
 					})
 					.ToolTipText_Lambda([this]() {
-						if (!FMCPToolboxAuxModelManager::Get().IsReady())
-							return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型运行");
-						return LOCTEXT("OptimizeTooltipFirst", "用本地模型提炼提示词核心意图");
-					})
+					if (!FMCPToolboxAuxModelManager::Get().IsReady())
+						return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型运行");
+					return LOCTEXT("OptimizeTooltipFirst", "用本地辅助模型优化提示词(清晰化、结构化、补充约束,可能扩展或精简)");
+				})
 					.ButtonColorAndOpacity_Lambda([this]() {
 						if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
 						return (FMCPToolboxAuxModelManager::Get().IsReady())
@@ -2303,8 +2303,9 @@ FReply SMCPToolboxChatWidget::OnClearChat()
 
 // ============================================================================
 // Prompt Optimization — use local auxiliary model to refine user input
-// Uses a simple extraction prompt (2B model can't handle complex optimization)
-// + post-processing validation to reject garbage output
+// Semantic optimization: clarify goal, add constraints, structure steps, remove
+// redundancy. Output may legitimately expand or shrink. Post-processing strips
+// Markdown fences and rejects obvious model echoes / heavy repetition.
 // ============================================================================
 
 FReply SMCPToolboxChatWidget::OnOptimizePrompt()
@@ -2319,18 +2320,25 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 	bOptimizingPrompt = true;
 	bPromptOptimized = false;
 
-	// ── Simple extraction prompt for small model (2B params) ──
-	// Instead of "optimize" (which 2B model can't do), ask it to extract core intent
+	// ── Semantic optimization prompt ──
+	// Goal: make the prompt clearer, more specific, better structured — NOT just shorter.
+	// Allowed to expand (add details, constraints, format) when it improves clarity.
 	FString OptPrompt;
-	OptPrompt += TEXT("从以下用户输入中提取核心需求,用1-3句简洁中文总结。不要添加任何额外内容,只输出总结:\n\n");
+	OptPrompt += TEXT("你是提示词工程师。请优化下面的用户输入,让它更清晰、更具体、更易执行。要求:\n");
+	OptPrompt += TEXT("1. 明确目标:说清要做什么、预期结果是什么\n");
+	OptPrompt += TEXT("2. 补充约束:如果输入模糊,根据上下文补充合理的细节约束(技术栈、格式、范围)\n");
+	OptPrompt += TEXT("3. 结构化:多个步骤或要求用编号列表组织\n");
+	OptPrompt += TEXT("4. 移除冗余:删除口语化重复表达,保留所有关键意图\n");
+	OptPrompt += TEXT("5. 保持中文,直接输出优化后的提示词,不要解释、不要前后缀、不要Markdown代码块\n\n");
+	OptPrompt += TEXT("用户输入:\n");
 	OptPrompt += CurrentText;
-	OptPrompt += TEXT("\n\n总结:");
+	OptPrompt += TEXT("\n\n优化后:");
 
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 	TWeakPtr<SMultiLineEditableTextBox> WeakInput = InputTextBox;
 	FString OriginalText = CurrentText;
 
-	AuxMgr.InferAsync(OptPrompt, 256,
+	AuxMgr.InferAsync(OptPrompt, 512,
 		[this, WeakInput, OriginalText](bool bSuccess, const FString& Output)
 		{
 			bOptimizingPrompt = false;
@@ -2338,7 +2346,7 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 			if (!bSuccess || Output.IsEmpty())
 			{
 				UndoBuffer.Empty();
-				FNotificationInfo Info(FText::FromString(TEXT("优化失败：辅助模型未响应")));
+				FNotificationInfo Info(FText::FromString(TEXT("优化失败:辅助模型未响应")));
 				Info.ExpireDuration = 3.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
 				return;
@@ -2346,8 +2354,21 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 
 			FString Cleaned = Output.TrimStartAndEnd();
 
+			// Strip common Markdown code fences if model added them despite instructions
+			if (Cleaned.StartsWith(TEXT("```")))
+			{
+				int32 FirstNewline = Cleaned.Find(TEXT("\n"));
+				if (FirstNewline != INDEX_NONE) Cleaned = Cleaned.Mid(FirstNewline + 1);
+				if (Cleaned.EndsWith(TEXT("```")))
+				{
+					Cleaned = Cleaned.LeftChop(3).TrimEnd();
+				}
+			}
+
 			// ── Garbage detection ──
-			// Reject if output contains the original text repeated many times (model looping)
+			// Reject if output contains the original text repeated many times (model looping).
+			// NOTE: We no longer reject "output > 3x original length" — optimization may
+			// legitimately expand the prompt (add details, structure, constraints).
 			int32 OrigCount = 0;
 			int32 Pos = 0;
 			FString CheckSub = OriginalText.Left(FMath::Min(20, OriginalText.Len()));
@@ -2357,20 +2378,19 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 				Pos += CheckSub.Len();
 			}
 
-			// Reject if: repeated original >2x, or output >3x original length, or output
-			// contains obvious meta-instructions (the model echoing the prompt template).
-			// NOTE: "以下" was removed — it's a legitimate word in Chinese ("以下文件...").
-			bool bIsGarbage = (OrigCount > 2) ||
-				(Cleaned.Len() > OriginalText.Len() * 3) ||
+			// Reject only on: heavy repetition of original (>3x), or obvious meta-echoes
+			// (the model echoing prompt template fragments instead of producing output).
+			bool bIsGarbage = (OrigCount > 3) ||
 				Cleaned.Contains(TEXT("优化规则")) ||
 				Cleaned.Contains(TEXT("原始提示词")) ||
 				Cleaned.Contains(TEXT("用户输入中提取")) ||
-				Cleaned.Contains(TEXT("用1-3句"));
+				Cleaned.Contains(TEXT("你是提示词工程师")) ||
+				Cleaned.Contains(TEXT("保持中文,直接输出"));
 
 			if (bIsGarbage || !WeakInput.IsValid())
 			{
 				UndoBuffer.Empty();
-				FNotificationInfo Info(FText::FromString(TEXT("优化结果不可用（模型输出无效），已自动恢复原文")));
+				FNotificationInfo Info(FText::FromString(TEXT("优化结果不可用(模型输出无效),已自动恢复原文")));
 				Info.ExpireDuration = 4.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
 				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Prompt optimization rejected (garbage): orig=%d chars, out=%d chars, repeats=%d"),
@@ -2382,10 +2402,14 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 			WeakInput.Pin()->SetText(FText::FromString(Cleaned));
 			bPromptOptimized = true;
 
-			FNotificationInfo Info(FText::FromString(TEXT("提示词已精简，不满意可点「退回」恢复原文")));
+			FString Direction = (Cleaned.Len() < OriginalText.Len()) ? TEXT("精简") : TEXT("扩展");
+			FNotificationInfo Info(FText::FromString(FString::Printf(
+				TEXT("提示词已优化(%s, %d → %d 字符),不满意可点「退回」恢复原文"),
+				*Direction, OriginalText.Len(), Cleaned.Len())));
 			Info.ExpireDuration = 4.0f;
 			FSlateNotificationManager::Get().AddNotification(Info);
-			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars)"), OriginalText.Len(), Cleaned.Len());
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars, direction=%s)"),
+				OriginalText.Len(), Cleaned.Len(), *Direction);
 		});
 
 	return FReply::Handled();
