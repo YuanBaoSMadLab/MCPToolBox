@@ -519,7 +519,14 @@ FReply SMCPToolboxWidget::OnAddEntry()
 	if (APIKeyInput.IsValid())
 		ApiKey = APIKeyInput->GetText().ToString().TrimStartAndEnd();
 
-	FMCPToolboxAPIManager::Get().AddEntry(CurrentProviderId, ModelId, ApiKey);
+	// Read user-edited BaseURL. Previously this input was visually present but silently
+	// ignored — making it impossible to connect to llama.cpp / LM Studio on custom ports
+	// or to override any preset's URL. Now passed through to AddEntry.
+	FString BaseURLOverride;
+	if (ProviderBaseURLInput.IsValid())
+		BaseURLOverride = ProviderBaseURLInput->GetText().ToString().TrimStartAndEnd();
+
+	FMCPToolboxAPIManager::Get().AddEntry(CurrentProviderId, ModelId, ApiKey, BaseURLOverride);
 
 	// 清空输入
 	if (APIKeyInput.IsValid()) APIKeyInput->SetText(FText::GetEmpty());

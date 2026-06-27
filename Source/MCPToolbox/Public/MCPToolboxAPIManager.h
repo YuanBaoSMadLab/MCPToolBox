@@ -108,7 +108,15 @@ public:
 	static FMCPToolboxAPIManager& Get();
 
 	// ---- 密钥条目管理 ----
-	void AddEntry(const FString& ProviderId, const FString& ModelId, const FString& ApiKey);
+	/**
+	 * Add a new API key entry.
+	 * @param BaseURLOverride  If non-empty, overrides the preset's BaseURL.
+	 *                         This is essential for local providers (llama.cpp / LM Studio)
+	 *                         where the user may run the server on a custom port.
+	 *                         Previously the UI's BaseURL input was silently ignored.
+	 */
+	void AddEntry(const FString& ProviderId, const FString& ModelId, const FString& ApiKey,
+	              const FString& BaseURLOverride = TEXT(""));
 	void RemoveEntry(const FString& EntryId);
 	const TArray<FMCPToolboxAPIKeyEntry>& GetEntries() const;
 	const FMCPToolboxAPIKeyEntry* GetEntry(const FString& EntryId) const;

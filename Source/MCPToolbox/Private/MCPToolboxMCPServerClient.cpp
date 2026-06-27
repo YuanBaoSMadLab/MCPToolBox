@@ -123,27 +123,20 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 							return;
 						}
 						// Re-send initialize via session endpoint
-						// ... reuse the same RPC body generation but with SessionEndpoint URL
-						// For simplicity, just set bInitialized=true and let user retry
-						bInitialized = true;
-						UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Initialized via SSE!"));
+					// ... reuse the same RPC body generation but with SessionEndpoint URL
+					// For simplicity, just set bInitialized=true and let user retry
+					bInitialized = true;
+					UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Initialized via SSE!"));
 
-						// ── Connection warmup ──
-						FString WarmupUrl = FString::Printf(TEXT("http://%s:%d/mcp"), *Host, Port);
-						auto WuReq = FHttpModule::Get().CreateRequest();
-						WuReq->SetURL(WarmupUrl);
-						WuReq->SetVerb(TEXT("POST"));
-						WuReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-						WuReq->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
-						if (!McpSessionId.IsEmpty())
-							WuReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
-						WuReq->SetContentAsString(TEXT(R"({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}})"));
-						WuReq->SetTimeout(3.0f);
-						WuReq->OnProcessRequestComplete().BindLambda([](FHttpRequestPtr, FHttpResponsePtr, bool) {});
-						WuReq->ProcessRequest();
+					// (Removed redundant warmup tools/list — OnConnected.Broadcast()
+					// triggers RefreshMCPTools() which sends tools/list anyway. The
+					// previous fire-and-forget warmup just wasted one round-trip and
+					// its response was discarded. UE5's HTTP module (WinHTTP/curl)
+					// already pools connections by host:port, so manual pre-warming
+					// of TCP keep-alive is unnecessary for localhost.)
 
-						OnConnected.Broadcast();
-					});
+					OnConnected.Broadcast();
+				});
 				SseReq->ProcessRequest();
 				return;
 			}
@@ -190,28 +183,17 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 			NotifyReq->SetURL(RootUrl);
 			NotifyReq->SetVerb(TEXT("POST"));
 			NotifyReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-			if (!McpSessionId.IsEmpty())
-				NotifyReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
-			NotifyReq->SetContentAsString(NotifyBody);
-			NotifyReq->ProcessRequest();
+		if (!McpSessionId.IsEmpty())
+			NotifyReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
+		NotifyReq->SetContentAsString(NotifyBody);
+		NotifyReq->ProcessRequest();
 
-			// ── Connection warmup: fire-and-forget to pre-establish TCP keep-alive ──
-			// Sends a lightweight tools/list to keep the connection hot for subsequent calls
-			auto WarmupReq = FHttpModule::Get().CreateRequest();
-			WarmupReq->SetURL(RootUrl);
-			WarmupReq->SetVerb(TEXT("POST"));
-			WarmupReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-			WarmupReq->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
-			if (!McpSessionId.IsEmpty())
-				WarmupReq->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
-			WarmupReq->SetContentAsString(TEXT(R"({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}})"));
-			WarmupReq->SetTimeout(3.0f);
-			WarmupReq->OnProcessRequestComplete().BindLambda([](FHttpRequestPtr, FHttpResponsePtr, bool) {});
-			WarmupReq->ProcessRequest();
-			UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Connection warmup sent"));
+		// (Removed redundant warmup tools/list — OnConnected.Broadcast() triggers
+		// RefreshMCPTools() which sends tools/list anyway. The previous fire-and-forget
+		// warmup just wasted one round-trip and its response was discarded.)
 
-			OnConnected.Broadcast();
-		});
+		OnConnected.Broadcast();
+	});
 
 	Req->ProcessRequest();
 	return true;
@@ -609,54 +591,73 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 				return;
 			}
 
+			// Update session ID if the server rotated/refreshed it (some MCP servers
+			// return a new Mcp-Session-Id on each response). Previously we only captured
+			// it during initialize, so a rotated session would cause subsequent requests
+			// to be rejected (404/403).
+			FString NewSessionId = Resp->GetHeader(TEXT("Mcp-Session-Id"));
+			if (!NewSessionId.IsEmpty() && NewSessionId != McpSessionId)
+			{
+				McpSessionId = NewSessionId;
+				UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Session ID updated: %s"), *McpSessionId);
+			}
+
 			int32 Code = Resp->GetResponseCode();
 		FString RespBody = Resp->GetContentAsString();
 		FString ContentType = Resp->GetHeader(TEXT("Content-Type"));
 
 		UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] ← %s (HTTP %d, %d bytes)"), *Method, Code, RespBody.Len());
 
-		// ── Optimized SSE parsing: single-pass extraction ──
+		// ── SSE parsing ──
+		// Correctly handles: multiple "data:" lines per event (concatenated with \n),
+		// multiple events (takes the last one with a JSON payload), event/id/comment
+		// lines that should be ignored. The previous "optimized" single-pass extraction
+		// had two bugs: (1) Find("data:") always shadowed Find("data: ") since the former
+		// is a substring of the latter, making the second branch dead code; (2) it used
+		// FindChar('\n') which finds the FIRST newline in the whole body — if an
+		// "event:" line preceded the "data:" line, the newline check would fail and the
+		// entire tail (including trailing whitespace and subsequent events) was treated
+		// as JSON, causing deserialization failures.
 		if (ContentType.Contains(TEXT("text/event-stream")))
 		{
-			// Find "data:" line index — avoid ParseIntoArrayLines allocation
-			int32 DataIdx = RespBody.Find(TEXT("data:"), ESearchCase::CaseSensitive);
-			if (DataIdx == INDEX_NONE)
+			TArray<FString> Lines;
+			RespBody.ParseIntoArrayLines(Lines, false);
+
+			FString DataAccumulator;
+			FString LastEventData;
+
+			for (const FString& Line : Lines)
 			{
-				DataIdx = RespBody.Find(TEXT("data: "), ESearchCase::CaseSensitive);
+				FString Trimmed = Line.TrimStartAndEnd();
+
+				if (Trimmed.IsEmpty())
+				{
+					// Blank line = event boundary
+					if (!DataAccumulator.IsEmpty())
+					{
+						LastEventData = DataAccumulator;
+						DataAccumulator.Empty();
+					}
+				}
+				else if (Trimmed.StartsWith(TEXT("data:")))
+				{
+					FString DataPart = Trimmed.RightChop(5); // skip "data:"
+					DataPart.TrimStartInline();
+					if (!DataAccumulator.IsEmpty())
+						DataAccumulator += TEXT("\n");
+					DataAccumulator += DataPart;
+				}
+				// Ignore "event:", "id:", ":" comment lines
 			}
 
-			if (DataIdx != INDEX_NONE)
+			// Handle trailing data without a final blank line
+			if (!DataAccumulator.IsEmpty() && LastEventData.IsEmpty())
+				LastEventData = DataAccumulator;
+
+			if (!LastEventData.IsEmpty())
 			{
-				// Extract from "data:" to end or next empty line
-				int32 Start = DataIdx;
-				while (Start < RespBody.Len() && RespBody[Start] != TEXT('{') && RespBody[Start] != TEXT('['))
-					Start++;
-
-				int32 End = RespBody.Len();
-				int32 NewlinePos = INDEX_NONE;
-				if (RespBody.FindChar(TEXT('\n'), NewlinePos) && NewlinePos > Start)
-				{
-					// Find end of JSON object/array
-					End = NewlinePos;
-					for (int32 i = Start + 1; i < RespBody.Len(); i++)
-					{
-						if (RespBody[i] == TEXT('\n'))
-						{
-							End = i;
-							break;
-						}
-					}
-				}
-
-				if (Start < End)
-				{
-					FString JsonPart = RespBody.Mid(Start, End - Start).TrimStartAndEnd();
-					if (!JsonPart.IsEmpty())
-					{
-						RespBody = JsonPart;
-						UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] SSE extracted: %d chars"), RespBody.Len());
-					}
-				}
+				RespBody = LastEventData;
+				UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] SSE extracted: %d chars"), RespBody.Len());
 			}
 		}
 

@@ -41,6 +41,12 @@ const TArray<FMCPToolboxProviderPreset>& FMCPToolboxProviderPreset::GetAll()
 		{TEXT("stepfun"),      TEXT("阶跃星辰 (StepFun)"), TEXT("https://api.stepfun.com/v1"), {TEXT("step-2-16k"), TEXT("step-1-8k"), TEXT("step-1v-8k"), TEXT("step-1-flash")}, true},
 		{TEXT("sense"),         TEXT("商汤 SenseNova"), TEXT("https://api.sensenova.cn/v1"), {TEXT("sensechat-5"), TEXT("sensechat-vision")}, true},
 		{TEXT("ollama"),       TEXT("Ollama (本地)"),  TEXT("http://127.0.0.1:11434/v1"),   {}, false},
+		// ======== 本地 OpenAI 兼容推理服务 ========
+		// llama.cpp llama-server: `./llama-server -m model.gguf --port 8088`
+		// 两者均实现标准 /v1/chat/completions 与 /v1/models，无需 API key，走 openai 通用代码路径。
+		{TEXT("llamacpp"),     TEXT("llama.cpp (本地)"), TEXT("http://127.0.0.1:8088/v1"),   {}, false},
+		{TEXT("lmstudio"),     TEXT("LM Studio (本地)"), TEXT("http://127.0.0.1:1234/v1"),   {}, false},
+		{TEXT("custom"),       TEXT("自定义 (OpenAI 兼容)"), TEXT(""),                         {}, false},
 	};
 
 	return Presets;
@@ -284,7 +290,8 @@ void FMCPToolboxAPIManager::SaveEntries()
 	FFileHelper::SaveStringToFile(Output, *GetEntriesPath());
 }
 
-void FMCPToolboxAPIManager::AddEntry(const FString& ProviderId, const FString& ModelId, const FString& ApiKey)
+void FMCPToolboxAPIManager::AddEntry(const FString& ProviderId, const FString& ModelId, const FString& ApiKey,
+                                     const FString& BaseURLOverride)
 {
 	// 查找预设
 	const FMCPToolboxProviderPreset* Preset = FMCPToolboxProviderPreset::Find(ProviderId);
@@ -293,7 +300,12 @@ void FMCPToolboxAPIManager::AddEntry(const FString& ProviderId, const FString& M
 	Entry.Id = FGuid::NewGuid().ToString();
 	Entry.ProviderId = ProviderId;
 	Entry.ProviderName = Preset ? Preset->Name : ProviderId;
-	Entry.BaseURL = Preset ? Preset->BaseURL : TEXT("");
+	// BaseURL priority: explicit override > preset > empty.
+	// The override is essential for local providers (llama.cpp/LM Studio) where the
+	// user may run the server on a non-default port, and for the "custom" preset which
+	// has no default URL. Previously the UI's BaseURL input was silently discarded here.
+	Entry.BaseURL = !BaseURLOverride.IsEmpty() ? BaseURLOverride :
+	                (Preset ? Preset->BaseURL : TEXT(""));
 	Entry.ModelId = ModelId;
 	Entry.bIsCustom = (Preset == nullptr);
 	Entry.CreatedAt = FDateTime::Now();
@@ -301,8 +313,8 @@ void FMCPToolboxAPIManager::AddEntry(const FString& ProviderId, const FString& M
 	// 本地Base64编码存储密钥（无需强加密，仅防窥视）
 	Entry.EncryptedKey = FBase64::Encode(ApiKey);
 
-	UE_LOG(LogMCPToolbox, Log, TEXT("[APIManager] 添加API密钥: Provider=%s, Model=%s, EntryId=%s"),
-		*ProviderId, *ModelId, *Entry.Id);
+	UE_LOG(LogMCPToolbox, Log, TEXT("[APIManager] 添加API密钥: Provider=%s, Model=%s, BaseURL=%s, EntryId=%s"),
+		*ProviderId, *ModelId, *Entry.BaseURL, *Entry.Id);
 
 	{
 		FScopeLock ScopeLock(&Lock);

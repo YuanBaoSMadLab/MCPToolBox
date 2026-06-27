@@ -23,6 +23,7 @@
 #include "Engine/Selection.h"
 #include "HttpModule.h"
 #include "Containers/Ticker.h"
+#include "Async/Async.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -1178,37 +1179,45 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 				MCPServerClient.ExecuteTool(FuncName, FuncArgs,
 					[this, PendingMCP, PendingMsgs, NameCap, IdCap](bool bOk, const FString& R)
 					{
-						// Build tool result message
-						TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
-						ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
-						ToolResultMsg->SetStringField(TEXT("tool_call_id"), IdCap);
-						ToolResultMsg->SetStringField(TEXT("name"), NameCap);
-						ToolResultMsg->SetStringField(TEXT("content"), R);
-						PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
-
-						// Show result
-						FMCPToolboxChatMessage ResultMsg;
-						ResultMsg.Role = EMCPToolboxMessageRole::System;
-						ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(500));
-						AddMessage(ResultMsg);
-
-						(*PendingMCP)--;
-
-						// All MCP calls done → continue when speculation resolves
-						if (*PendingMCP <= 0)
+						// HTTP callback runs on a background thread. Three unsafe operations
+						// must be marshalled back to the game thread:
+						//   1. PendingMCP-- is a non-atomic read-modify-write that races when
+						//      multiple MCP tools finish concurrently (lost update → counter
+						//      never reaches zero → conversation hangs).
+						//   2. PendingMsgs->Add() pushes to a TArray that is not thread-safe
+						//      under concurrent callers (corrupts internal state / crash).
+						//   3. AddMessage() touches Slate UI state (Messages array, scrollbox)
+						//      which UE requires to run on the game thread.
+						AsyncTask(ENamedThreads::GameThread,
+							[this, PendingMCP, PendingMsgs, NameCap, IdCap, R]()
 						{
-							if (bSpeculationPending && LastSpeculation.IsValid() == false)
+							TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+							ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+							ToolResultMsg->SetStringField(TEXT("tool_call_id"), IdCap);
+							ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+							ToolResultMsg->SetStringField(TEXT("content"), R);
+							PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+							FMCPToolboxChatMessage ResultMsg;
+							ResultMsg.Role = EMCPToolboxMessageRole::System;
+							ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(500));
+							AddMessage(ResultMsg);
+
+							(*PendingMCP)--;
+
+							// All MCP calls done → continue when speculation resolves
+							if (*PendingMCP <= 0)
 							{
-								// Speculation still in-flight: defer continuation to speculation callback.
-								// Store PendingMsgs so the callback can pick up where we left off.
-								// (The speculation lambda will call TrySpeculativeOrContinue)
-								bPendingToolCompletion = true;
+								if (bSpeculationPending && LastSpeculation.IsValid() == false)
+								{
+									bPendingToolCompletion = true;
+								}
+								else
+								{
+									TrySpeculativeOrContinue(PendingMsgs);
+								}
 							}
-							else
-							{
-								TrySpeculativeOrContinue(PendingMsgs);
-							}
-						}
+						});
 					});
 			}
 			else
