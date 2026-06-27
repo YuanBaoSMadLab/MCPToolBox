@@ -1822,14 +1822,49 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		}
 		else
 		{
-			// 缓存目录不存在 — 不阻塞任务。LLM 仍可基于上方 CachedMCPToolDescriptionsMD
-			// 中的工具列表直接调用 call_tool（参数可从工具描述推断）。
-			// 静默处理（不打日志避免每次 BuildSystemPrompt 都刷屏），UI 按钮上有 tooltip 引导。
-			Prompt += TEXT("\n## MCP Toolset 调用提示\n");
-			Prompt += TEXT("> 详细 toolset 文档未缓存（`.mcptoolbox/` 目录不存在），但不影响任务执行。\n");
-			Prompt += TEXT("> 上方'已发现MCP工具'列表已包含所有可用工具的名称和描述。\n");
-			Prompt += TEXT("> **直接用 call_tool 调用**，参数根据工具描述推断；如不确定参数名，可用通用参数名试探（如 name/path/content 等常见命名）。\n");
-			Prompt += TEXT("> 若需详细 toolset 文档以避免试错，可让用户点击工具栏\"刷新工具\"按钮预拉取文档（非必需）。\n\n");
+			// 缓存目录不存在 — 不阻塞任务。
+			// 把 call_tool 本身的调用格式（从 tools/list 预获取）塞进 prompt，
+			// 让 LLM 即使没有详细 toolset 文档也能正确构造 call_tool 调用。
+			// 推荐用户点"刷新工具"按钮自行构建完整文档。
+			Prompt += TEXT("\n## MCP Toolset 调用指南（预构建）\n");
+			Prompt += TEXT("> 详细 toolset 文档未缓存（`.mcptoolbox/` 目录不存在），但 call_tool 已可用。\n");
+			Prompt += TEXT("> 以下是 call_tool 的标准调用格式，可立即使用。\n\n");
+
+			Prompt += TEXT("### call_tool 参数\n");
+			Prompt += TEXT("- `toolset_name` (string, 必填): toolset 完整路径，**不含** tool_name\n");
+			Prompt += TEXT("  示例: `editor_toolset.toolsets.material.MaterialTools`\n");
+			Prompt += TEXT("- `tool_name` (string, 必填): 工具名（toolset 内的具体工具）\n");
+			Prompt += TEXT("  示例: `CreateMaterial`\n");
+			Prompt += TEXT("- `arguments` (object, 必填): 工具参数对象，嵌套在 arguments 字段内\n\n");
+
+			Prompt += TEXT("### 调用示例\n");
+			Prompt += TEXT("```json\n");
+			Prompt += TEXT("{\n");
+			Prompt += TEXT("  \"toolset_name\": \"editor_toolset.toolsets.material.MaterialTools\",\n");
+			Prompt += TEXT("  \"tool_name\": \"CreateMaterial\",\n");
+			Prompt += TEXT("  \"arguments\": {\n");
+			Prompt += TEXT("    \"name\": \"MyMaterial\",\n");
+			Prompt += TEXT("    \"path\": \"/Game/Materials\"\n");
+			Prompt += TEXT("  }\n");
+			Prompt += TEXT("}\n");
+			Prompt += TEXT("```\n\n");
+
+			Prompt += TEXT("### 常见 toolset 路径模式（参考，实际以刷新工具后获取为准）\n");
+			Prompt += TEXT("UE5 MCP 工具集通常按以下模式组织:\n");
+			Prompt += TEXT("- `editor_toolset.toolsets.material.MaterialTools` — 材质操作\n");
+			Prompt += TEXT("- `editor_toolset.toolsets.actor.ActorTools` — Actor 操作\n");
+			Prompt += TEXT("- `editor_toolset.toolsets.blueprint.BlueprintTools` — 蓝图操作\n");
+			Prompt += TEXT("- `editor_toolset.toolsets.file.FileTools` — 文件操作\n");
+			Prompt += TEXT("- `editor_toolset.toolsets.screenshot.ScreenshotTools` — 截图操作\n");
+			Prompt += TEXT("（以上为常见命名，实际 toolset_name 以用户点击\"刷新工具\"后缓存的文档为准）\n\n");
+
+			Prompt += TEXT("### 参数推断策略\n");
+			Prompt += TEXT("如不确定具体参数名，可参考通用命名约定:\n");
+			Prompt += TEXT("- 资源类: `name`, `path`, `content`\n");
+			Prompt += TEXT("- 变换类: `location`(x,y,z), `rotation`(pitch,yaw,roll), `scale`\n");
+			Prompt += TEXT("- 查询类: `query`, `filter`, `search_path`\n\n");
+
+			Prompt += TEXT("> **建议**: 让用户点击工具栏\"刷新工具\"按钮，可预拉取完整的 toolset 文档（含每个工具的精确参数 schema），避免参数试错。\n\n");
 		}
 	}
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
