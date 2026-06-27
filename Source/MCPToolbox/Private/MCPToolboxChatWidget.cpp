@@ -2585,10 +2585,10 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					.Text_Lambda([this]() -> FText
 					{
 						if (MCPServerClient.IsConnected())
-							return LOCTEXT("MCPReady", "MCP: 已连接");
+							return LOCTEXT("MCPReady", "MCP");
 						if (FMCPToolboxModule::IsMCPServerStarted())
-							return LOCTEXT("MCPStarting", "MCP: 连接中...");
-						return LOCTEXT("MCPOffline", "MCP: 未启动");
+							return LOCTEXT("MCPStarting", "MCP…");
+						return LOCTEXT("MCPOffline", "MCP");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity_Lambda([this]() -> FLinearColor
@@ -2601,21 +2601,18 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					})
 				]
 				// Aux Model status
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 12, 0))
-				[
-					SNew(STextBlock)
-					.Text_Lambda([]() -> FText
-					{
-						return FText::FromString(FMCPToolboxAuxModelManager::Get().GetStatusText());
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity_Lambda([]() -> FLinearColor
-					{
-						return FMCPToolboxAuxModelManager::Get().IsReady()
-							? FLinearColor(0.3f, 0.85f, 0.4f)
-							: FLinearColor(0.45f, 0.45f, 0.45f);
-					})
-				]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(10, 0, 0, 0))
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TEXT("Aux")))
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				.ColorAndOpacity_Lambda([]() -> FLinearColor
+				{
+					return FMCPToolboxAuxModelManager::Get().IsReady()
+						? FLinearColor(0.3f, 0.85f, 0.4f)
+						: FLinearColor(0.4f, 0.4f, 0.4f);
+				})
+			]
 				// AI status
 				+ SHorizontalBox::Slot().AutoWidth()
 				[
@@ -2623,8 +2620,8 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					.Text_Lambda([this]() -> FText
 					{
 						if (bIsWaiting)
-							return LOCTEXT("AIThinking", "AI: 思考中...");
-						return LOCTEXT("AIIdle", "AI: 就绪");
+							return LOCTEXT("AIThinking", "AI…");
+						return LOCTEXT("AIIdle", "AI");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity_Lambda([this]() -> FLinearColor
@@ -2632,53 +2629,65 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 						return bIsWaiting ? FLinearColor(1.0f, 0.8f, 0.2f) : FLinearColor(0.5f, 0.5f, 0.5f);
 					})
 				]
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(12, 0, 0, 0))
+				// Spacer pushes action buttons to the right edge
+				+ SHorizontalBox::Slot().FillWidth(1.0f)
+				[
+					SNew(SBox)
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
 				[
 					SNew(SButton)
 					.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
 					{
-						return bVisionModeEnabled ? FLinearColor(0.2f, 0.4f, 0.6f) : FLinearColor(0.15f, 0.15f, 0.18f);
+						return bVisionModeEnabled ? FLinearColor(0.2f, 0.45f, 0.65f, 1.0f) : FLinearColor(0.13f, 0.13f, 0.15f, 1.0f);
 					})
 					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleVisionMode)
-					.Content()
+				.ContentPadding(FMargin(6, 2))
+				.ToolTipText(LOCTEXT("VisionTooltip", "切换视觉模式: 启用后可处理图片输入"))
+				.Content()
 					[
 						SNew(STextBlock)
 						.Text_Lambda([this]() -> FText
 						{
-							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "👁 视觉模式") : LOCTEXT("VisionDisabled", "视觉: 关闭");
-						})
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					]
+							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "👁 视觉") : LOCTEXT("VisionDisabled", "视觉");
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity_Lambda([this]() -> FLinearColor
+					{
+						return bVisionModeEnabled ? FLinearColor(0.9f, 0.95f, 1.0f) : FLinearColor(0.7f, 0.7f, 0.7f);
+					})
+				]
 				]
 				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
 			[
 				SNew(SButton)
-				.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
-				{
-					return bSidebarCollapsed ? FLinearColor(0.2f, 0.2f, 0.25f) : FLinearColor(0.15f, 0.15f, 0.18f);
-				})
-				.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+				.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
+			.ContentPadding(FMargin(6, 2))
+			.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+			.ToolTipText(LOCTEXT("SidebarTooltip", "显示/隐藏会话历史侧边栏"))
 				.Content()
 				[
 					SNew(STextBlock)
 					.Text_Lambda([this]() -> FText
 					{
-						return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 显示对话") : LOCTEXT("SidebarHide", "☰ 隐藏对话");
+						return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 侧栏") : LOCTEXT("SidebarHide", "☰ 隐藏");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
 				]
 			]
 			// ── Refresh MCP Toolset Cache: discovers all toolsets and writes them to <ProjectDir>/.mcptoolbox/*.md ──
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
-			[
-				SNew(SButton)
-				.ButtonColorAndOpacity(FLinearColor(0.15f, 0.3f, 0.18f))
-				.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
+		+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
+		[
+			SNew(SButton)
+			.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
+			.ContentPadding(FMargin(6, 2))
+			.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
 				.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "感知当前项目启用的所有 MCP 工具集，缓存为 .mcptoolbox/*.md 供 AI 直接调用，省去询问 list_toolsets/describe_toolset 的时间"))
 				.Content()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("RefreshToolCacheBtn", "🔄 刷新工具"))
+					.Text(LOCTEXT("RefreshToolCacheBtn", "🔄 工具"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
 				]

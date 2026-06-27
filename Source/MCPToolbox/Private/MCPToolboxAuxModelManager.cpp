@@ -132,7 +132,9 @@ void FMCPToolboxAuxModelManager::StartServer()
 	if (IsServerRunning()) return;
 	if (CurrentStatus != EMCPToolboxAuxModelStatus::Ready) return;
 
-	ServerPort = FindFreePort(8088);
+	// Use 8089+ for the auxiliary model so that 8088 stays reserved for the user's
+	// own llama.cpp / LM Studio instance (see MCPToolboxAPIManager presets).
+	ServerPort = FindFreePort(8089);
 	const FString AuxDir = GetAuxModuleDir();
 	const FString ServerExe = FPaths::Combine(AuxDir, TEXT("llama/llama-server.exe"));
 	const FString ModelPath = FPaths::Combine(AuxDir, TEXT("qwen3-vl/Qwen3VL-2B-Instruct-Q4_K_M.gguf"));
