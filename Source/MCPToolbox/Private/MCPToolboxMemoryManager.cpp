@@ -297,7 +297,9 @@ int32 FMCPToolboxMemoryManager::ExtractMemoriesFromResponse(const FString& AIRes
 	FScopeLock ScopeLock(&Lock);
 	int32 Count = 0;
 
-	// Patterns to detect: "记住：xxx", "重要：xxx", "偏好：xxx", "MEMORY:xxx"
+	// Patterns to detect: "记住：xxx", "重要：xxx", "偏好：xxx", "总结：xxx",
+	// "经验：xxx", "MEMORY:xxx"
+	// 注：RightChopInline(N) 按 TCHAR 数量从左侧移除前缀，中文关键字统一为 3。
 	TArray<FString> Lines;
 	AIResponse.ParseIntoArrayLines(Lines);
 
@@ -327,6 +329,18 @@ int32 FMCPToolboxMemoryManager::ExtractMemoriesFromResponse(const FString& AIRes
 			Line.RightChopInline(3);
 			bIsMemory = true;
 			MemType = EMCPToolboxMemoryType::User;
+		}
+		else if (Line.StartsWith(TEXT("总结：")) || Line.StartsWith(TEXT("总结:")))
+		{
+			Line.RightChopInline(3);
+			bIsMemory = true;
+			MemType = EMCPToolboxMemoryType::Project;
+		}
+		else if (Line.StartsWith(TEXT("经验：")) || Line.StartsWith(TEXT("经验:")))
+		{
+			Line.RightChopInline(3);
+			bIsMemory = true;
+			MemType = EMCPToolboxMemoryType::Feedback;
 		}
 		else if (Line.StartsWith(TEXT("MEMORY:")) || Line.StartsWith(TEXT("MEMORY：")))
 		{

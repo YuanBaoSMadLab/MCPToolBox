@@ -373,8 +373,19 @@ private:
 	/** Whether the sidebar is collapsed */
 	bool bSidebarCollapsed = false;
 
-	/** Toggle sidebar visibility */
-	FReply ToggleSidebar();
+	/** Whether the "more actions" secondary toolbar row is expanded */
+	bool bMoreExpanded = false;
+
+	// ---- Widget State Persistence ----
+
+	/** Get path to widget state file (~/.mcptoolbox/widget_state.json) */
+	FString GetWidgetStatePath() const;
+
+	/** Load bVisionModeEnabled / bSidebarCollapsed / bMoreExpanded from disk */
+	void LoadWidgetState();
+
+	/** Persist bVisionModeEnabled / bSidebarCollapsed / bMoreExpanded to disk */
+	void SaveWidgetState() const;
 
 	// ---- DAG Parallel Execution ----
 

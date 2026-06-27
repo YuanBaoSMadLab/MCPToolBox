@@ -42,9 +42,12 @@ static void InjectSpeculationHint(TArray<TSharedPtr<FJsonValue>>& PendingMsgs, c
 void SMCPToolboxChatWidget::Construct(const FArguments& InArgs)
 {
 	Messages.Empty();
-	bVisionModeEnabled = false;
 	bIsStreaming = false;
 	bIsWaiting = false;
+
+	// Restore persisted widget state (vision/sidebar/more-expanded) before any UI is built.
+	// bVisionModeEnabled etc. are reset above; LoadWidgetState overrides them from disk.
+	LoadWidgetState();
 
 	// Refresh auxiliary model status and start llama-server
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
@@ -113,6 +116,14 @@ TSharedRef<SScrollBox> SMCPToolboxChatWidget::BuildChatArea()
 	if (CurrentSession && CurrentSession->Messages.Num() > 0)
 	{
 		Messages = CurrentSession->Messages;
+		// Defensive: clear stale bIsStreaming flags from any interrupted past session.
+		// A streaming message saved with bIsStreaming=true would otherwise render as a
+		// forever-streaming bubble after restart, which is one cause of the
+		// "context inconsistent after editor restart" report.
+		for (FMCPToolboxChatMessage& Msg : Messages)
+		{
+			Msg.bIsStreaming = false;
+		}
 	}
 	else
 	{
@@ -150,7 +161,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildSessionSidebar()
 		.HAlign(HAlign_Center);
 
 	// (Removed the in-sidebar ">>" collapse button — it duplicated the toolbar's
-	// "☰ 显示/隐藏对话" toggle and, worse, disappeared along with the sidebar when
+	// "显示/隐藏对话" toggle and, worse, disappeared along with the sidebar when
 	// clicked, leaving no in-pane way to expand again. The toolbar button remains.)
 
 	return SNew(SBox)
@@ -270,7 +281,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 	case EMCPToolboxMessageRole::User:      RoleLabel = TEXT("你"); bAlignRight = true; break;
 	case EMCPToolboxMessageRole::Assistant:  RoleLabel = TEXT("AI助手"); break;
 	case EMCPToolboxMessageRole::System:     RoleLabel = TEXT("系统"); break;
-	case EMCPToolboxMessageRole::Thinking:   RoleLabel = TEXT("⚙ 思考中"); break;
+	case EMCPToolboxMessageRole::Thinking:   RoleLabel = TEXT("思考中"); break;
 	}
 
 	// Clean markdown for display
@@ -298,7 +309,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 						+ SHorizontalBox::Slot().AutoWidth()
 						[
 							SNew(STextBlock)
-							.Text(FText::FromString(bIsResult ? TEXT("✓") : TEXT("⚙")))
+							.Text(FText::FromString(bIsResult ? TEXT("[OK]") : TEXT("[...]")))
 							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 							.ColorAndOpacity(bIsResult ? FLinearColor(0.3f, 0.85f, 0.4f) : FLinearColor(1.0f, 0.8f, 0.2f))
 						]
@@ -1162,7 +1173,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 		FMCPToolboxChatMessage ToolMsg;
 		ToolMsg.Role = EMCPToolboxMessageRole::Thinking;
-		ToolMsg.Content = FString::Printf(TEXT("⚙ 调用工具: %s"), *ToolNames);
+		ToolMsg.Content = FString::Printf(TEXT("调用工具: %s"), *ToolNames);
 		AddMessage(ToolMsg);
 
 		// Check if tool calls have DAG dependencies (LLMCompiler-style)
@@ -1629,18 +1640,35 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += FString::Printf(TEXT("- Content目录: %s\n"), *ContentPath);
 	Prompt += FString::Printf(TEXT("- 资源路径前缀: /Game/ (对应Content目录)\n\n"));
 
+	// ── CRITICAL: tool info source ──
+	// This block must come BEFORE any other rule. The user has repeatedly observed the
+	// LLM wasting turns calling list_toolsets / describe_toolset even though every
+	// toolset's schema is already injected below (from .mcptoolbox/*.md). Putting the
+	// prohibition at the very top maximises the chance the model obeys.
+	Prompt += TEXT("## ⚠ 最高优先级规则（违反=立即失败）\n");
+	Prompt += TEXT("1. **所有 MCP 工具的调用方式（toolset_name / tool_name / arguments schema）已在下方 \"MCP Toolset 缓存\" 章节完整给出**。\n");
+	Prompt += TEXT("2. **绝对禁止调用 list_toolsets 或 describe_toolset**。这两个工具在本会话中不可用、不需要、也不被允许。\n");
+	Prompt += TEXT("3. **需要调用工具时，直接 call_tool(toolset_name=..., tool_name=..., arguments={...})**。参数 schema 就在下方，照抄即可。\n");
+	Prompt += TEXT("4. 如果下方没有 \"MCP Toolset 缓存\" 章节（说明用户尚未点击\"刷新工具\"按钮），**请明确告知用户**：\"请先点击工具栏的 '更多 → 刷新工具' 按钮缓存工具集文档\"，然后停止。不要尝试自行发现工具。\n\n");
+
 	Prompt += TEXT("## 核心规则（必须100%遵守！违反规则=失败）\n");
 	Prompt += TEXT("1. **绝不空口承诺**：禁止说\"我来帮你\"\"让我看看\"等文字而不调用工具。说一次执行一次\n");
 	Prompt += TEXT("2. **先调用工具再说话**：收到指令→立即调用工具→拿到结果→回复用户。中间不允许纯文字\n");
 	Prompt += TEXT("3. **非工具不可**：创建材质/执行命令/截图/选择Actor—这些操作必须且只能通过工具完成\n");
 	Prompt += TEXT("4. **工具参数必填且正确**：路径加/Game/前缀，命令写完整\n");
-	Prompt += TEXT("5. **🚫 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
-	Prompt += TEXT("6. **🔴 MCP工具已内置（禁止重复发现！）**：所有MCP工具已在下方'已发现MCP工具'完整列出。直接 call_tool 调用。list_toolsets/describe_toolset 不可用，也不要尝试调用。\n");
+	Prompt += TEXT("5. ** 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
+	Prompt += TEXT("6. ** MCP工具已内置（禁止重复发现！）**：所有MCP工具已在下方'已发现MCP工具'完整列出。直接 call_tool 调用。list_toolsets/describe_toolset 不可用，也不要尝试调用。\n");
 	Prompt += TEXT("7. **command仅限控制台命令**：command只用于 HighResShot、stat fps 等纯控制台命令，绝不用于Python脚本。\n");
-	Prompt += TEXT("8. **主动记忆**：每次对话后，用\"记住：xxx\"保存MCP工具使用经验和用户偏好。\n");
-	Prompt += TEXT("9. **👁 视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
+	Prompt += TEXT("8. **主动记忆总结**：每完成一个有价值的任务或学到新经验后，在回复末尾**单独一行**输出以下任一格式以触发持久化记忆：\n");
+	Prompt += TEXT("   - `记住：xxx`（保存工具使用经验）\n");
+	Prompt += TEXT("   - `重要：xxx`（保存项目关键事实）\n");
+	Prompt += TEXT("   - `偏好：xxx`（保存用户偏好）\n");
+	Prompt += TEXT("   - `总结：xxx`（保存本次任务的核心经验）\n");
+	Prompt += TEXT("   - `经验：xxx`（保存踩坑/最佳实践）\n");
+	Prompt += TEXT("   示例：`记住：call_tool 创建材质时 toolset_name=unreal_editor_asset, tool_name=create_material`\n");
+	Prompt += TEXT("9. **视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
 
-	Prompt += TEXT("## ⚡ 效率规则（必须严格遵守！目标：减少round-trip，提高速度）\n");
+	Prompt += TEXT("##  效率规则（必须严格遵守！目标：减少round-trip，提高速度）\n");
 	Prompt += TEXT("1. **批量读取**：需要读取多个文件时，使用 batch_read_files 一次性读取，禁止逐个调用 read_file\n");
 	Prompt += TEXT("2. **并行工具调用**：如果有多个独立的工具需要调用（如搜索+读取、截图+inspect），在同一次响应中并行调用多个tool_calls，不要分多次\n");
 	Prompt += TEXT("3. **先搜索再读取**：需要找代码时，先用 search_codebase 搜索定位，再用 batch_read_files 批量读取，避免盲目读取大量文件\n");
@@ -1648,7 +1676,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("5. **减少对话轮数**：目标是用最少的轮数完成任务。能一轮完成的绝不两轮，能两轮完成的绝不三轮\n");
 	Prompt += TEXT("6. **善用 glob_search**：找文件用 glob_search，比逐个目录 list_directory 快得多\n");
 	Prompt += TEXT("7. **工具调用是免费的**：不要因为怕调用工具而省着用。但要聪明地用——批量用、并行用、一次用对\n");
-	Prompt += TEXT("8. **🔥 DAG 依赖式并行（LLMCompiler）**：当工具调用有依赖关系时，使用 $tN.xxx 引用语法声明依赖，系统会自动构建DAG并按层并行执行！\n");
+	Prompt += TEXT("8. ** DAG 依赖式并行（LLMCompiler）**：当工具调用有依赖关系时，使用 $tN.xxx 引用语法声明依赖，系统会自动构建DAG并按层并行执行！\n");
 	Prompt += TEXT("   - 格式：每个工具调用可通过参数中的 $t1.result、$t2.data 等引用前面任务的结果\n");
 	Prompt += TEXT("   - 示例：t1=search_codebase(\"bug\"), t2=read_file(path=$t1.result[0]), t3=analyze(data=$t2.content)\n");
 	Prompt += TEXT("   - 执行方式：系统自动检测依赖，构建DAG，无依赖的任务并行执行，大幅提速\n");
@@ -1657,15 +1685,15 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("## 工具优先级（从高到低，严格按此顺序）\n");
 	Prompt += TEXT("1. **MCP call_tool（直接调用！）**：工具已在下方列出，直接用 call_tool 调用。多个独立调用时一次性批量发出（多个tool_calls）\n");
 	Prompt += TEXT("2. **本地工具**：screenshot, select, inspect\n");
-	Prompt += TEXT("3. **command**：仅限控制台命令(HighResShot, stat等)，🚫禁止py脚本\n\n");
+	Prompt += TEXT("3. **command**：仅限控制台命令(HighResShot, stat等)，禁止py脚本\n\n");
 
 	Prompt += TEXT("## 工具列表\n");
 	Prompt += TEXT("### MCP工具（直接调用，无需发现）\n");
 	Prompt += TEXT("- **call_tool** — 调用MCP工具。参数: toolset_name (string), tool_name (string), arguments (object)。工具集和工具名见下方'已发现MCP工具'列表\n");
 	Prompt += TEXT("### 本地高效工具（优先使用，节省时间）\n");
-	Prompt += TEXT("- **batch_read_files** — ⚡ 批量读取多个文件。参数: file_paths (array of strings)。**读取多个文件时必须用这个，禁止逐个读**\n");
-	Prompt += TEXT("- **search_codebase** — ⚡ 搜索整个代码库。参数: pattern (string), path (可选), file_pattern (可选,默认*.cpp,*.h), max_results (可选,默认50)。**找代码先用这个**\n");
-	Prompt += TEXT("- **glob_search** — ⚡ 按文件名模式搜索文件。参数: pattern (string, 如 *.cpp, **/*.h), path (可选)。**找文件用这个**\n");
+	Prompt += TEXT("- **batch_read_files** —  批量读取多个文件。参数: file_paths (array of strings)。**读取多个文件时必须用这个，禁止逐个读**\n");
+	Prompt += TEXT("- **search_codebase** —  搜索整个代码库。参数: pattern (string), path (可选), file_pattern (可选,默认*.cpp,*.h), max_results (可选,默认50)。**找代码先用这个**\n");
+	Prompt += TEXT("- **glob_search** —  按文件名模式搜索文件。参数: pattern (string, 如 *.cpp, **/*.h), path (可选)。**找文件用这个**\n");
 	Prompt += TEXT("- **list_directory** — 列出目录内容。参数: path (string)\n");
 	Prompt += TEXT("### 本地辅助工具\n");
 	Prompt += TEXT("- **screenshot** — 截取屏幕图片，你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
@@ -1686,7 +1714,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		IFileManager& FileMgr = IFileManager::Get();
 		if (FileMgr.DirectoryExists(*ToolboxDir))
 		{
-			Prompt += TEXT("\n## 📚 MCP Toolset 缓存（来自 .mcptoolbox/）\n");
+			Prompt += TEXT("\n##  MCP Toolset 缓存（来自 .mcptoolbox/）\n");
 			Prompt += TEXT("> 以下文档由 fetch-mcp-toolsets.ps1 预拉取生成，已包含所有 toolset 的精确调用方式（toolset_name/tool_name/arguments）。\n");
 			Prompt += TEXT("> **不要调用 list_toolsets/describe_toolset** — 本章节已包含所有信息。\n");
 			Prompt += TEXT("> **关键**：toolset_name 是完整 toolset 路径（不含 tool_name），tool_name 是 toolset 中的工具名。\n\n");
@@ -1748,26 +1776,26 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		}
 	}
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
-	Prompt += TEXT("- **command** — 🚫 禁止用于py脚本。仅限纯控制台命令。\n\n");
+	Prompt += TEXT("- **command** —  禁止用于py脚本。仅限纯控制台命令。\n\n");
 
 	Prompt += TEXT("## 行为示例（正确 vs 错误）\n");
 	Prompt += TEXT("用户: 帮我创建自发光白色材质\n");
-	Prompt += TEXT("❌ 错误: 直接用 command(cmd=\"py ...\") (绕开MCP)\n");
-	Prompt += TEXT("✅ 正确: 从下方'已发现MCP工具'中找到材质工具 → call_tool 创建材质\n");
-	Prompt += TEXT("✅ 正确(MCP不可用时): command(cmd=\"py ...创建自发光材质...\")\n\n");
+	Prompt += TEXT(" 错误: 直接用 command(cmd=\"py ...\") (绕开MCP)\n");
+	Prompt += TEXT(" 正确: 从下方'已发现MCP工具'中找到材质工具 → call_tool 创建材质\n");
+	Prompt += TEXT(" 正确(MCP不可用时): command(cmd=\"py ...创建自发光材质...\")\n\n");
 
-	Prompt += TEXT("## ⚡ 效率示例（快 vs 慢）\n");
+	Prompt += TEXT("##  效率示例（快 vs 慢）\n");
 	Prompt += TEXT("用户: 帮我看看MCPToolboxChatWidget.h和MCPToolboxChatWidget.cpp里的工具调用相关代码\n");
-	Prompt += TEXT("🐢 慢: 先list_directory找文件 → read_file读.h → read_file读.cpp → 读了5轮\n");
-	Prompt += TEXT("⚡ 快: search_codebase(\"ToolCall\") → 定位到相关行 → batch_read_files([两个文件]) → 1-2轮搞定\n\n");
+	Prompt += TEXT(" 慢: 先list_directory找文件 → read_file读.h → read_file读.cpp → 读了5轮\n");
+	Prompt += TEXT(" 快: search_codebase(\"ToolCall\") → 定位到相关行 → batch_read_files([两个文件]) → 1-2轮搞定\n\n");
 
 	Prompt += TEXT("用户: 帮我修改5个文件\n");
-	Prompt += TEXT("🐢 慢: 读文件1 → 改文件1 → 读文件2 → 改文件2 → ... 10轮\n");
-	Prompt += TEXT("⚡ 快: batch_read_files(5个文件) → 一次性看完 → 并行调用5个call_tool改文件 → 2-3轮搞定\n\n");
+	Prompt += TEXT(" 慢: 读文件1 → 改文件1 → 读文件2 → 改文件2 → ... 10轮\n");
+	Prompt += TEXT(" 快: batch_read_files(5个文件) → 一次性看完 → 并行调用5个call_tool改文件 → 2-3轮搞定\n\n");
 
 	Prompt += TEXT("用户: 搜索bug→读文件→分析→生成修复方案\n");
-	Prompt += TEXT("🐢 慢: search → read → analyze → report → 4轮\n");
-	Prompt += TEXT("⚡ 快(DAG并行): t1=search, t2=search2(另一个关键词), t3=read(path=$t1.result[0]), t4=analyze(data=$t3.content) → 1轮(t1/t2并行, t3等t1, t4等t3)\n\n");
+	Prompt += TEXT(" 慢: search → read → analyze → report → 4轮\n");
+	Prompt += TEXT(" 快(DAG并行): t1=search, t2=search2(另一个关键词), t3=read(path=$t1.result[0]), t4=analyze(data=$t3.content) → 1轮(t1/t2并行, t3等t1, t4等t3)\n\n");
 
 	if (!MemoryContext.IsEmpty())
 	{
@@ -2338,7 +2366,7 @@ FReply SMCPToolboxChatWidget::OnRefreshToolCache()
 					}
 
 					FString Md;
-					Md += TEXT("## 📚 MCP Toolset 缓存(运行时感知)\n\n");
+					Md += TEXT("##  MCP Toolset 缓存(运行时感知)\n\n");
 					Md += TEXT("使用 `call_tool` 调用,toolset_name 是完整路径(如 `editor_toolset.toolsets.material.MaterialTools`),tool_name 是工具名(如 `CreateMaterial`)。**禁止**调用 list_toolsets/describe_toolset。\n\n");
 					for (const auto& Kvp : Grouped)
 					{
@@ -2511,6 +2539,7 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 FReply SMCPToolboxChatWidget::OnToggleVisionMode()
 {
 	bVisionModeEnabled = !bVisionModeEnabled;
+	SaveWidgetState();
 
 	bool bHasLocalVL = FMCPToolboxAuxModelManager::Get().IsReady();
 	FString Note;
@@ -2524,7 +2553,7 @@ FReply SMCPToolboxChatWidget::OnToggleVisionMode()
 	FNotificationInfo Info(FText::FromString(Note));
 	Info.ExpireDuration = 3.0f;
 	FSlateNotificationManager::Get().AddNotification(Info);
-	
+
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Vision mode %s"), bVisionModeEnabled ? TEXT("enabled") : TEXT("disabled"));
 	return FReply::Handled();
 }
@@ -2532,6 +2561,7 @@ FReply SMCPToolboxChatWidget::OnToggleVisionMode()
 FReply SMCPToolboxChatWidget::OnToggleSidebar()
 {
 	bSidebarCollapsed = !bSidebarCollapsed;
+	SaveWidgetState();
 	return FReply::Handled();
 }
 // ============================================================================
@@ -2649,7 +2679,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 						SNew(STextBlock)
 						.Text_Lambda([this]() -> FText
 						{
-							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "👁 视觉") : LOCTEXT("VisionDisabled", "视觉");
+							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "视觉开") : LOCTEXT("VisionDisabled", "视觉");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity_Lambda([this]() -> FLinearColor
@@ -2658,40 +2688,73 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					})
 				]
 				]
+				// ── "更多" toggle: expands/collapses the secondary action buttons (Sidebar/RefreshTool) ──
 				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
-			[
-				SNew(SButton)
-				.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
-			.ContentPadding(FMargin(6, 2))
-			.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
-			.ToolTipText(LOCTEXT("SidebarTooltip", "显示/隐藏会话历史侧边栏"))
-				.Content()
 				[
-					SNew(STextBlock)
-					.Text_Lambda([this]() -> FText
+					SNew(SButton)
+					.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
+					.ContentPadding(FMargin(6, 2))
+					.OnClicked_Lambda([this]() -> FReply
 					{
-						return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 侧栏") : LOCTEXT("SidebarHide", "☰ 隐藏");
+						bMoreExpanded = !bMoreExpanded;
+						SaveWidgetState();
+						return FReply::Handled();
 					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+					.ToolTipText(LOCTEXT("MoreTooltip", "展开/收起更多操作"))
+					.Content()
+					[
+						SNew(STextBlock)
+						.Text_Lambda([this]() -> FText
+						{
+							return bMoreExpanded ? LOCTEXT("MoreCollapse", "收起") : LOCTEXT("MoreExpand", "更多");
+						})
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+					]
 				]
-			]
-			// ── Refresh MCP Toolset Cache: discovers all toolsets and writes them to <ProjectDir>/.mcptoolbox/*.md ──
-		+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-		[
-			SNew(SButton)
-			.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
-			.ContentPadding(FMargin(6, 2))
-			.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
-				.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "感知当前项目启用的所有 MCP 工具集，缓存为 .mcptoolbox/*.md 供 AI 直接调用，省去询问 list_toolsets/describe_toolset 的时间"))
-				.Content()
+				// ── Sidebar toggle (visible only when "更多" is expanded) ──
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
 				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("RefreshToolCacheBtn", "🔄 工具"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
+					SNew(SButton)
+					.Visibility_Lambda([this]() -> EVisibility
+					{
+						return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+					})
+					.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
+					.ContentPadding(FMargin(6, 2))
+					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+					.ToolTipText(LOCTEXT("SidebarTooltip", "显示/隐藏会话历史侧边栏"))
+					.Content()
+					[
+						SNew(STextBlock)
+						.Text_Lambda([this]() -> FText
+						{
+							return bSidebarCollapsed ? LOCTEXT("SidebarShow", "显示侧栏") : LOCTEXT("SidebarHide", "隐藏侧栏");
+						})
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+					]
 				]
-			]
+				// ── Refresh MCP Toolset Cache: discovers all toolsets and writes them to <ProjectDir>/.mcptoolbox/*.md ──
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
+				[
+					SNew(SButton)
+					.Visibility_Lambda([this]() -> EVisibility
+					{
+						return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+					})
+					.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
+					.ContentPadding(FMargin(6, 2))
+					.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
+					.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "感知当前项目启用的所有 MCP 工具集，缓存为 .mcptoolbox/*.md 供 AI 直接调用，省去询问 list_toolsets/describe_toolset 的时间"))
+					.Content()
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("RefreshToolCacheBtn", "刷新工具"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
+					]
+				]
 		]
 	];
 }
@@ -2946,7 +3009,7 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 
 	FMCPToolboxChatMessage DAGMsg;
 	DAGMsg.Role = EMCPToolboxMessageRole::Thinking;
-	DAGMsg.Content = FString::Printf(TEXT("⚡ DAG 并行执行 (加速比: %.1fx)\n```\n%s\n```"),
+	DAGMsg.Content = FString::Printf(TEXT("DAG 并行执行 (加速比: %.1fx)\n```\n%s\n```"),
 		ExecutionPlanner.EstimateSpeedup(Plan), *DAGVisual);
 	AddMessage(DAGMsg);
 
@@ -3017,7 +3080,7 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 				// 结果消息
 				FMCPToolboxChatMessage ResultMsg;
 				ResultMsg.Role = EMCPToolboxMessageRole::System;
-				FString Status = Res.bSuccess ? TEXT("✓") : TEXT("✗");
+				FString Status = Res.bSuccess ? TEXT("[OK]") : TEXT("[FAIL]");
 				ResultMsg.Content = FString::Printf(
 					TEXT("**%s %s** (%dms)\n```\n%s\n```"),
 					*Status, *Name,
@@ -3437,10 +3500,47 @@ void SMCPToolboxChatWidget::UpdateCurrentSessionWithMessage(const FMCPToolboxCha
 	RefreshSessionList();
 }
 
-FReply SMCPToolboxChatWidget::ToggleSidebar()
+// ============================================================================
+// Widget State Persistence — restores vision/sidebar/more-expanded across restarts
+// ============================================================================
+FString SMCPToolboxChatWidget::GetWidgetStatePath() const
 {
-	bSidebarCollapsed = !bSidebarCollapsed;
-	return FReply::Handled();
+	return FPaths::Combine(FPlatformProcess::UserHomeDir(), TEXT(".mcptoolbox"), TEXT("widget_state.json"));
+}
+
+void SMCPToolboxChatWidget::LoadWidgetState()
+{
+	FString Path = GetWidgetStatePath();
+	FString Content;
+	if (!FFileHelper::LoadFileToString(Content, *Path)) return;
+
+	TSharedPtr<FJsonObject> Json;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
+	if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid()) return;
+
+	Json->TryGetBoolField(TEXT("vision_enabled"), bVisionModeEnabled);
+	Json->TryGetBoolField(TEXT("sidebar_collapsed"), bSidebarCollapsed);
+	Json->TryGetBoolField(TEXT("more_expanded"), bMoreExpanded);
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Widget state loaded: vision=%d sidebar=%d more=%d"),
+		(int32)bVisionModeEnabled, (int32)bSidebarCollapsed, (int32)bMoreExpanded);
+}
+
+void SMCPToolboxChatWidget::SaveWidgetState() const
+{
+	TSharedPtr<FJsonObject> Json = MakeShareable(new FJsonObject());
+	Json->SetBoolField(TEXT("vision_enabled"), bVisionModeEnabled);
+	Json->SetBoolField(TEXT("sidebar_collapsed"), bSidebarCollapsed);
+	Json->SetBoolField(TEXT("more_expanded"), bMoreExpanded);
+
+	FString Output;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
+
+	FString Path = GetWidgetStatePath();
+	FString Dir = FPaths::GetPath(Path);
+	IFileManager::Get().MakeDirectory(*Dir, true);
+	FFileHelper::SaveStringToFile(Output, *Path);
 }
 
 // ============================================================================
