@@ -530,3 +530,133 @@ bool FMCPToolboxMemoryManager::ParseIndexLine(const FString& Line, FString& OutT
 
 	return true;
 }
+
+// ============================================================================
+// Conversation Summary (Archive)
+// ============================================================================
+FString FMCPToolboxMemoryManager::GetConversationSummaryIndexPath() const
+{
+	// ~/.mcptoolbox/conversation_summary.md
+	return FPaths::Combine(FPlatformProcess::UserHomeDir(), TEXT(".mcptoolbox"), TEXT("conversation_summary.md"));
+}
+
+FString FMCPToolboxMemoryManager::GetConversationSummaryArchiveDir() const
+{
+	// ~/.mcptoolbox/summaries/
+	return FPaths::Combine(FPlatformProcess::UserHomeDir(), TEXT(".mcptoolbox"), TEXT("summaries"));
+}
+
+bool FMCPToolboxMemoryManager::SaveConversationSummary(const FString& ToolsSummary, const FString& MemorySummary)
+{
+	FScopeLock ScopeLock(&Lock);
+
+	if (ToolsSummary.IsEmpty() && MemorySummary.IsEmpty())
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Memory] SaveConversationSummary: both summaries empty, nothing to save"));
+		return false;
+	}
+
+	// Ensure archive directory exists
+	FString ArchiveDir = GetConversationSummaryArchiveDir();
+	IFileManager::Get().MakeDirectory(*ArchiveDir, true);
+
+	// Timestamp for archive filenames (e.g. 20260627-223100)
+	FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S"));
+
+	// ── Build index file content (overwrite) ──
+	FString Index;
+	Index += TEXT("# Conversation Summary\n\n");
+	Index += FString::Printf(TEXT("> 生成时间: %s\n"), *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")));
+	Index += TEXT("> 此文件作为最新索引，每次总结时覆盖；历史归档见 summaries/ 目录\n\n");
+
+	if (!ToolsSummary.IsEmpty())
+	{
+		Index += TEXT("## 工具使用归档\n\n");
+		Index += ToolsSummary;
+		Index += TEXT("\n\n");
+
+		// Write timestamped archive
+		FString ToolsArchivePath = FPaths::Combine(ArchiveDir, TEXT("tools_") + Timestamp + TEXT(".md"));
+		if (FFileHelper::SaveStringToFile(ToolsSummary, *ToolsArchivePath, FFileHelper::EEncodingOptions::ForceUTF8))
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 工具归档已保存: %s"), *ToolsArchivePath);
+		}
+	}
+
+	if (!MemorySummary.IsEmpty())
+	{
+		Index += TEXT("## 记忆归档\n\n");
+		Index += MemorySummary;
+		Index += TEXT("\n");
+
+		// Write timestamped archive
+		FString MemoryArchivePath = FPaths::Combine(ArchiveDir, TEXT("memory_") + Timestamp + TEXT(".md"));
+		if (FFileHelper::SaveStringToFile(MemorySummary, *MemoryArchivePath, FFileHelper::EEncodingOptions::ForceUTF8))
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 记忆归档已保存: %s"), *MemoryArchivePath);
+		}
+	}
+
+	// Write index file (overwrite)
+	FString IndexPath = GetConversationSummaryIndexPath();
+	FString IndexDir = FPaths::GetPath(IndexPath);
+	IFileManager::Get().MakeDirectory(*IndexDir, true);
+
+	bool bOK = FFileHelper::SaveStringToFile(Index, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8);
+	if (bOK)
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 会话归档索引已更新: %s"), *IndexPath);
+	}
+	else
+	{
+		UE_LOG(LogMCPToolbox, Error, TEXT("[Memory] 写入归档索引失败: %s"), *IndexPath);
+	}
+	return bOK;
+}
+
+bool FMCPToolboxMemoryManager::LoadConversationSummary(FString& OutToolsSummary, FString& OutMemorySummary) const
+{
+	FScopeLock ScopeLock(&Lock);
+
+	OutToolsSummary.Reset();
+	OutMemorySummary.Reset();
+
+	FString IndexPath = GetConversationSummaryIndexPath();
+	FString Content;
+	if (!FFileHelper::LoadFileToString(Content, *IndexPath))
+	{
+		return false;
+	}
+
+	// Parse sections by "## 工具使用归档" and "## 记忆归档"
+	int32 ToolsIdx = Content.Find(TEXT("## 工具使用归档"));
+	int32 MemoryIdx = Content.Find(TEXT("## 记忆归档"));
+
+	if (ToolsIdx != INDEX_NONE)
+	{
+		int32 ContentStart = ToolsIdx + FString(TEXT("## 工具使用归档")).Len();
+		// Skip the heading line itself + blank line
+		while (ContentStart < Content.Len() && (Content[ContentStart] == TEXT('\n') || Content[ContentStart] == TEXT('\r')))
+		{
+			ContentStart++;
+		}
+
+		int32 SectionEnd = (MemoryIdx != INDEX_NONE && MemoryIdx > ToolsIdx) ? MemoryIdx : Content.Len();
+		OutToolsSummary = Content.Mid(ContentStart, SectionEnd - ContentStart).TrimEnd();
+	}
+
+	if (MemoryIdx != INDEX_NONE)
+	{
+		int32 ContentStart = MemoryIdx + FString(TEXT("## 记忆归档")).Len();
+		while (ContentStart < Content.Len() && (Content[ContentStart] == TEXT('\n') || Content[ContentStart] == TEXT('\r')))
+		{
+			ContentStart++;
+		}
+		OutMemorySummary = Content.Mid(ContentStart).TrimEnd();
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 加载会话归档: tools=%d字符, memory=%d字符"),
+		OutToolsSummary.Len(), OutMemorySummary.Len());
+	return true;
+}
+

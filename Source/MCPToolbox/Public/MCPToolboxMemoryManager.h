@@ -103,6 +103,36 @@ public:
 	 */
 	FString BuildMemoryContext() const;
 
+	// ---- Conversation Summary (Archive) ----
+
+	/**
+	 * Path to the single-index summary file (~/.mcptoolbox/conversation_summary.md).
+	 * This file is overwritten on each summary and is what BuildSystemPrompt loads.
+	 */
+	FString GetConversationSummaryIndexPath() const;
+
+	/**
+	 * Path to the multi-file archive directory (~/.mcptoolbox/summaries/).
+	 * Each archive call writes tools_<ts>.md and/or memory_<ts>.md here.
+	 */
+	FString GetConversationSummaryArchiveDir() const;
+
+	/**
+	 * Save a conversation summary.
+	 * - Writes ~/.mcptoolbox/conversation_summary.md (overwrite) as the live index
+	 *   containing both ToolsSummary and MemorySummary sections.
+	 * - Writes timestamped archive copies to ~/.mcptoolbox/summaries/.
+	 * Empty strings are skipped (only the non-empty type is saved).
+	 */
+	bool SaveConversationSummary(const FString& ToolsSummary, const FString& MemorySummary);
+
+	/**
+	 * Load the live conversation summary index file.
+	 * OutToolsSummary / OutMemorySummary receive the parsed sections.
+	 * Returns true if the index file existed and was read.
+	 */
+	bool LoadConversationSummary(FString& OutToolsSummary, FString& OutMemorySummary) const;
+
 private:
 	FMCPToolboxMemoryManager() = default;
 	~FMCPToolboxMemoryManager() = default;

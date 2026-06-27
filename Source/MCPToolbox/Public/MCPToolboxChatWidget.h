@@ -8,8 +8,11 @@
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/SWindow.h"
 #include "MCPToolboxAPIManager.h"
 #include "Http.h"
 #include "Interfaces/IHttpRequest.h"
@@ -155,6 +158,32 @@ private:
 
 	/** Write discovered tools to .mcptoolbox/ directory as multiple MD files (one per toolset) */
 	void WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJsonObject>>& Tools);
+
+	// ---- Conversation Summary (Archive) ----
+
+	/** Summary model strategy for the OnArchiveSummary dialog */
+	enum class ESummaryModelChoice : uint8
+	{
+		LocalFirst,   // 优先本地辅助模型（免费、快），失败回退主模型
+		MainModel,    // 直接用当前选中的主模型（质量好，消耗 API 额度）
+		Hybrid        // 工具归档用本地（量大），记忆归档用主模型（要求质量）
+	};
+
+	/** Button handler: open the summary choice dialog (first-time shows advantages) */
+	FReply OnArchiveSummary();
+
+	/** Show the summary choice dialog (advantages + model selection + archive type checkboxes) */
+	void ShowSummaryChoiceDialog();
+
+	/** Generate the summary using the chosen model strategy.
+	 *  bArchiveTools / bArchiveMemory select which sections to produce. */
+	void GenerateSummary(ESummaryModelChoice ModelChoice, bool bArchiveTools, bool bArchiveMemory);
+
+	/** Called on the game thread when the summary is ready (or failed). */
+	void OnSummaryGenerated(bool bSuccess, const FString& ToolsSummary, const FString& MemorySummary);
+
+	/** Build a "give me a summary" prompt from the current Messages array. */
+	FString BuildSummaryPrompt(bool bForTools, bool bForMemory) const;
 
 	// ---- Provider/Model Selection ----
 
@@ -375,6 +404,18 @@ private:
 
 	/** Whether the "more actions" secondary toolbar row is expanded */
 	bool bMoreExpanded = false;
+
+	// ---- Conversation Summary State ----
+
+	/** True if user previously declined the first-time summary dialog (persisted) */
+	bool bSummaryDeclined = false;
+
+	/** Cached conversation summary sections loaded at startup (injected into BuildSystemPrompt) */
+	FString CachedToolsSummary;
+	FString CachedMemorySummary;
+
+	/** Weak reference to the summary dialog window (prevent duplicate open) */
+	TWeakPtr<SWindow> SummaryDialogWindow;
 
 	// ---- Widget State Persistence ----
 
