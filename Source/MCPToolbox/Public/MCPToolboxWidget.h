@@ -39,13 +39,6 @@ private:
 
 	void RefreshMemoryListItems();
 
-	// ---- 旧方法（占位兼容） ----
-	TSharedRef<SWidget> CreateProviderDetailPanel();
-	TSharedRef<SWidget> CreateAPIKeyPanel();
-	TSharedRef<SWidget> CreateVisionDetectionPanel();
-	TSharedRef<SWidget> CreateMCPServerPanel();
-	TSharedRef<SWidget> CreateStatusBar();
-
 	// ---- 事件处理 ----
 	void OnTabSelected(int32 TabIndex);
 	void OnProviderListSelectionChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo);
@@ -54,15 +47,6 @@ private:
 	FReply OnAddEntry();
 	FReply OnOpenHelp();
 	FReply OnStartMCPServer();
-
-	FReply OnAddProvider();
-	FReply OnRemoveProvider();
-	FReply OnSaveProvider();
-	FReply OnSaveAPIKey();
-	FReply OnDetectVision();
-	FReply OnRefreshMCPConnection();
-	FReply OnExportConfiguration();
-	FReply OnImportConfiguration();
 
 	void RefreshEntryListItems();
 

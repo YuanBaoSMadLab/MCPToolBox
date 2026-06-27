@@ -146,10 +146,9 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildSessionSidebar()
 		.OnClicked(this, &SMCPToolboxChatWidget::OnNewChat)
 		.HAlign(HAlign_Center);
 
-	TSharedRef<SWidget> CollapseBtn = SNew(SButton)
-		.Text(LOCTEXT("CollapseSidebar", ">>"))
-		.OnClicked(this, &SMCPToolboxChatWidget::ToggleSidebar)
-		.ButtonColorAndOpacity(FLinearColor(0.15f, 0.15f, 0.18f));
+	// (Removed the in-sidebar ">>" collapse button — it duplicated the toolbar's
+	// "☰ 显示/隐藏对话" toggle and, worse, disappeared along with the sidebar when
+	// clicked, leaving no in-pane way to expand again. The toolbar button remains.)
 
 	return SNew(SBox)
 		.WidthOverride(220.0f)
@@ -158,17 +157,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildSessionSidebar()
 
 			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(4))
 			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot().FillWidth(1.0)
-				[
-					NewChatBtn
-				]
-
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-				[
-					CollapseBtn
-				]
+				NewChatBtn
 			]
 
 			+ SVerticalBox::Slot().FillHeight(1.0).Padding(FMargin(2))
@@ -593,11 +582,42 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 
 	// ── Determine if current model supports vision ──
+	// Previously this was hardcoded to only openai/google/anthropic providers,
+	// which (a) excluded vision-capable models from other providers (Qwen-VL,
+	// GLM-4V, Yi-Vision, Moonshot, etc.) forcing them through the slower local
+	// VL path, and (b) incorrectly flagged non-vision models from those providers
+	// (e.g. gpt-3.5-turbo) as vision-capable, causing API 400 errors.
+	// Now: check by model name pattern in addition to provider whitelist.
 	const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
-	bool bModelSupportsVision = ActiveEntry &&
-		(ActiveEntry->ProviderId == TEXT("openai") ||
-		 ActiveEntry->ProviderId == TEXT("google") ||
-		 ActiveEntry->ProviderId == TEXT("anthropic"));
+	bool bModelSupportsVision = false;
+	if (ActiveEntry)
+	{
+		// Provider whitelist (most common vision-capable providers)
+		static const TSet<FString> VisionProviders = {
+			TEXT("openai"), TEXT("google"), TEXT("anthropic"),
+			TEXT("qwen"), TEXT("zhipu"), TEXT("yi"), TEXT("moonshot"),
+			TEXT("minimax"), TEXT("stepfun"), TEXT("sense"), TEXT("mistral"),
+			TEXT("groq"),
+		};
+		if (VisionProviders.Contains(ActiveEntry->ProviderId))
+		{
+			// Within vision-capable providers, still verify by model name —
+			// older/cheaper variants (gpt-3.5-turbo, claude-3-haiku text-only, etc.)
+			// may not accept image_url.
+			const FString& M = ActiveEntry->ModelId;
+			bModelSupportsVision = M.Contains(TEXT("gpt-4o")) ||
+				M.Contains(TEXT("gpt-4-turbo")) || M.Contains(TEXT("gpt-4-vision")) ||
+				M.Contains(TEXT("o1")) || M.Contains(TEXT("o3")) ||
+				M.Contains(TEXT("claude-3")) || M.Contains(TEXT("claude-4")) ||
+				M.Contains(TEXT("gemini")) ||
+				M.Contains(TEXT("vl")) || M.Contains(TEXT("vision")) ||
+				M.Contains(TEXT("image")) ||
+				// Qwen/GLM/Yi vision model naming
+				M.Contains(TEXT("qwen-vl")) || M.Contains(TEXT("glm-4v")) ||
+				M.Contains(TEXT("yi-vision")) || M.Contains(TEXT("step-1v")) ||
+				M.Contains(TEXT("pixtral")) || M.Contains(TEXT("sonar"));
+		}
+	}
 
 	// Auto-fallback: vision ON but model doesn't support images → preprocess locally
 	bool bNeedLocalVL = (bVisionModeEnabled && !bModelSupportsVision) || (!bVisionModeEnabled && AuxMgr.IsReady());
@@ -946,23 +966,29 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			TSharedPtr<TArray<FString>> Chunks = MakeShareable(new TArray<FString>(MoveTemp(TextChunks)));
 
 			FTSTicker::GetCoreTicker().AddTicker(
-				FTickerDelegate::CreateLambda([this, StreamPtr, ChunkIndex, DisplayBuffer, Chunks](float DeltaTime) -> bool
+			FTickerDelegate::CreateLambda([this, StreamPtr, ChunkIndex, DisplayBuffer, Chunks](float DeltaTime) -> bool
+			{
+				if (bInterrupted || *ChunkIndex >= Chunks->Num())
 				{
-					if (bInterrupted || *ChunkIndex >= Chunks->Num())
-					{
-						StreamPtr->bIsStreaming = false;
-						StreamPtr->Content = *DisplayBuffer;
-						FMCPToolboxMemoryManager::Get().ExtractMemoriesFromResponse(*DisplayBuffer);
-						bIsWaiting = false;
-						// Final rebuild to show cleaned markdown
-						RebuildChatDisplay();
-						// Save the completed message to session
-						FMCPToolboxChatSessionManager::Get().SaveCurrentSession();
-						RefreshSessionList();
-						StreamingMessageBox.Reset();
-						UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Stream done, %d chars"), DisplayBuffer->Len());
-						return false;
-					}
+					StreamPtr->bIsStreaming = false;
+					StreamPtr->Content = *DisplayBuffer;
+					FMCPToolboxMemoryManager::Get().ExtractMemoriesFromResponse(*DisplayBuffer);
+					bIsWaiting = false;
+					// Final rebuild to show cleaned markdown
+					RebuildChatDisplay();
+					// Persist the completed streaming message to the session.
+					// Previously this only called SaveCurrentSession(), which serializes
+					// Session->Messages — but the streaming message was added to the
+					// *widget's* Messages array via Messages.Add() at line 930 and never
+					// transferred into Session->Messages. As a result, every streaming AI
+					// reply was lost on editor restart or session switch.
+					// UpdateCurrentSessionWithMessage adds to Session->Messages AND saves.
+					UpdateCurrentSessionWithMessage(*StreamPtr);
+					RefreshSessionList();
+					StreamingMessageBox.Reset();
+					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Stream done, %d chars"), DisplayBuffer->Len());
+					return false;
+				}
 
 					// Batch: append up to 5 chunks at once to reduce rebuild frequency
 					int32 BatchCount = FMath::Min(5, Chunks->Num() - *ChunkIndex);
@@ -2994,6 +3020,18 @@ void SMCPToolboxChatWidget::OnSessionSelected(TSharedPtr<FString> SessionId, ESe
 
 void SMCPToolboxChatWidget::SwitchToSession(const FString& SessionId)
 {
+	// Guard against switching while a streaming response is in flight.
+	// The streaming ticker holds a bare pointer (StreamPtr = &Messages.Last())
+	// into the Messages array; replacing Messages here would free that memory
+	// and the ticker would write to freed memory (use-after-free / crash).
+	// Also the in-flight stream content has not been persisted yet, so switching
+	// would silently discard the partial AI reply.
+	if (bIsStreaming || bIsWaiting)
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Ignored session switch while streaming/waiting"));
+		return;
+	}
+
 	if (FMCPToolboxChatSessionManager::Get().SetCurrentSession(SessionId))
 	{
 		FMCPToolboxChatSession* Session = FMCPToolboxChatSessionManager::Get().GetCurrentSession();
@@ -3059,6 +3097,20 @@ FReply SMCPToolboxChatWidget::ToggleSidebar()
 
 void SMCPToolboxChatWidget::LaunchIdleSpec(const FString& CurrentToolName)
 {
+	// ── Speculative execution DISABLED ──
+	// The speculative prediction mechanism caused measurable slowdown and
+	// correctness issues:
+	//   1. Every MCP tool call triggered an extra local-model inference HTTP
+	//      round-trip (LaunchSpeculation → InferAsync), adding latency.
+	//   2. When the prediction hadn't returned by the time the tool finished,
+	//      the conversation BLOCKED waiting for it (bPendingToolCompletion).
+	//   3. TrySpeculativeExecution ran the predicted tool with empty arguments
+	//      "{}", producing error results that polluted the LLM context with
+	//      no rollback (PreSpeculationMessages was never wired up).
+	// To re-enable, this early return must be removed and the issues above
+	// addressed (parameter prediction, non-blocking semantics, rollback).
+	return;
+
 	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 	if (!AuxMgr.IsReady()) return;
 
@@ -3114,6 +3166,10 @@ void SMCPToolboxChatWidget::LaunchIdleSpec(const FString& CurrentToolName)
 
 void SMCPToolboxChatWidget::TrySpeculativeOrContinue(TSharedPtr<TArray<TSharedPtr<FJsonValue>>> PendingMsgs)
 {
+	// Speculative execution is disabled (see LaunchIdleSpec). Since LaunchIdleSpec
+	// is a no-op, bSpeculationPending is never set and LastSpeculation is always
+	// invalid, so we always take the direct-continue path here. The branches below
+	// are retained for when speculation is properly reimplemented.
 	if (bSpeculationPending)
 	{
 		// Still waiting — store for later
@@ -3122,18 +3178,8 @@ void SMCPToolboxChatWidget::TrySpeculativeOrContinue(TSharedPtr<TArray<TSharedPt
 		return;
 	}
 
-	bool bSpecExecuted = false;
-	if (LastSpeculation.IsValid())
-	{
-		bSpecExecuted = TrySpeculativeExecution(*PendingMsgs);
-	}
-
-	if (!bSpecExecuted)
-	{
-		InjectSpeculationHint(*PendingMsgs, LastSpeculation, bSpeculationPending);
-		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 工具调用完成(MCP), 继续对话"));
-		SendAIRequest(*PendingMsgs);
-	}
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 工具调用完成(MCP), 继续对话"));
+	SendAIRequest(*PendingMsgs);
 }
 
 /** Preprocess images in messages through local VL model (when vision mode is OFF but aux VL available) */
@@ -3225,10 +3271,45 @@ void SMCPToolboxChatWidget::PreprocessImagesLocally(
 		}
 
 		double StartTime = FPlatformTime::Seconds();
+		// Completion flag shared between the AnalyzeImage callback and the timeout
+		// ticker below — whichever fires first wins, the other becomes a no-op.
+		TSharedPtr<bool> bDone = MakeShared<bool>(false);
+
+		// Timeout guard: if the local VL server crashes or the HTTP callback never
+		// fires, Remaining would never decrement and OnDone would never be called,
+		// permanently stalling the conversation. After 30s we give up and degrade.
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([bDone, Modified, Target, Remaining, OnDone, StartTime](float) -> bool
+		{
+			if (*bDone) return false; // already completed by the real callback
+			if (FPlatformTime::Seconds() - StartTime < 30.0) return true; // keep waiting
+
+			// Timeout — degrade to placeholder text
+			*bDone = true;
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[VL] Image analysis timed out (30s), degrading"));
+
+			TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject(*(*Modified)[Target.Index]->AsObject()));
+			TArray<TSharedPtr<FJsonValue>> NewContent;
+			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+			TextPart->SetStringField(TEXT("type"), TEXT("text"));
+			TextPart->SetStringField(TEXT("text"),
+				Target.UserText.IsEmpty() ? TEXT("[图片分析超时]") : Target.UserText);
+			NewContent.Add(MakeShareable(new FJsonValueObject(TextPart)));
+			NewObj->SetArrayField(TEXT("content"), NewContent);
+			(*Modified)[Target.Index] = MakeShareable(new FJsonValueObject(NewObj));
+
+			(*Remaining)--;
+			if (*Remaining <= 0 && OnDone) OnDone(*Modified);
+			return false; // stop ticking
+		}), 1.0f);
+
 		AuxMgr.AnalyzeImage(Target.Base64,
 			TEXT("Describe what you actually see in this image in detail. Focus on visible objects, people, text, colors, layout. Be specific and objective. Reply in Chinese."),
-			[this, Modified, Target, Remaining, OnDone, StartTime](const FString& Description)
+			[this, bDone, Modified, Target, Remaining, OnDone, StartTime](const FString& Description)
 		{
+			if (*bDone) return; // already handled by timeout
+			*bDone = true;
+
 			double ElapsedSec = FPlatformTime::Seconds() - StartTime;
 			TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject(*(*Modified)[Target.Index]->AsObject()));
 			TArray<TSharedPtr<FJsonValue>> NewContent;

@@ -612,7 +612,7 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateMemoryTab()
 		[
 			SAssignNew(MemoryListView, SListView<TSharedPtr<FString>>)
 			.ListItemsSource(&MemoryListItems)
-			.OnGenerateRow_Lambda([](TSharedPtr<FString> Item, const TSharedRef<STableViewBase>& OwnerTable)
+			.OnGenerateRow_Lambda([this](TSharedPtr<FString> Item, const TSharedRef<STableViewBase>& OwnerTable)
 			{
 				return SNew(STableRow<TSharedPtr<FString>>, OwnerTable)
 					.Padding(FMargin(2))
@@ -629,7 +629,7 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateMemoryTab()
 						[
 							SNew(SButton)
 							.Text(LOCTEXT("DeleteMemory", "删除"))
-							.OnClicked_Lambda([Item]()
+							.OnClicked_Lambda([this, Item]()
 							{
 								// Extract slug from display: "slug — description"
 								FString Slug;
@@ -638,6 +638,12 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateMemoryTab()
 								if (DashPos != INDEX_NONE) Slug = Display.Left(DashPos);
 								else Slug = Display;
 								FMCPToolboxMemoryManager::Get().DeleteNote(Slug);
+								// Refresh the list so the deleted row disappears.
+								// Previously this only deleted the file on disk but left
+								// the stale row visible — looked like the button did nothing.
+								RefreshMemoryListItems();
+								if (MemoryListView.IsValid())
+									MemoryListView->RequestListRefresh();
 								return FReply::Handled();
 							})
 						]
@@ -813,21 +819,7 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateSettingsTab()
 	ThemeOptions.Add(MakeShareable(new FString(TEXT("Light"))));
 }
 
-// ---- 占位方法（旧接口兼容） ----
-TSharedRef<SWidget> SMCPToolboxWidget::CreateProviderDetailPanel() { return SNullWidget::NullWidget; }
-TSharedRef<SWidget> SMCPToolboxWidget::CreateAPIKeyPanel() { return SNullWidget::NullWidget; }
-TSharedRef<SWidget> SMCPToolboxWidget::CreateVisionDetectionPanel() { return SNullWidget::NullWidget; }
-TSharedRef<SWidget> SMCPToolboxWidget::CreateMCPServerPanel() { return SNullWidget::NullWidget; }
-TSharedRef<SWidget> SMCPToolboxWidget::CreateStatusBar() { return SNullWidget::NullWidget; }
-
-FReply SMCPToolboxWidget::OnAddProvider() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnRemoveProvider() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnSaveProvider() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnSaveAPIKey() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnDetectVision() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnRefreshMCPConnection() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnExportConfiguration() { return FReply::Handled(); }
-FReply SMCPToolboxWidget::OnImportConfiguration() { return FReply::Handled(); }
+// ---- 占位方法已删除（旧接口兼容，从未被 UI 绑定引用） ----
 
 void SMCPToolboxWidget::OnLanguageChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo)
 {
