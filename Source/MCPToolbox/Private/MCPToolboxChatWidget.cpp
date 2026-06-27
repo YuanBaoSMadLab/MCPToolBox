@@ -255,11 +255,11 @@ void SMCPToolboxChatWidget::AddMessage(const FMCPToolboxChatMessage& Message)
 // ============================================================================
 TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message)
 {
-	TSharedPtr<STextBlock> Dummy;
+	TSharedPtr<SMultiLineEditableTextBox> Dummy;
 	return CreateMessageBubble(Message, Dummy);
 }
 
-TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<STextBlock>& OutTextBlock)
+TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBlock)
 {
 	FLinearColor BgColor = GetMessageColor(Message.Role);
 	FString RoleLabel;
@@ -283,7 +283,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 		bool bIsResult = Message.Role == EMCPToolboxMessageRole::System;
 		if (DisplayContent.Len() > 500) DisplayContent = DisplayContent.Left(500) + TEXT("...");
 
-		TSharedPtr<STextBlock> TextBlock;
+		TSharedPtr<SMultiLineEditableTextBox> TextBlock;
 		auto Result = SNew(SBox)
 			.HAlign(HAlign_Left)
 			[
@@ -319,11 +319,15 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 4, 0, 0))
 					[
-						SAssignNew(TextBlock, STextBlock)
+						SAssignNew(TextBlock, SMultiLineEditableTextBox)
 						.Text(FText::FromString(DisplayContent))
 						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
+						.IsReadOnly(true)
+						.AllowMultiLine(true)
+						.AllowContextMenu(true)
 						.AutoWrapText(true)
 						.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
+						.BackgroundColor(FLinearColor::Transparent)
 					]
 				]
 			];
@@ -331,7 +335,7 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 		return Result;
 	}
 
-	TSharedPtr<STextBlock> TextBlock;
+	TSharedPtr<SMultiLineEditableTextBox> TextBlock;
 	auto Result = SNew(SBox)
 		.HAlign(bAlignRight ? HAlign_Right : HAlign_Left)
 		[
@@ -359,11 +363,15 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 6, 0, 0))
 				[
-					SAssignNew(TextBlock, STextBlock)
+					SAssignNew(TextBlock, SMultiLineEditableTextBox)
 					.Text(FText::FromString(DisplayContent))
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 10))
+					.IsReadOnly(true)
+					.AllowMultiLine(true)
+					.AllowContextMenu(true)
 					.AutoWrapText(true)
 					.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
+					.BackgroundColor(FLinearColor::Transparent)
 				]
 			]
 		];
@@ -954,7 +962,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			FMCPToolboxChatMessage* StreamPtr = &Messages.Last();
 			
 			// Add the message bubble to the chat area and get the text box reference
-			TSharedPtr<STextBlock> TextBlock;
+			TSharedPtr<SMultiLineEditableTextBox> TextBlock;
 			if (ChatScrollBox.IsValid())
 			{
 				TSharedRef<SWidget> Bubble = CreateMessageBubble(*StreamPtr, TextBlock);
@@ -2282,6 +2290,222 @@ FReply SMCPToolboxChatWidget::OnUndoOptimization()
 }
 
 // ============================================================================
+// MCP Toolset Cache (Refresh Tool Cache button)
+// ============================================================================
+FReply SMCPToolboxChatWidget::OnRefreshToolCache()
+{
+	if (!MCPServerClient.IsConnected())
+	{
+		FNotificationInfo Err(FText::FromString(TEXT("MCP 服务器未连接,请先点击 \"连接 MCP\"")));
+		Err.ExpireDuration = 3.0f;
+		FSlateNotificationManager::Get().AddNotification(Err);
+		return FReply::Handled();
+	}
+
+	FNotificationInfo Info(FText::FromString(TEXT("正在感知项目 MCP 工具集...")));
+	Info.ExpireDuration = 5.0f;
+	FSlateNotificationManager::Get().AddNotification(Info);
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] OnRefreshToolCache: calling DiscoverRealTools..."));
+
+	MCPServerClient.DiscoverRealTools(
+		[this](const TArray<TSharedPtr<FJsonObject>>& Tools)
+		{
+			// Per project rules, MCP callbacks must execute on the game thread
+			// to prevent cross-thread Slate/UObject access.
+			AsyncTask(ENamedThreads::GameThread,
+				[this, Tools]()
+				{
+					if (Tools.Num() == 0)
+					{
+						FNotificationInfo Err(FText::FromString(TEXT("未感知到任何 MCP 工具,请确认 UE5 MCP 服务器已启用")));
+						Err.ExpireDuration = 4.0f;
+						FSlateNotificationManager::Get().AddNotification(Err);
+						return;
+					}
+
+					WriteToolsetCacheToDisk(Tools);
+
+					// Rebuild the cached tool descriptions MD so the next system
+					// prompt construction picks up the refreshed tools immediately.
+					TMap<FString, TArray<TSharedPtr<FJsonObject>>> Grouped;
+					for (const auto& Tool : Tools)
+					{
+						if (!Tool.IsValid()) continue;
+						FString Ts;
+						if (Tool->TryGetStringField(TEXT("_toolset"), Ts) && !Ts.IsEmpty())
+							Grouped.FindOrAdd(Ts).Add(Tool);
+					}
+
+					FString Md;
+					Md += TEXT("## 📚 MCP Toolset 缓存(运行时感知)\n\n");
+					Md += TEXT("使用 `call_tool` 调用,toolset_name 是完整路径(如 `editor_toolset.toolsets.material.MaterialTools`),tool_name 是工具名(如 `CreateMaterial`)。**禁止**调用 list_toolsets/describe_toolset。\n\n");
+					for (const auto& Kvp : Grouped)
+					{
+						Md += FString::Printf(TEXT("### Toolset: `%s` (%d 个工具)\n"), *Kvp.Key, Kvp.Value.Num());
+						for (const auto& Tool : Kvp.Value)
+						{
+							FString Name;  Tool->TryGetStringField(TEXT("name"), Name);
+							FString Desc;  Tool->TryGetStringField(TEXT("description"), Desc);
+							FString OneLine = Desc.Replace(TEXT("\n"), TEXT(" ")).Left(140);
+							Md += FString::Printf(TEXT("- **%s**: %s\n"), *Name, *OneLine);
+						}
+						Md += TEXT("\n");
+					}
+					CachedMCPToolDescriptionsMD = Md;
+
+					FString OkText = FString::Printf(
+						TEXT("已缓存 %d 个 toolset / %d 个工具到 .mcptoolbox/"),
+						Grouped.Num(), Tools.Num());
+					FNotificationInfo Ok(FText::FromString(OkText));
+					Ok.ExpireDuration = 4.0f;
+					FSlateNotificationManager::Get().AddNotification(Ok);
+
+					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Toolset cache refreshed: %d toolsets, %d tools"),
+						Grouped.Num(), Tools.Num());
+				});
+		});
+
+	return FReply::Handled();
+}
+
+void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJsonObject>>& Tools)
+{
+	FString ToolboxDir = FPaths::ProjectDir() / TEXT(".mcptoolbox");
+
+	IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PF.CreateDirectoryTree(*ToolboxDir))
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] WriteToolsetCacheToDisk: failed to create dir %s"), *ToolboxDir);
+		return;
+	}
+
+	// Convert toolset name to safe file name (replace . / \ : etc with _)
+	auto SafeFileName = [](const FString& Ts) -> FString
+	{
+		FString S = Ts;
+		S.ReplaceInline(TEXT("."), TEXT("_"));
+		S.ReplaceInline(TEXT("/"),  TEXT("_"));
+		S.ReplaceInline(TEXT("\\"), TEXT("_"));
+		S.ReplaceInline(TEXT(":"),  TEXT("_"));
+		return S;
+	};
+
+	// Group tools by _toolset field (set by ExtractToolsFromDescribeResult)
+	TMap<FString, TArray<TSharedPtr<FJsonObject>>> Grouped;
+	TArray<FString> ToolsetOrder; // preserve first-seen order
+	for (const auto& Tool : Tools)
+	{
+		if (!Tool.IsValid()) continue;
+		FString Ts;
+		if (!Tool->TryGetStringField(TEXT("_toolset"), Ts) || Ts.IsEmpty()) continue;
+		if (!Grouped.Contains(Ts))
+		{
+			Grouped.Add(Ts);
+			ToolsetOrder.Add(Ts);
+		}
+		Grouped[Ts].Add(Tool);
+	}
+
+	// Write index.md
+	FString Index;
+	Index += TEXT("# MCP Toolset 索引(运行时感知)\n\n");
+	Index += FString::Printf(TEXT("生成时间: %s\n"), *FDateTime::Now().ToString());
+	Index += FString::Printf(TEXT("工具集总数: %d, 工具总数: %d\n\n"), ToolsetOrder.Num(), Tools.Num());
+	Index += TEXT("## 工具集列表\n\n");
+	for (const FString& Ts : ToolsetOrder)
+	{
+		const TArray<TSharedPtr<FJsonObject>>& TsTools = Grouped[Ts];
+		Index += FString::Printf(TEXT("- **%s** (%d 个工具) — 详见 `%s.md`\n"),
+			*Ts, TsTools.Num(), *SafeFileName(Ts));
+	}
+	Index += TEXT("\n## 调用约定\n\n");
+	Index += TEXT("使用 `call_tool` 工具调用,参数:\n");
+	Index += TEXT("- `toolset_name`: toolset 完整路径(如 `editor_toolset.toolsets.material.MaterialTools`),**不含** tool_name\n");
+	Index += TEXT("- `tool_name`: 工具名(如 `CreateMaterial`)\n");
+	Index += TEXT("- `arguments`: 工具参数对象,具体 schema 见各 toolset 的 MD 文件\n\n");
+	Index += TEXT("**禁止**调用 `list_toolsets` 或 `describe_toolset` — 该缓存已包含全部可用工具的 schema。\n");
+
+	FString IndexPath = ToolboxDir / TEXT("index.md");
+	if (!FFileHelper::SaveStringToFile(Index, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Failed to write %s"), *IndexPath);
+	}
+
+	// Write one MD per toolset
+	int32 WrittenFiles = 1; // index.md already written
+	for (const FString& Ts : ToolsetOrder)
+	{
+		const TArray<TSharedPtr<FJsonObject>>& TsTools = Grouped[Ts];
+		FString Md;
+		Md += FString::Printf(TEXT("# Toolset: `%s`\n\n"), *Ts);
+		Md += FString::Printf(TEXT("工具数: %d\n\n"), TsTools.Num());
+		Md += TEXT("## 工具列表\n\n");
+
+		for (const auto& Tool : TsTools)
+		{
+			FString Name; Tool->TryGetStringField(TEXT("name"), Name);
+			FString Desc; Tool->TryGetStringField(TEXT("description"), Desc);
+			Md += FString::Printf(TEXT("### %s\n\n"), *Name);
+			Md += FString::Printf(TEXT("**描述**: %s\n\n"), *Desc);
+
+			// inputSchema block
+			const TSharedPtr<FJsonObject>* SchemaObj;
+			if (Tool->TryGetObjectField(TEXT("inputSchema"), SchemaObj) && SchemaObj->IsValid())
+			{
+				FString SchemaStr;
+				TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&SchemaStr);
+				FJsonSerializer::Serialize(SchemaObj->ToSharedRef(), W);
+				Md += TEXT("**参数 schema**:\n```json\n");
+				Md += SchemaStr;
+				Md += TEXT("\n```\n\n");
+			}
+
+			// example call (fills in required property names as placeholders)
+			Md += TEXT("**调用示例**:\n```json\n");
+			Md += FString::Printf(TEXT("{\n  \"toolset_name\": \"%s\",\n  \"tool_name\": \"%s\",\n  \"arguments\": {"),
+				*Ts, *Name);
+
+			const TSharedPtr<FJsonObject>* Schema2;
+			if (Tool->TryGetObjectField(TEXT("inputSchema"), Schema2) && Schema2->IsValid())
+			{
+				const TArray<TSharedPtr<FJsonValue>>* RequiredArr;
+				if ((*Schema2)->TryGetArrayField(TEXT("required"), RequiredArr))
+				{
+					bool bFirst = true;
+					for (const auto& Req : *RequiredArr)
+					{
+						FString ReqName;
+						if (Req->TryGetString(ReqName))
+						{
+							Md += FString::Printf(TEXT("%s\n    \"%s\": \"<value>\""),
+								bFirst ? TEXT("") : TEXT(","),
+								*ReqName);
+							bFirst = false;
+						}
+					}
+				}
+			}
+			Md += TEXT("\n  }\n}\n```\n\n---\n\n");
+		}
+
+		FString FileName = SafeFileName(Ts) + TEXT(".md");
+		FString FilePath = ToolboxDir / FileName;
+		if (FFileHelper::SaveStringToFile(Md, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			WrittenFiles++;
+		}
+		else
+		{
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Failed to write %s"), *FilePath);
+		}
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] WriteToolsetCacheToDisk: wrote %d files to %s"),
+		WrittenFiles, *ToolboxDir);
+}
+
+// ============================================================================
 // Stubs & helpers
 // ============================================================================
 FReply SMCPToolboxChatWidget::OnToggleVisionMode()
@@ -2427,25 +2651,40 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					]
 				]
 				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
+			[
+				SNew(SButton)
+				.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
+				{
+					return bSidebarCollapsed ? FLinearColor(0.2f, 0.2f, 0.25f) : FLinearColor(0.15f, 0.15f, 0.18f);
+				})
+				.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+				.Content()
 				[
-					SNew(SButton)
-					.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
+					SNew(STextBlock)
+					.Text_Lambda([this]() -> FText
 					{
-						return bSidebarCollapsed ? FLinearColor(0.2f, 0.2f, 0.25f) : FLinearColor(0.15f, 0.15f, 0.18f);
+						return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 显示对话") : LOCTEXT("SidebarHide", "☰ 隐藏对话");
 					})
-					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() -> FText
-						{
-							return bSidebarCollapsed ? LOCTEXT("SidebarShow", "☰ 显示对话") : LOCTEXT("SidebarHide", "☰ 隐藏对话");
-						})
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					]
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 				]
 			]
-		];
+			// ── Refresh MCP Toolset Cache: discovers all toolsets and writes them to <ProjectDir>/.mcptoolbox/*.md ──
+			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
+			[
+				SNew(SButton)
+				.ButtonColorAndOpacity(FLinearColor(0.15f, 0.3f, 0.18f))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
+				.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "感知当前项目启用的所有 MCP 工具集，缓存为 .mcptoolbox/*.md 供 AI 直接调用，省去询问 list_toolsets/describe_toolset 的时间"))
+				.Content()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("RefreshToolCacheBtn", "🔄 刷新工具"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
+				]
+			]
+		]
+	];
 }
 // ============================================================================
 // Entry Selection

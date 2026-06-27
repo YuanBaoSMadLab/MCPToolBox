@@ -93,7 +93,7 @@ private:
 	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message);
 	
 	/** Create a message bubble widget and optionally return the content text box for streaming updates */
-	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<STextBlock>& OutTextBlock);
+	TSharedRef<SWidget> CreateMessageBubble(const FMCPToolboxChatMessage& Message, TSharedPtr<SMultiLineEditableTextBox>& OutTextBlock);
 
 	/** Generate a row for the session list view */
 	TSharedRef<ITableRow> GenerateSessionRow(TSharedPtr<FString> SessionId, const TSharedRef<STableViewBase>& OwnerTable);
@@ -149,6 +149,12 @@ private:
 
 	/** Revert optimized prompt back to original text */
 	FReply OnUndoOptimization();
+
+	/** Refresh MCP toolset cache: discovers all toolsets via list_toolsets + describe_toolset, writes them to <ProjectDir>/.mcptoolbox/*.md */
+	FReply OnRefreshToolCache();
+
+	/** Write discovered tools to .mcptoolbox/ directory as multiple MD files (one per toolset) */
+	void WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJsonObject>>& Tools);
 
 	// ---- Provider/Model Selection ----
 
@@ -313,11 +319,11 @@ private:
 	/** Reference to the streaming message (updated in place) */
 	FMCPToolboxChatMessage* CurrentStreamingMessage = nullptr;
 
-	/** Text block for the streaming message (to update in place) */
-	TSharedPtr<STextBlock> StreamingTextBlock;
+	/** Multi-line editable text box for the streaming message (to update in place, supports copy) */
+	TSharedPtr<SMultiLineEditableTextBox> StreamingTextBlock;
 
-	/** Multi-line text box for the streaming message (to update in place) */
-	TSharedPtr<STextBlock> StreamingMessageBox;
+	/** Multi-line editable text box for the streaming message container (supports copy) */
+	TSharedPtr<SMultiLineEditableTextBox> StreamingMessageBox;
 
 	// ---- Prompt Optimization ----
 
