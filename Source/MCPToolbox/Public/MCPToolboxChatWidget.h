@@ -330,6 +330,13 @@ private:
 	/** Whether optimization is in progress */
 	bool bOptimizingPrompt = false;
 
+	// ---- File Upload ----
+
+	/** Pending image URIs from OnUploadFile — attached to the next user message and cleared after send.
+	 *  This avoids the previous design where OnUploadFile called AddMessage(FileMsg) then OnSendMessage(),
+	 *  which either sent a duplicate user message or (if input was empty) skipped sending entirely. */
+	TArray<FString> PendingUploadURIs;
+
 	/** Local FunctionTable for tool registration */
 	TUniquePtr<assistant::FunctionTable> ToolFunctionTable;
 	mutable TArray<TSharedPtr<FJsonValue>> CachedToolsArray; // Built once, reused per request

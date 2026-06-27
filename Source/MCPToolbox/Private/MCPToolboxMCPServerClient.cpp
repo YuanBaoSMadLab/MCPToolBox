@@ -517,16 +517,18 @@ void FMCPToolboxMCPServerClient::ExecuteTool(const FString& ToolName, const FStr
 			FJsonSerializer::Serialize(Result.ToSharedRef(), W);
 		}
 
-		// ── Build result without FString::Printf (avoid large string copy) ──
+		// ── Build result with proper JSON escaping for output ──
+		// Output may contain quotes/newlines/backslashes → must serialize as JSON string.
+		// Wrap with object so LLM gets a parseable JSON: {"ok":bool,"tool":"x","output":"..."}
+		TSharedPtr<FJsonObject> ResultObj = MakeShareable(new FJsonObject());
+		ResultObj->SetBoolField(TEXT("ok"), !bIsError);
+		ResultObj->SetStringField(TEXT("tool"), ToolName);
+		ResultObj->SetStringField(TEXT("output"), Output);
+
 		FString FullResult;
-		FullResult.Reserve(Output.Len() + 128);
-		FullResult += TEXT("{\"ok\":");
-		FullResult += bIsError ? TEXT("false") : TEXT("true");
-		FullResult += TEXT(",\"tool\":\"");
-		FullResult += ToolName;
-		FullResult += TEXT("\",\"output\":");
-		FullResult += Output;
-		FullResult += TEXT("}");
+		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> ResultWriter =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&FullResult);
+		FJsonSerializer::Serialize(ResultObj.ToSharedRef(), ResultWriter);
 
 		UE_LOG(LogMCPToolbox, Verbose, TEXT("[MCPSrv] tool result: %d chars"), FullResult.Len());
 		OnComplete(true, FullResult);

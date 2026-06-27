@@ -498,6 +498,13 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 	FMCPToolboxChatMessage UserMsg;
 	UserMsg.Role = EMCPToolboxMessageRole::User;
 	UserMsg.Content = UserText;
+	// Attach any pending uploaded images to this user message, then clear the queue.
+	if (PendingUploadURIs.Num() > 0)
+	{
+		UserMsg.bHasImageAttachment = true;
+		UserMsg.ImageDataURIs = PendingUploadURIs;
+		PendingUploadURIs.Empty();
+	}
 	AddMessage(UserMsg);
 	InputTextBox->SetText(FText::GetEmpty());
 
@@ -508,6 +515,8 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 	ConsecutiveSameToolCount = 0;
 
 	// Build messages array for API — PRESERVE conversation history!
+	// NOTE: UserMsg has already been pushed into Messages via AddMessage() above,
+	// so iterating Messages naturally includes it. Do NOT append it again.
 	TArray<TSharedPtr<FJsonValue>> Msgs;
 
 	// Always fresh system prompt (memory may have been updated)
@@ -518,9 +527,14 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 	SysMsg->SetStringField(TEXT("content"), SystemPrompt);
 	Msgs.Add(MakeShareable(new FJsonValueObject(SysMsg)));
 
-	// Append conversation history from local Messages array
+	// Append conversation history (includes the user message just added above)
 	for (const auto& Msg : Messages)
 	{
+		// Skip the welcome message — it's UI-only, not for LLM context
+		if (Msg.Role == EMCPToolboxMessageRole::Assistant &&
+			Msg.Content.StartsWith(TEXT("**欢迎使用 MCP Toolbox")))
+			continue;
+
 		TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject());
 		FString RoleStr;
 		switch (Msg.Role)
@@ -562,54 +576,6 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		}
 
 		Msgs.Add(MakeShareable(new FJsonValueObject(MsgObj)));
-	}
-
-	// Add new user message (the one just entered)
-	{
-		TSharedPtr<FJsonObject> UsrMsg = MakeShareable(new FJsonObject());
-		UsrMsg->SetStringField(TEXT("role"), TEXT("user"));
-
-		bool bHasImages = false;
-		// Check if last message has images (in case of file upload)
-		if (Messages.Num() > 0)
-		{
-			const FMCPToolboxChatMessage& LastMsg = Messages.Last();
-			if (LastMsg.Role == EMCPToolboxMessageRole::User && LastMsg.bHasImageAttachment && LastMsg.ImageDataURIs.Num() > 0)
-			{
-				bHasImages = true;
-			}
-		}
-
-		if (bHasImages && Messages.Num() > 0)
-		{
-			const FMCPToolboxChatMessage& LastMsg = Messages.Last();
-			TArray<TSharedPtr<FJsonValue>> ContentArray;
-
-			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
-			TextPart->SetStringField(TEXT("type"), TEXT("text"));
-			TextPart->SetStringField(TEXT("text"), UserText.IsEmpty() ? LastMsg.Content : UserText);
-			ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
-
-			for (const FString& ImageURI : LastMsg.ImageDataURIs)
-			{
-				TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
-				ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
-
-				TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
-				ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
-				ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
-
-				ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
-			}
-
-			UsrMsg->SetArrayField(TEXT("content"), ContentArray);
-		}
-		else
-		{
-			UsrMsg->SetStringField(TEXT("content"), UserText);
-		}
-
-		Msgs.Add(MakeShareable(new FJsonValueObject(UsrMsg)));
 	}
 
 	SendAIRequest(Msgs);
@@ -2021,17 +1987,31 @@ FReply SMCPToolboxChatWidget::OnUploadFile()
 		TEXT("Images (*.png;*.jpg;*.jpeg)|*.png;*.jpg;*.jpeg|All (*.*)|*.*"),
 		EFileDialogFlags::Multiple, Files) && Files.Num() > 0)
 	{
-		FMCPToolboxChatMessage FileMsg;
-		FileMsg.Role = EMCPToolboxMessageRole::User;
-		FileMsg.Content = TEXT("上传了文件：\n");
+		// Collect image URIs into PendingUploadURIs — they will be attached to the
+		// next user message inside OnSendMessage. This avoids the old design where
+		// OnUploadFile called AddMessage(FileMsg) + OnSendMessage(), which either
+		// sent a duplicate user message (when input had text) or skipped sending
+		// entirely (when input was empty, because OnSendMessage early-returns).
+		PendingUploadURIs.Empty();
+		FString FileList;
 		for (const FString& F : Files)
 		{
-			FileMsg.Content += FPaths::GetCleanFilename(F) + TEXT("\n");
+			FileList += FPaths::GetCleanFilename(F) + TEXT("\n");
 			FString URI = EncodeFileToDataURI(F);
-			if (!URI.IsEmpty()) { FileMsg.ImageDataURIs.Add(URI); FileMsg.bHasImageAttachment = true; }
+			if (!URI.IsEmpty())
+				PendingUploadURIs.Add(URI);
 		}
-		AddMessage(FileMsg);
-		OnSendMessage(); // trigger AI
+
+		// If input box is empty, inject a default prompt so OnSendMessage actually sends.
+		if (InputTextBox.IsValid())
+		{
+			FString Current = InputTextBox->GetText().ToString().TrimStartAndEnd();
+			if (Current.IsEmpty())
+				InputTextBox->SetText(FText::FromString(TEXT("请分析这张图片")));
+		}
+
+		// Trigger send — OnSendMessage picks up PendingUploadURIs and attaches them.
+		OnSendMessage();
 	}
 	return FReply::Handled();
 }
@@ -2111,12 +2091,15 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 				Pos += CheckSub.Len();
 			}
 
-			// Reject if: repeated original >2x, or output >3x original length, or output contains Chinese meta-instructions
+			// Reject if: repeated original >2x, or output >3x original length, or output
+			// contains obvious meta-instructions (the model echoing the prompt template).
+			// NOTE: "以下" was removed — it's a legitimate word in Chinese ("以下文件...").
 			bool bIsGarbage = (OrigCount > 2) ||
 				(Cleaned.Len() > OriginalText.Len() * 3) ||
 				Cleaned.Contains(TEXT("优化规则")) ||
-				Cleaned.Contains(TEXT("以下")) ||
-				Cleaned.Contains(TEXT("原始提示词"));
+				Cleaned.Contains(TEXT("原始提示词")) ||
+				Cleaned.Contains(TEXT("用户输入中提取")) ||
+				Cleaned.Contains(TEXT("用1-3句"));
 
 			if (bIsGarbage || !WeakInput.IsValid())
 			{
@@ -3223,6 +3206,12 @@ void SMCPToolboxChatWidget::PreprocessImagesLocally(
 			NewObj->SetArrayField(TEXT("content"), TextOnly);
 			(*Modified)[Target.Index] = MakeShareable(new FJsonValueObject(NewObj));
 			(*Remaining)--;
+			// Note: synchronous path must also check completion — otherwise if all
+			// targets had empty base64, OnDone would never fire and the request stalls.
+			if (*Remaining <= 0 && OnDone)
+			{
+				OnDone(*Modified);
+			}
 			continue;
 		}
 
@@ -3259,12 +3248,6 @@ void SMCPToolboxChatWidget::PreprocessImagesLocally(
 				OnDone(*Modified);
 			}
 		});
-	}
-
-	// If all targets had no base64 (handled synchronously), call done now
-	if (*Remaining <= 0 && OnDone)
-	{
-		// Already called from the sync path above if remaining hit 0
 	}
 }
 
