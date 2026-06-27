@@ -373,6 +373,12 @@ private:
 	/** Whether optimization is in progress */
 	bool bOptimizingPrompt = false;
 
+	/** Pseudo-tool-call retry counter: when LLM says it will call a tool in content
+	 *  but doesn't generate tool_calls (finish=stop), we auto-retry once by appending
+	 *  a system message telling it to actually generate tool_calls. Limited to 1 retry
+	 *  per turn to prevent infinite loops. Reset to 0 whenever real tool_calls are seen. */
+	int32 PseudoToolCallRetries = 0;
+
 	// ---- File Upload ----
 
 	/** Pending image URIs from OnUploadFile — attached to the next user message and cleared after send.

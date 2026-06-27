@@ -505,6 +505,9 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 {
 	if (!InputTextBox.IsValid() || bIsWaiting) return FReply::Handled();
 
+	// Reset pseudo-tool-call retry counter at the start of each user turn.
+	PseudoToolCallRetries = 0;
+
 	FString UserText = InputTextBox->GetText().ToString().TrimStartAndEnd();
 	if (UserText.IsEmpty()) return FReply::Handled();
 
@@ -1150,6 +1153,9 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 	if (bHasToolCalls)
 	{
+		// Reset pseudo-tool-call retry counter — LLM generated real tool_calls this turn.
+		PseudoToolCallRetries = 0;
+
 		// Loop detection: abort if same tool name repeats more than 10 times
 		++ToolCallIteration;
 		FString CurrentToolNames;
@@ -1394,6 +1400,65 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 	if (!Content.IsEmpty())
 	{
+		// ── Pseudo-tool-call detection ──
+		// DeepSeek thinking mode sometimes makes LLM state its tool-call intent in content
+		// (e.g. "先查看 Panner 的引脚：调用工具 call_tool") but doesn't actually generate
+		// the tool_calls field, so finish=stop and the conversation stalls. Detect this
+		// and auto-retry once by appending a user message telling it to generate tool_calls.
+		if (FinishReason == TEXT("stop") && PseudoToolCallRetries == 0)
+		{
+			bool bPseudoToolCall = false;
+			// Detect intent keywords — LLM said it will call a tool but didn't.
+			// Exclude past tense ("已调用"/"调用了") to avoid false positives.
+			bool bHasIntent = Content.Contains(TEXT("调用工具")) ||
+			                  Content.Contains(TEXT("call_tool")) ||
+			                  Content.Contains(TEXT("先查看")) ||
+			                  Content.Contains(TEXT("先读取")) ||
+			                  Content.Contains(TEXT("先调用")) ||
+			                  Content.Contains(TEXT("接下来调用")) ||
+			                  Content.Contains(TEXT("接下来查看"));
+			bool bHasPast = Content.Contains(TEXT("已调用")) ||
+			                Content.Contains(TEXT("调用了")) ||
+			                Content.Contains(TEXT("已完成"));
+			if (bHasIntent && !bHasPast && Content.Len() < 600)
+			{
+				bPseudoToolCall = true;
+			}
+
+			if (bPseudoToolCall)
+			{
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Pseudo tool-call detected: LLM said it would call a tool but tool_calls=0. Auto-retrying (attempt %d)."), PseudoToolCallRetries + 1);
+
+				PseudoToolCallRetries++;
+
+				// Show the LLM's text reply (so user sees what it said)
+				FMCPToolboxChatMessage Reply;
+				Reply.Role = EMCPToolboxMessageRole::Assistant;
+				Reply.Content = Content;
+				AddMessage(Reply);
+
+				// Append assistant message + user nudge, re-send
+				TArray<TSharedPtr<FJsonValue>> RetryMsgs = SentMessages;
+				TSharedPtr<FJsonObject> AsstMsg = MakeShareable(new FJsonObject());
+				AsstMsg->SetStringField(TEXT("role"), TEXT("assistant"));
+				AsstMsg->SetStringField(TEXT("content"), Content);
+				AsstMsg->SetStringField(TEXT("reasoning_content"), TEXT(""));
+				RetryMsgs.Add(MakeShareable(new FJsonValueObject(AsstMsg)));
+
+				TSharedPtr<FJsonObject> NudgeMsg = MakeShareable(new FJsonObject());
+				NudgeMsg->SetStringField(TEXT("role"), TEXT("user"));
+				NudgeMsg->SetStringField(TEXT("content"),
+					TEXT("你刚才说要调用工具，但没有在 tool_calls 字段中生成实际的工具调用（finish_reason=stop）。"
+					     "请立即用 tool_calls 字段调用你刚才提到的工具，不要再用文字描述。"
+					     "如果你已经完成了任务不需要调用工具，请直接给出最终答复。"));
+				RetryMsgs.Add(MakeShareable(new FJsonValueObject(NudgeMsg)));
+
+				bIsWaiting = true;
+				SendAIRequest(RetryMsgs);
+				return;
+			}
+		}
+
 		FMCPToolboxChatMessage Reply;
 		Reply.Role = EMCPToolboxMessageRole::Assistant;
 		Reply.Content = Content;
@@ -1408,6 +1473,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			TSharedPtr<FJsonObject> AsstMsg = MakeShareable(new FJsonObject());
 			AsstMsg->SetStringField(TEXT("role"), TEXT("assistant"));
 			AsstMsg->SetStringField(TEXT("content"), Content);
+			AsstMsg->SetStringField(TEXT("reasoning_content"), TEXT(""));
 			ContinueMsgs.Add(MakeShareable(new FJsonValueObject(AsstMsg)));
 
 			TSharedPtr<FJsonObject> ContMsg = MakeShareable(new FJsonObject());
@@ -1715,7 +1781,10 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("   - `总结：xxx`（保存本次任务的核心经验）\n");
 	Prompt += TEXT("   - `经验：xxx`（保存踩坑/最佳实践）\n");
 	Prompt += TEXT("   示例：`记住：call_tool 创建材质时 toolset_name=unreal_editor_asset, tool_name=create_material`\n");
-	Prompt += TEXT("9. **视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n\n");
+	Prompt += TEXT("9. **视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n");
+	Prompt += TEXT("10. **工具调用必须通过 tool_calls 字段生成**：禁止在回复文字中用\"调用工具: call_tool\"或\"先查看 XX 的引脚：\"等方式描述工具调用。\n");
+	Prompt += TEXT("    如果你决定调用工具，content 可以为空或简短说明意图，然后**必须**在 tool_calls 字段中生成实际的工具调用 JSON。\n");
+	Prompt += TEXT("    在文字中说\"我要调用工具\"但不生成 tool_calls = 失败！系统会检测到并要求你重试，但反复重试浪费 token。\n\n");
 
 	Prompt += TEXT("##  效率规则（必须严格遵守！目标：减少round-trip，提高速度）\n");
 	Prompt += TEXT("1. **批量读取**：需要读取多个文件时，使用 batch_read_files 一次性读取，禁止逐个调用 read_file\n");
