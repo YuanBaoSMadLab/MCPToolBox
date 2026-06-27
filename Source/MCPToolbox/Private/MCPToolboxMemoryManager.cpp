@@ -45,6 +45,15 @@ void FMCPToolboxMemoryManager::Initialize()
 
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 初始化记忆系统: %s"), *MemoryRoot);
 	LoadIndex();
+
+	// Cleanup obviously invalid memory notes (AI-confession garbage etc.)
+	int32 Removed = CleanupInvalidNotes();
+	if (Removed > 0)
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 清理无效记忆 %d 条"), Removed);
+		// Reload index because CleanupInvalidNotes may have removed pointer lines
+		LoadIndex();
+	}
 }
 
 // ============================================================================
@@ -563,6 +572,28 @@ bool FMCPToolboxMemoryManager::SaveConversationSummary(const FString& ToolsSumma
 	// Timestamp for archive filenames (e.g. 20260627-223100)
 	FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S"));
 
+	// ── Backup existing index file before overwriting ──
+	// Safeguard against accidental data loss: copy the current conversation_summary.md
+	// to summaries/backup_<ts>.md before writing the new one.
+	// Use Load+Save instead of IFileManager::Copy to avoid ECopyResult visibility issues.
+	FString IndexPath = GetConversationSummaryIndexPath();
+	if (FPaths::FileExists(IndexPath))
+	{
+		FString BackupPath = FPaths::Combine(ArchiveDir, TEXT("backup_") + Timestamp + TEXT(".md"));
+		FString OldContent;
+		if (FFileHelper::LoadFileToString(OldContent, *IndexPath))
+		{
+			if (FFileHelper::SaveStringToFile(OldContent, *BackupPath, FFileHelper::EEncodingOptions::ForceUTF8))
+			{
+				UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 旧索引已备份: %s"), *BackupPath);
+			}
+			else
+			{
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Memory] 备份旧索引失败: %s"), *BackupPath);
+			}
+		}
+	}
+
 	// ── Build index file content (overwrite) ──
 	FString Index;
 	Index += TEXT("# Conversation Summary\n\n");
@@ -598,7 +629,6 @@ bool FMCPToolboxMemoryManager::SaveConversationSummary(const FString& ToolsSumma
 	}
 
 	// Write index file (overwrite)
-	FString IndexPath = GetConversationSummaryIndexPath();
 	FString IndexDir = FPaths::GetPath(IndexPath);
 	IFileManager::Get().MakeDirectory(*IndexDir, true);
 
@@ -658,5 +688,120 @@ bool FMCPToolboxMemoryManager::LoadConversationSummary(FString& OutToolsSummary,
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Memory] 加载会话归档: tools=%d字符, memory=%d字符"),
 		OutToolsSummary.Len(), OutMemorySummary.Len());
 	return true;
+}
+
+// ============================================================================
+// Cleanup Invalid Notes
+// ============================================================================
+int32 FMCPToolboxMemoryManager::CleanupInvalidNotes()
+{
+	FScopeLock ScopeLock(&Lock);
+
+	// Heuristics for invalid memory notes — these keywords indicate the content
+	// was extracted from an AI's "I can't do X" confession rather than a real fact.
+	static const TCHAR* const InvalidKeywords[] = {
+		TEXT("我目前无法"),
+		TEXT("我无法"),
+		TEXT("作为AI"),
+		TEXT("作为一个人工智能"),
+		TEXT("我是一个AI"),
+		TEXT("我是一个人工智能"),
+		TEXT("我没有能力"),
+		TEXT("我做不到"),
+	};
+	constexpr int32 InvalidKeywordCount = sizeof(InvalidKeywords) / sizeof(InvalidKeywords[0]);
+
+	// Min body length (after frontmatter). Bodies shorter than this are likely noise.
+	constexpr int32 MinBodyLen = 20;
+
+	TArray<FString> NoteFiles;
+	IFileManager::Get().FindFiles(NoteFiles, *MemoryRoot, TEXT("*.md"));
+
+	int32 RemovedCount = 0;
+	TArray<FString> SlugsToRemove;
+
+	for (const FString& FileName : NoteFiles)
+	{
+		if (FileName == TEXT("MEMORY.md")) continue;
+
+		FString FilePath = FPaths::Combine(MemoryRoot, FileName);
+		FString Content;
+		if (!FFileHelper::LoadFileToString(Content, *FilePath)) continue;
+
+		bool bInvalid = false;
+
+		// 1. Check invalid keywords anywhere in content
+		for (int32 i = 0; i < InvalidKeywordCount; ++i)
+		{
+			if (Content.Contains(InvalidKeywords[i]))
+			{
+				bInvalid = true;
+				break;
+			}
+		}
+
+		// 2. Check body length (after second "---" of frontmatter)
+		if (!bInvalid)
+		{
+			int32 FirstFence = Content.Find(TEXT("---"));
+			if (FirstFence != INDEX_NONE)
+			{
+				int32 SecondFence = Content.Find(TEXT("---"), ESearchCase::CaseSensitive, ESearchDir::FromStart, FirstFence + 3);
+				if (SecondFence != INDEX_NONE)
+				{
+					FString Body = Content.Mid(SecondFence + 3).TrimStartAndEnd();
+					if (Body.Len() < MinBodyLen)
+					{
+						bInvalid = true;
+					}
+				}
+			}
+		}
+
+		if (bInvalid)
+		{
+			if (IFileManager::Get().Delete(*FilePath))
+			{
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Memory] 删除无效记忆文件: %s"), *FileName);
+				RemovedCount++;
+				// Strip ".md" to get the slug; collect for index update
+				SlugsToRemove.Add(FileName.Left(FileName.Len() - 3));
+			}
+			else
+			{
+				UE_LOG(LogMCPToolbox, Error, TEXT("[Memory] 删除失败: %s"), *FileName);
+			}
+		}
+	}
+
+	// Remove pointer lines from the in-memory index (and persist to MEMORY.md)
+	if (SlugsToRemove.Num() > 0)
+	{
+		bool bChanged = false;
+		for (const FString& Slug : SlugsToRemove)
+		{
+			for (int32 i = IndexLines.Num() - 1; i >= 0; --i)
+			{
+				FString Title, LineSlug, Hook;
+				if (ParseIndexLine(IndexLines[i], Title, LineSlug, Hook) && LineSlug == Slug)
+				{
+					IndexLines.RemoveAt(i);
+					LoadedNotes.Remove(Slug);
+					bChanged = true;
+					break;
+				}
+			}
+		}
+		if (bChanged)
+		{
+			FString IndexPathLocal = FPaths::Combine(MemoryRoot, TEXT("MEMORY.md"));
+			FFileHelper::SaveStringToFile(
+				FString::Join(IndexLines, TEXT("\n")) + TEXT("\n"),
+				*IndexPathLocal,
+				FFileHelper::EEncodingOptions::ForceUTF8);
+		}
+	}
+
+	return RemovedCount;
 }
 

@@ -133,6 +133,13 @@ public:
 	 */
 	bool LoadConversationSummary(FString& OutToolsSummary, FString& OutMemorySummary) const;
 
+	/**
+	 * Remove obviously invalid memory notes (e.g. AI-confession garbage like
+	 * "我目前无法...", "作为AI...", body too short, etc.). Called once at init.
+	 * Returns number of removed files.
+	 */
+	int32 CleanupInvalidNotes();
+
 private:
 	FMCPToolboxMemoryManager() = default;
 	~FMCPToolboxMemoryManager() = default;

@@ -185,6 +185,14 @@ private:
 	/** Build a "give me a summary" prompt from the current Messages array. */
 	FString BuildSummaryPrompt(bool bForTools, bool bForMemory) const;
 
+	// ---- Auto Archive (Idle Aux Model) ----
+
+	/** Try to auto-archive the current session when the aux model is idle.
+	 *  Called from the main chat-stream end points. Does nothing if disabled,
+	 *  already archiving, chat busy, dialog open, aux model not ready, or
+	 *  within the cooldown window (30 minutes). */
+	void TryAutoArchiveWhenIdle();
+
 	// ---- Provider/Model Selection ----
 
 	/** Rebuild entry list from APIManager saved entries */
@@ -416,6 +424,18 @@ private:
 
 	/** Weak reference to the summary dialog window (prevent duplicate open) */
 	TWeakPtr<SWindow> SummaryDialogWindow;
+
+	// ---- Auto Archive State ----
+
+	/** True if user enabled "auto-archive when aux model is idle" (persisted). Default false. */
+	bool bAutoArchiveEnabled = false;
+
+	/** Runtime guard to prevent re-entrant auto-archive triggers (not persisted). */
+	bool bIsAutoArchiving = false;
+
+	/** Epoch seconds of the last successful auto-archive trigger (in-memory only,
+	 *  resets on restart to allow one auto-archive right after a fresh start). */
+	double LastAutoArchiveTime = 0.0;
 
 	// ---- Widget State Persistence ----
 

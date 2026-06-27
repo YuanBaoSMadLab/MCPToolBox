@@ -1024,6 +1024,18 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 					RefreshSessionList();
 					StreamingMessageBox.Reset();
 					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Stream done, %d chars"), DisplayBuffer->Len());
+
+					// Auto-archive opportunity: defer to next game-thread tick to avoid
+					// nesting HTTP startup inside the ticker callback. Use weak pointer
+					// because the widget may be destroyed between ticks.
+					TWeakPtr<SMCPToolboxChatWidget> WeakSelf = SharedThis(this);
+					AsyncTask(ENamedThreads::GameThread, [WeakSelf]()
+					{
+						if (TSharedPtr<SMCPToolboxChatWidget> Self = WeakSelf.Pin())
+						{
+							Self->TryAutoArchiveWhenIdle();
+						}
+					});
 					return false;
 				}
 
@@ -1844,6 +1856,28 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("- MCP工具调用成功的方法用\"记住：MCP工具 XXX 使用方法：...\"保存\n");
 	Prompt += TEXT("- 项目信息用\"重要：xxx\"保存\n");
 	Prompt += TEXT("- 用户偏好用\"偏好：xxx\"保存\n\n");
+
+	// ── 科学辩证观 — AI 行为准则（八荣八耻） ──
+	// 强制 AI 在每一轮决策前对照这套准则，避免瞎猜/浪费/破坏架构等典型问题。
+	Prompt += TEXT("## AI 行为准则\n");
+	Prompt += TEXT("> 每一轮决策前必须对照此准则自检；违反任意一条视为本轮失败。\n\n");
+	Prompt += TEXT("- 以认真查询为荣，以瞎猜接口为耻\n");
+	Prompt += TEXT("- 以寻求 MD 为荣，以浪费时间为耻\n");
+	Prompt += TEXT("- 以人类确认为荣，以模糊执行为耻\n");
+	Prompt += TEXT("- 以复用现有为荣，以创造求证为耻\n");
+	Prompt += TEXT("- 以诚信无知为荣，以假装理解为耻\n");
+	Prompt += TEXT("- 以遵循规范为荣，以破坏架构为耻\n");
+	Prompt += TEXT("- 以谨慎重构为荣，以盲目脚本为耻\n");
+	Prompt += TEXT("- 以备份数据为荣，以覆盖丢失为耻\n\n");
+	Prompt += TEXT("具体落地：\n");
+	Prompt += TEXT("1. 不确定的接口/路径/枚举值必须先 search/read 文件再使用，不得凭印象编写\n");
+	Prompt += TEXT("2. 项目内已有 .mcptoolbox/*.md 缓存（工具集说明、归档总结）必须先读再行动\n");
+	Prompt += TEXT("3. 涉及破坏性操作（删除/覆盖/重命名/批量修改）前必须先告知用户并获得确认\n");
+	Prompt += TEXT("4. 优先复用现有函数/工具/抽象，禁止为了\"清洁\"而创造新接口\n");
+	Prompt += TEXT("5. 不知道就说不知道，不得编造虚假 API 或参数\n");
+	Prompt += TEXT("6. 严格遵守项目硬约束（见上下文中的 project_memory）\n");
+	Prompt += TEXT("7. 重构必须最小化、谨慎进行，禁止\"顺手\"批量改架构\n");
+	Prompt += TEXT("8. 覆盖任何持久化文件（MD/JSON/配置）前必须先备份原文件\n\n");
 
 	Prompt += TEXT("## 格式\n");
 	Prompt += TEXT("- 工具执行完后用中文Markdown回复结果\n");
@@ -3577,9 +3611,9 @@ void SMCPToolboxChatWidget::LoadWidgetState()
 	Json->TryGetBoolField(TEXT("sidebar_collapsed"), bSidebarCollapsed);
 	Json->TryGetBoolField(TEXT("more_expanded"), bMoreExpanded);
 	Json->TryGetBoolField(TEXT("summary_declined"), bSummaryDeclined);
-
-	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Widget state loaded: vision=%d sidebar=%d more=%d summary_declined=%d"),
-		(int32)bVisionModeEnabled, (int32)bSidebarCollapsed, (int32)bMoreExpanded, (int32)bSummaryDeclined);
+	Json->TryGetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Widget state loaded: vision=%d sidebar=%d more=%d summary_declined=%d auto_archive=%d"),
+		(int32)bVisionModeEnabled, (int32)bSidebarCollapsed, (int32)bMoreExpanded, (int32)bSummaryDeclined, (int32)bAutoArchiveEnabled);
 }
 
 void SMCPToolboxChatWidget::SaveWidgetState() const
@@ -3589,6 +3623,7 @@ void SMCPToolboxChatWidget::SaveWidgetState() const
 	Json->SetBoolField(TEXT("sidebar_collapsed"), bSidebarCollapsed);
 	Json->SetBoolField(TEXT("more_expanded"), bMoreExpanded);
 	Json->SetBoolField(TEXT("summary_declined"), bSummaryDeclined);
+	Json->SetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
 
 	FString Output;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
@@ -3715,6 +3750,8 @@ void SMCPToolboxChatWidget::OnSummaryGenerated(bool bSuccess, const FString& Too
 		FailMsg.Role = EMCPToolboxMessageRole::System;
 		FailMsg.Content = TEXT("**归档总结失败**\n\n可能原因：\n- 本地辅助模型未启动或异常\n- 主模型 API key 无效或网络超时\n\n可从工具栏'更多 → 归档总结'重新触发。");
 		AddMessage(FailMsg);
+		// Reset auto-archive guard on failure too, so retry is possible
+		bIsAutoArchiving = false;
 		return;
 	}
 
@@ -3741,6 +3778,9 @@ void SMCPToolboxChatWidget::OnSummaryGenerated(bool bSuccess, const FString& Too
 	DoneMsg.Content += FString::Printf(TEXT("- 记忆归档: %s\n"), *MemInfo);
 	DoneMsg.Content += TEXT("\n已保存到 `~/.mcptoolbox/conversation_summary.md`，并归档到 `~/.mcptoolbox/summaries/`。下次启动编辑器将自动加载到系统提示词，无需用户重复说明上下文。");
 	AddMessage(DoneMsg);
+
+	// Reset auto-archive guard so the next idle window can trigger again
+	bIsAutoArchiving = false;
 }
 
 void SMCPToolboxChatWidget::GenerateSummary(ESummaryModelChoice ModelChoice, bool bArchiveTools, bool bArchiveMemory)
@@ -3985,6 +4025,61 @@ void SMCPToolboxChatWidget::GenerateSummary(ESummaryModelChoice ModelChoice, boo
 	}
 }
 
+// ============================================================================
+// Auto Archive — fires when the aux model is idle and the chat stream just ended
+// ============================================================================
+void SMCPToolboxChatWidget::TryAutoArchiveWhenIdle()
+{
+	// User must have explicitly opted in via the summary dialog checkbox
+	if (!bAutoArchiveEnabled) return;
+
+	// Re-entrancy guard: don't trigger while a previous auto-archive is still pending
+	if (bIsAutoArchiving) return;
+
+	// Don't fire while the main chat is still busy (streaming/waiting)
+	if (bIsStreaming || bIsWaiting) return;
+
+	// Don't fire while the user is interacting with the summary dialog
+	if (SummaryDialogWindow.IsValid()) return;
+
+	// Aux model must be ready (the whole point is to use idle aux capacity)
+	if (!FMCPToolboxAuxModelManager::Get().IsReady()) return;
+
+	// Cooldown: 30 minutes between auto-archives to prevent loop idle-spin
+	constexpr double CooldownSeconds = 1800.0;
+	const double Now = FPlatformTime::Seconds();
+	if (LastAutoArchiveTime > 0.0 && (Now - LastAutoArchiveTime) < CooldownSeconds)
+	{
+		return;
+	}
+
+	// Must have at least one user message worth summarizing
+	bool bHasUserMsg = false;
+	for (const FMCPToolboxChatMessage& M : Messages)
+	{
+		if (M.Role == EMCPToolboxMessageRole::User) { bHasUserMsg = true; break; }
+	}
+	if (!bHasUserMsg) return;
+
+	// All conditions met — fire
+	bIsAutoArchiving = true;
+	LastAutoArchiveTime = Now;
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Auto-archive triggered (aux idle, cooldown elapsed)"));
+
+	FMCPToolboxChatMessage Notice;
+	Notice.Role = EMCPToolboxMessageRole::System;
+	Notice.Content = TEXT("**辅助模型空闲，自动归档当前会话**\n\n");
+	Notice.Content += TEXT("- 使用本地辅助模型生成（LocalFirst 策略）\n");
+	Notice.Content += TEXT("- 工具使用归档 + 记忆归档双归档\n");
+	Notice.Content += TEXT("- 旧索引文件已自动备份到 `summaries/backup_*.md`\n");
+	Notice.Content += TEXT("- 冷却时间 30 分钟，防止循环空转");
+	AddMessage(Notice);
+
+	// LocalFirst: prefer local aux model for both (free, fast, no API quota)
+	GenerateSummary(ESummaryModelChoice::LocalFirst, true, true);
+}
+
 void SMCPToolboxChatWidget::ShowSummaryChoiceDialog()
 {
 	bool bIsFirstTime = !bSummaryDeclined;
@@ -4169,6 +4264,52 @@ void SMCPToolboxChatWidget::ShowSummaryChoiceDialog()
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 				.AutoWrapText(true)
 				.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
+			]
+
+			// Separator
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(SSeparator)
+			]
+
+			// Auto-archive toggle
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 4)
+			[
+				SNew(SCheckBox)
+				.IsChecked_Lambda([this]() -> ECheckBoxState
+				{
+					return bAutoArchiveEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+				{
+					bAutoArchiveEnabled = (State == ECheckBoxState::Checked);
+					SaveWidgetState();
+					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Auto-archive %s"),
+						bAutoArchiveEnabled ? TEXT("enabled") : TEXT("disabled"));
+				})
+				.Content()
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("AutoArchiveToggle",
+							"启用辅助模型空闲时自动归档"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 2, 0, 0)
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("AutoArchiveHint",
+							"启用后：主聊天流结束时，若辅助模型就绪且距上次自动归档超过 30 分钟，\n"
+							"将自动用本地模型生成归档（覆盖索引文件，旧版本自动备份到 summaries/backup_*.md）。\n"
+							"防止循环空转：30 分钟冷却 + bIsAutoArchiving 状态保护。"))
+						.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f))
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						.AutoWrapText(true)
+						.WrappingPolicy(ETextWrappingPolicy::DefaultWrapping)
+					]
+				]
 			]
 
 			// Spacer
