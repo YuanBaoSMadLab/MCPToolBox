@@ -1756,15 +1756,16 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		Prompt += CachedMCPToolDescriptionsMD;
 	}
 
-	// ── 加载 .mcptoolbox/ 缓存（由 fetch-mcp-toolsets.ps1 预拉取生成）──
-	// 这些 MD 文件包含所有 toolset 的精确 call_tool 调用方式，避免 LLM 反复试探参数
+	// ── 加载 .mcptoolbox/ 缓存（由工具栏"刷新工具"按钮预拉取生成）──
+	// 这些 MD 文件包含所有 toolset 的精确 call_tool 调用方式，避免 LLM 反复试探参数。
+	// 即使缓存不存在也不阻塞任务 — LLM 仍可基于 CachedMCPToolDescriptionsMD 调用 call_tool。
 	{
 		FString ToolboxDir = FPaths::ProjectDir() / TEXT(".mcptoolbox");
 		IFileManager& FileMgr = IFileManager::Get();
 		if (FileMgr.DirectoryExists(*ToolboxDir))
 		{
 			Prompt += TEXT("\n##  MCP Toolset 缓存（来自 .mcptoolbox/）\n");
-			Prompt += TEXT("> 以下文档由 fetch-mcp-toolsets.ps1 预拉取生成，已包含所有 toolset 的精确调用方式（toolset_name/tool_name/arguments）。\n");
+			Prompt += TEXT("> 以下文档由工具栏\"刷新工具\"按钮预拉取生成，已包含所有 toolset 的精确调用方式（toolset_name/tool_name/arguments）。\n");
 			Prompt += TEXT("> **不要调用 list_toolsets/describe_toolset** — 本章节已包含所有信息。\n");
 			Prompt += TEXT("> **关键**：toolset_name 是完整 toolset 路径（不含 tool_name），tool_name 是 toolset 中的工具名。\n\n");
 
@@ -1821,7 +1822,14 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		}
 		else
 		{
-			UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] .mcptoolbox/ not found at %s — run fetch-mcp-toolsets.ps1 to pre-fetch toolset docs"), *ToolboxDir);
+			// 缓存目录不存在 — 不阻塞任务。LLM 仍可基于上方 CachedMCPToolDescriptionsMD
+			// 中的工具列表直接调用 call_tool（参数可从工具描述推断）。
+			// 静默处理（不打日志避免每次 BuildSystemPrompt 都刷屏），UI 按钮上有 tooltip 引导。
+			Prompt += TEXT("\n## MCP Toolset 调用提示\n");
+			Prompt += TEXT("> 详细 toolset 文档未缓存（`.mcptoolbox/` 目录不存在），但不影响任务执行。\n");
+			Prompt += TEXT("> 上方'已发现MCP工具'列表已包含所有可用工具的名称和描述。\n");
+			Prompt += TEXT("> **直接用 call_tool 调用**，参数根据工具描述推断；如不确定参数名，可用通用参数名试探（如 name/path/content 等常见命名）。\n");
+			Prompt += TEXT("> 若需详细 toolset 文档以避免试错，可让用户点击工具栏\"刷新工具\"按钮预拉取文档（非必需）。\n\n");
 		}
 	}
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
