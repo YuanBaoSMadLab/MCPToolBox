@@ -602,6 +602,14 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 			MsgObj->SetStringField(TEXT("content"), Msg.Content);
 		}
 
+		// DeepSeek thinking mode: round-trip reasoning_content for assistant messages.
+		// We always attach the field (even if empty) so the API sees a consistent shape.
+		// This prevents HTTP 400 "The reasoning_content in the thinking mode must be passed back".
+		if (RoleStr == TEXT("assistant"))
+		{
+			MsgObj->SetStringField(TEXT("reasoning_content"), Msg.ReasoningContent);
+		}
+
 		Msgs.Add(MakeShareable(new FJsonValueObject(MsgObj)));
 	}
 
@@ -861,6 +869,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 	TSharedPtr<FJsonObject> RespObj;
 	FString FinishReason = TEXT("stop");
 	FString AccumulatedContent;
+	FString AccumulatedReasoning;  // DeepSeek thinking mode: delta.reasoning_content
 	TArray<TSharedPtr<FJsonValue>> AccumulatedToolCalls;
 	TMap<int32, TSharedPtr<FJsonValue>> ToolCallByIndex; // Dedup by index
 
@@ -900,6 +909,14 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 				{
 					AccumulatedContent += DeltaContent;
 					TextChunks.Add(DeltaContent);
+				}
+
+				// DeepSeek thinking mode: accumulate reasoning_content so we can pass
+				// it back on subsequent requests (API enforces this in thinking mode).
+				FString DeltaReasoning;
+				if ((*Delta)->TryGetStringField(TEXT("reasoning_content"), DeltaReasoning))
+				{
+					AccumulatedReasoning += DeltaReasoning;
 				}
 
 				const TArray<TSharedPtr<FJsonValue>>* DeltaTC;
@@ -973,8 +990,8 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 		for (auto& Pair : ToolCallByIndex)
 			AccumulatedToolCalls.Add(Pair.Value);
 
-		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] SSE: content=%d chars(%d chunks), tool_calls=%d (deduped from map), finish=%s"),
-			AccumulatedContent.Len(), TextChunks.Num(), AccumulatedToolCalls.Num(), *FinishReason);
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] SSE: content=%d chars(%d chunks), tool_calls=%d (deduped from map), finish=%s, reasoning=%d chars"),
+			AccumulatedContent.Len(), TextChunks.Num(), AccumulatedToolCalls.Num(), *FinishReason, AccumulatedReasoning.Len());
 
 		// Progressive display for text-only responses (no tool_calls)
 		if (AccumulatedToolCalls.Num() == 0 && TextChunks.Num() > 0)
@@ -984,6 +1001,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			StreamMsg.Role = EMCPToolboxMessageRole::Assistant;
 			StreamMsg.Content = TEXT("");
 			StreamMsg.bIsStreaming = true;
+			StreamMsg.ReasoningContent = AccumulatedReasoning;  // Persist for next request
 			Messages.Add(StreamMsg);
 			FMCPToolboxChatMessage* StreamPtr = &Messages.Last();
 			
@@ -1075,6 +1093,10 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 		TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject());
 		MsgObj->SetStringField(TEXT("role"), TEXT("assistant"));
 		MsgObj->SetStringField(TEXT("content"), AccumulatedContent);
+		// DeepSeek thinking mode: attach reasoning_content so it round-trips back on
+		// the next request (API rejects assistant messages without this field in thinking mode).
+		// Use empty string when no reasoning was streamed (preserves field presence).
+		MsgObj->SetStringField(TEXT("reasoning_content"), AccumulatedReasoning);
 		if (AccumulatedToolCalls.Num() > 0)
 			MsgObj->SetArrayField(TEXT("tool_calls"), AccumulatedToolCalls);
 		TSharedPtr<FJsonObject> ChoiceObj = MakeShareable(new FJsonObject());
@@ -1661,7 +1683,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	FString ContentPath = FPaths::ProjectContentDir();
 	FString ProjectName = FApp::GetProjectName();
 
-	Prompt += TEXT("你是 MCP Toolbox AI助手，运行在 Unreal Engine 5.8 编辑器内部。必须用中文回复。\n\n");
+	Prompt += TEXT("你是 MCP Toolbox AI助手，运行在 Unreal Engine 5.8 编辑器内部。用中文回复。\n\n");
 	Prompt += FString::Printf(TEXT("## 工作环境\n"));
 	Prompt += FString::Printf(TEXT("- 项目: %s\n"), *ProjectName);
 	Prompt += FString::Printf(TEXT("- Content目录: %s\n"), *ContentPath);
@@ -1679,7 +1701,7 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("4. 如果下方没有 \"MCP Toolset 缓存\" 章节（说明用户尚未点击\"刷新工具\"按钮），**请明确告知用户**：\"请先点击工具栏的 '更多 → 刷新工具' 按钮缓存工具集文档\"，然后停止。不要尝试自行发现工具。\n\n");
 
 	Prompt += TEXT("## 核心规则（必须100%遵守！违反规则=失败）\n");
-	Prompt += TEXT("1. **绝不空口承诺**：禁止说\"我来帮你\"\"让我看看\"等文字而不调用工具。说一次执行一次\n");
+	Prompt += TEXT("1. **绝不空口承诺**：禁止说\"我来帮你\"等文字而不调用工具。说一次执行一次\n");
 	Prompt += TEXT("2. **先调用工具再说话**：收到指令→立即调用工具→拿到结果→回复用户。中间不允许纯文字\n");
 	Prompt += TEXT("3. **非工具不可**：创建材质/执行命令/截图/选择Actor—这些操作必须且只能通过工具完成\n");
 	Prompt += TEXT("4. **工具参数必填且正确**：路径加/Game/前缀，命令写完整\n");
@@ -2684,10 +2706,18 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					.Text_Lambda([this]() -> FText
 					{
 						if (MCPServerClient.IsConnected())
-							return LOCTEXT("MCPReady", "MCP");
+							return LOCTEXT("MCPReady", "MCP就绪");
 						if (FMCPToolboxModule::IsMCPServerStarted())
-							return LOCTEXT("MCPStarting", "MCP…");
-						return LOCTEXT("MCPOffline", "MCP");
+							return LOCTEXT("MCPStarting", "MCP连接中…");
+						return LOCTEXT("MCPOffline", "MCP未连接");
+					})
+					.ToolTipText_Lambda([this]() -> FText
+					{
+						if (MCPServerClient.IsConnected())
+							return LOCTEXT("MCPReadyTip", "MCP 服务器已连接，可调用工具");
+						if (FMCPToolboxModule::IsMCPServerStarted())
+							return LOCTEXT("MCPStartingTip", "MCP 服务器启动中，正在建立连接");
+						return LOCTEXT("MCPOfflineTip", "MCP 服务器未启动，点击'启动MCP'按钮");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity_Lambda([this]() -> FLinearColor
@@ -2700,18 +2730,29 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					})
 				]
 				// Aux Model status
-			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(10, 0, 0, 0))
-			[
-				SNew(STextBlock)
-				.Text(FText::FromString(TEXT("Aux")))
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-				.ColorAndOpacity_Lambda([]() -> FLinearColor
-				{
-					return FMCPToolboxAuxModelManager::Get().IsReady()
-						? FLinearColor(0.3f, 0.85f, 0.4f)
-						: FLinearColor(0.4f, 0.4f, 0.4f);
-				})
-			]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(10, 0, 0, 0))
+				[
+					SNew(STextBlock)
+					.Text_Lambda([]() -> FText
+					{
+						return FMCPToolboxAuxModelManager::Get().IsReady()
+							? LOCTEXT("AuxReady", "Aux就绪")
+							: LOCTEXT("AuxOffline", "Aux未就绪");
+					})
+					.ToolTipText_Lambda([]() -> FText
+					{
+						return FMCPToolboxAuxModelManager::Get().IsReady()
+							? LOCTEXT("AuxReadyTip", "本地辅助模型就绪（如 llama-server），可用于归档总结/视觉预处理")
+							: LOCTEXT("AuxOfflineTip", "本地辅助模型未就绪，归档总结将回退到主模型");
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity_Lambda([]() -> FLinearColor
+					{
+						return FMCPToolboxAuxModelManager::Get().IsReady()
+							? FLinearColor(0.3f, 0.85f, 0.4f)
+							: FLinearColor(0.4f, 0.4f, 0.4f);
+					})
+				]
 				// AI status
 				+ SHorizontalBox::Slot().AutoWidth()
 				[
