@@ -19,6 +19,9 @@
 #include "Misc/Base64.h"
 #include "Misc/App.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
 #include "EngineUtils.h"
 #include "Engine/Selection.h"
 #include "HttpModule.h"
@@ -1518,15 +1521,47 @@ void SMCPToolboxChatWidget::MergeMCPTools()
 
 		// MCP tools are now dispatched directly in HandleAIResponse (fully async).
 		// This FunctionTable callback provides schema info only.
-		ToolFunctionTable->Add(assistant::FunctionBuilder(TCHAR_TO_UTF8(*ToolName))
-			.SetDescription(TCHAR_TO_UTF8(*ToolDesc))
-			.SetCallback([](const assistant::json& Args) -> assistant::FunctionResult
-			{
-				return assistant::FunctionResult{
-					.isError = false,
-					.text = R"({"status":"dispatched"})"
-				};
-			}).Build());
+		if (ToolName == TEXT("call_tool"))
+		{
+			// ── 关键修复：为 call_tool 注册精确的参数 schema ──
+			// 之前仅 SetDescription，LLM 看不到参数结构 → 把 tool_name 误并入 toolset_name
+			// (日志: Toolset 'editor_toolset.toolsets.material.MaterialTools.create_material' not found)
+			FString CallToolDesc = ToolDesc;
+			CallToolDesc += TEXT("\n\n**关键**: toolset_name 是 toolset 的完整路径(如 'editor_toolset.toolsets.material.MaterialTools')");
+			CallToolDesc += TEXT("，tool_name 是该 toolset 中的具体工具名(如 'CreateMaterial')。");
+			CallToolDesc += TEXT("不要把 tool_name 拼进 toolset_name。所有可用 toolset 和 tool 见下方'已发现MCP工具'章节或 .mcptoolbox/ 缓存。");
+
+			ToolFunctionTable->Add(assistant::FunctionBuilder("call_tool")
+				.SetDescription(TCHAR_TO_UTF8(*CallToolDesc))
+				.AddRequiredParam("toolset_name",
+					"完整 toolset 路径，如 'editor_toolset.toolsets.material.MaterialTools'。不含 tool_name。",
+					"string")
+				.AddRequiredParam("tool_name",
+					"toolset 中的具体工具名，如 'CreateMaterial'。",
+					"string")
+				.AddRequiredParam("arguments",
+					"工具参数对象。具体 schema 见下方'已发现MCP工具'章节或 .mcptoolbox/ 缓存。",
+					"object")
+				.SetCallback([](const assistant::json& Args) -> assistant::FunctionResult
+				{
+					return assistant::FunctionResult{
+						.isError = false,
+						.text = R"({"status":"dispatched"})"
+					};
+				}).Build());
+		}
+		else
+		{
+			ToolFunctionTable->Add(assistant::FunctionBuilder(TCHAR_TO_UTF8(*ToolName))
+				.SetDescription(TCHAR_TO_UTF8(*ToolDesc))
+				.SetCallback([](const assistant::json& Args) -> assistant::FunctionResult
+				{
+					return assistant::FunctionResult{
+						.isError = false,
+						.text = R"({"status":"dispatched"})"
+					};
+				}).Build());
+		}
 
 		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Registered MCP tool: %s"), *ToolName);
 	}
@@ -1634,6 +1669,75 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	{
 		Prompt += TEXT("\n");
 		Prompt += CachedMCPToolDescriptionsMD;
+	}
+
+	// ── 加载 .mcptoolbox/ 缓存（由 fetch-mcp-toolsets.ps1 预拉取生成）──
+	// 这些 MD 文件包含所有 toolset 的精确 call_tool 调用方式，避免 LLM 反复试探参数
+	{
+		FString ToolboxDir = FPaths::ProjectDir() / TEXT(".mcptoolbox");
+		IFileManager& FileMgr = IFileManager::Get();
+		if (FileMgr.DirectoryExists(*ToolboxDir))
+		{
+			Prompt += TEXT("\n## 📚 MCP Toolset 缓存（来自 .mcptoolbox/）\n");
+			Prompt += TEXT("> 以下文档由 fetch-mcp-toolsets.ps1 预拉取生成，已包含所有 toolset 的精确调用方式（toolset_name/tool_name/arguments）。\n");
+			Prompt += TEXT("> **不要调用 list_toolsets/describe_toolset** — 本章节已包含所有信息。\n");
+			Prompt += TEXT("> **关键**：toolset_name 是完整 toolset 路径（不含 tool_name），tool_name 是 toolset 中的工具名。\n\n");
+
+			int32 LoadedCount = 0;
+			int32 TotalChars = 0;
+			const int32 MaxTotalChars = 60000;  // ~15K tokens 上限
+
+			// 先加载 index.md（总索引）
+			FString IndexPath = ToolboxDir / TEXT("index.md");
+			if (FileMgr.FileExists(*IndexPath))
+			{
+				FString IndexContent;
+				if (FFileHelper::LoadFileToString(IndexContent, *IndexPath))
+				{
+					Prompt += TEXT("### 索引\n\n");
+					Prompt += IndexContent;
+					Prompt += TEXT("\n\n");
+					TotalChars += IndexContent.Len();
+					LoadedCount++;
+				}
+			}
+
+			// 加载所有其他 .md（按字母序）
+			TArray<FString> MdFiles;
+			FileMgr.FindFiles(MdFiles, *ToolboxDir, TEXT(".md"));
+			MdFiles.Sort();
+
+			for (const FString& FileName : MdFiles)
+			{
+				if (FileName == TEXT("index.md")) continue;
+
+				FString FilePath = ToolboxDir / FileName;
+				FString FileContent;
+				if (FFileHelper::LoadFileToString(FileContent, *FilePath))
+				{
+					int32 Remaining = MaxTotalChars - TotalChars;
+					if (Remaining <= 0)
+					{
+						Prompt += FString::Printf(TEXT("<!-- 已达上限，剩余文件未加载: %s -->\n"), *FileName);
+						break;
+					}
+					if (FileContent.Len() > Remaining)
+					{
+						FileContent = FileContent.Left(Remaining) + TEXT("\n... (已截断)\n");
+					}
+					Prompt += FileContent;
+					Prompt += TEXT("\n");
+					TotalChars += FileContent.Len();
+					LoadedCount++;
+				}
+			}
+
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Loaded %d toolset docs from .mcptoolbox/ (%d chars)"), LoadedCount, TotalChars);
+		}
+		else
+		{
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] .mcptoolbox/ not found at %s — run fetch-mcp-toolsets.ps1 to pre-fetch toolset docs"), *ToolboxDir);
+		}
 	}
 	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
 	Prompt += TEXT("- **command** — 🚫 禁止用于py脚本。仅限纯控制台命令。\n\n");
