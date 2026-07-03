@@ -20,6 +20,7 @@ struct MCPTOOLBOX_API FMCPToolboxChatMessage
 	bool bIsStreaming = false;
 	bool bHasImageAttachment = false;
 	TArray<FString> ImageDataURIs;
+	TArray<FString> ImageFileNames;  // 原始文件名(用于UI显示+文本转换)
 	TArray<FString> FileAttachments;
 	FString ModelName;
 

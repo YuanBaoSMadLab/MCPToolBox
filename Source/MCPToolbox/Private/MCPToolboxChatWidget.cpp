@@ -4,6 +4,11 @@
 #include "MCPToolboxMemoryManager.h"
 #include "MCPToolboxScreenshot.h"
 #include "MCPToolboxAuxModelManager.h"
+#include "MCPToolboxErrorCodes.h"
+#include "MCPToolboxJsonValueHelper.h"
+#include "MCPToolboxTransactionService.h"
+#include "MCPToolboxPerformanceService.h"
+#include "MCPToolboxServiceRegistry.h"
 
 // Assistant library — only FunctionBuilder/FunctionTable (no HTTP layer)
 #include "assistant/function.hpp"
@@ -16,6 +21,9 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SBorder.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/SWindow.h"
+#include "Misc/MessageDialog.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Framework/Notifications/NotificationManager.h"
@@ -33,6 +41,9 @@
 #include "Interfaces/IHttpResponse.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+// Python infrastructure (移植自 VibeUE)
+#include "MCPToolboxPythonExecutionService.h"
+#include "MCPToolboxPythonDiscoveryService.h"
 
 #define LOCTEXT_NAMESPACE "MCPToolboxChat"
 
@@ -51,6 +62,10 @@ void SMCPToolboxChatWidget::Construct(const FArguments& InArgs)
 	// Restore persisted widget state (vision/sidebar/more-expanded) before any UI is built.
 	// bVisionModeEnabled etc. are reset above; LoadWidgetState overrides them from disk.
 	LoadWidgetState();
+
+	// 阶段 A1: 注册 SkillService 状态变更回调 — ToggleSkillEnabled 后触发 SaveWidgetState
+	// 解耦:SkillService 不依赖 widget,通过回调通知持久化
+	SkillService.SetStateChangedCallback([this]() { this->SaveWidgetState(); bSystemPromptDirty = true; });
 
 	// Load cached conversation summary (if user previously generated one) — injected into BuildSystemPrompt.
 	{
@@ -387,6 +402,27 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 						.ColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f))
 					]
 				]
+				// Image attachment indicator
+			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 4, 0, 0))
+			[
+				SNew(STextBlock)
+				.Visibility_Lambda([MsgCopy = Message]() -> EVisibility {
+					return (MsgCopy.bHasImageAttachment && MsgCopy.ImageFileNames.Num() > 0)
+						? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.Text_Lambda([MsgCopy = Message]() -> FText
+				{
+					FString Names;
+					for (int32 i = 0; i < MsgCopy.ImageFileNames.Num(); ++i)
+					{
+						if (i > 0) Names += TEXT(", ");
+						Names += MsgCopy.ImageFileNames[i];
+					}
+					return FText::FromString(FString::Printf(TEXT("[图片: %s]"), *Names));
+				})
+				.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
+				.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f))
+			]
 				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 6, 0, 0))
 				[
 					SAssignNew(TextBlock, SMultiLineEditableTextBox)
@@ -410,93 +446,94 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 // ============================================================================
 TSharedRef<SWidget> SMCPToolboxChatWidget::BuildInputArea()
 {
+	// ponytail: 单行布局 — 输入框 + 所有操作按钮同一行
+	// 原 Row 2(优化/退回/上传/清空)合并到输入行,2 行 → 1 行
 	return SNew(SBorder).Padding(FMargin(4))
 		[
-			SNew(SVerticalBox)
-			// Row 1: input box + send
-			+ SVerticalBox::Slot().AutoHeight()
+			SNew(SHorizontalBox)
+			// 输入框(占满宽度)
+			+ SHorizontalBox::Slot().FillWidth(1.0).VAlign(VAlign_Center).Padding(FMargin(0, 0, 4, 0))
 			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().FillWidth(1.0).Padding(FMargin(0, 0, 4, 0))
-				[
-					SAssignNew(InputTextBox, SMultiLineEditableTextBox)
-					.HintText(LOCTEXT("InputHint", "输入消息... 回车发送, Shift+回车换行"))
-					.OnKeyDownHandler(this, &SMCPToolboxChatWidget::OnInputKeyDown)
-				]
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(SButton)
-					.Text_Lambda([this]() { return bIsWaiting ? LOCTEXT("StopBtn", "停止") : LOCTEXT("SendBtn", "发送"); })
-					.OnClicked_Lambda([this]() { return bIsWaiting ? OnInterrupt() : OnSendMessage(); })
-					.ButtonColorAndOpacity_Lambda([this]() { return bIsWaiting ? FLinearColor(0.8f, 0.2f, 0.2f) : FLinearColor::White; })
-				]
+				SAssignNew(InputTextBox, SMultiLineEditableTextBox)
+				.HintText(LOCTEXT("InputHint", "输入消息... 回车发送, Shift+回车换行"))
+				.OnKeyDownHandler(this, &SMCPToolboxChatWidget::OnInputKeyDown)
 			]
-			// Row 2: action buttons (optimize / undo / upload / clear)
-			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 2, 0, 0))
+			// 优化按钮
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(0, 0, 2, 0))
 			[
-				SNew(SHorizontalBox)
-				// ── Prompt Optimization ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
-				[
-					SNew(SButton)
-					.Text_Lambda([this]() {
-						if (bOptimizingPrompt) return LOCTEXT("OptimizingBtn", "优化中...");
-						return LOCTEXT("OptimizeBtn", "优化");
-					})
-					.OnClicked(this, &SMCPToolboxChatWidget::OnOptimizePrompt)
-					.IsEnabled_Lambda([this]() {
-						return !bIsWaiting && !bOptimizingPrompt && FMCPToolboxAuxModelManager::Get().IsReady();
-					})
-					.ToolTipText_Lambda([this]() {
-					if (!FMCPToolboxAuxModelManager::Get().IsReady())
-						return LOCTEXT("OptimizeDisabledTooltip", "需要本地辅助模型运行");
-					return LOCTEXT("OptimizeTooltipFirst", "用本地辅助模型优化提示词(清晰化、结构化、补充约束,可能扩展或精简)");
+				SNew(SButton)
+				.Text_Lambda([this]() {
+					if (bOptimizingPrompt) return LOCTEXT("OptimizingBtn", "优化中...");
+					return LOCTEXT("OptimizeBtn", "优化");
 				})
-					.ButtonColorAndOpacity_Lambda([this]() {
-						if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
-						return (FMCPToolboxAuxModelManager::Get().IsReady())
-							? FLinearColor(0.3f, 0.15f, 0.5f) : FLinearColor(0.3f, 0.3f, 0.3f);
-					})
-				]
-				// ── Undo Optimization ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("UndoBtn", "退回"))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnUndoOptimization)
-					.IsEnabled_Lambda([this]() { return bPromptOptimized && !bOptimizingPrompt; })
-					.ToolTipText(LOCTEXT("UndoTooltip", "撤销优化，恢复原始提示词"))
-					.Visibility_Lambda([this]() { return bPromptOptimized ? EVisibility::Visible : EVisibility::Collapsed; })
-					.ButtonColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.2f))
-				]
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 4, 0))
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("UploadBtn", "上传"))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnUploadFile)
-					.IsEnabled_Lambda([this]() {
-						return bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady();
-					})
-					.ToolTipText_Lambda([this]() {
-						if (bVisionModeEnabled)
-							return LOCTEXT("UploadTooltip", "上传图片 (云端视觉)");
-						if (FMCPToolboxAuxModelManager::Get().IsReady())
-							return LOCTEXT("UploadVLMode", "上传图片 (本地 VL 分析)");
-						return LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式或确保辅助模型可用");
-					})
-					.ButtonColorAndOpacity_Lambda([this]() {
-						return (bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady())
-							? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
-					})
-				]
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(SButton).Text(LOCTEXT("ClearBtn", "清空"))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnClearChat)
-				]
+				.OnClicked(this, &SMCPToolboxChatWidget::OnOptimizePrompt)
+				.IsEnabled_Lambda([this]() {
+				return !bIsWaiting && !bOptimizingPrompt;
+			})
+			.ToolTipText_Lambda([this]() {
+				return LOCTEXT("OptimizeTooltipRemote", "用远程大模型优化提示词(去冗余+明确意图)");
+			})
+				.ButtonColorAndOpacity_Lambda([this]() {
+				if (bOptimizingPrompt) return FLinearColor(0.4f, 0.5f, 0.9f);
+				return FLinearColor(0.3f, 0.15f, 0.5f);
+			})
+				.ContentPadding(FMargin(6, 2))
+			]
+			// 退回按钮(仅 bPromptOptimized 时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(0, 0, 2, 0))
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("UndoBtn", "退回"))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnUndoOptimization)
+				.IsEnabled_Lambda([this]() { return bPromptOptimized && !bOptimizingPrompt; })
+				.ToolTipText(LOCTEXT("UndoTooltip", "撤销优化，恢复原始提示词"))
+				.Visibility_Lambda([this]() { return bPromptOptimized ? EVisibility::Visible : EVisibility::Collapsed; })
+				.ButtonColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.2f))
+				.ContentPadding(FMargin(6, 2))
+			]
+			// 上传按钮
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(0, 0, 2, 0))
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("UploadBtn", "上传"))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnUploadFile)
+				.IsEnabled_Lambda([this]() {
+					return bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady();
+				})
+				.ToolTipText_Lambda([this]() {
+					if (bVisionModeEnabled)
+						return LOCTEXT("UploadTooltip", "上传图片 (云端视觉)");
+					if (FMCPToolboxAuxModelManager::Get().IsReady())
+						return LOCTEXT("UploadVLMode", "上传图片 (本地 VL 分析)");
+					return LOCTEXT("UploadDisabledTooltip", "请先开启视觉模式或确保辅助模型可用");
+				})
+				.ButtonColorAndOpacity_Lambda([this]() {
+					return (bVisionModeEnabled || FMCPToolboxAuxModelManager::Get().IsReady())
+						? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f);
+				})
+				.ContentPadding(FMargin(6, 2))
+			]
+			// 清空按钮
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(0, 0, 2, 0))
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("ClearBtn", "清空"))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnClearChat)
+				.ContentPadding(FMargin(6, 2))
+			]
+			// 发送 / 停止按钮
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+			[
+				SNew(SButton)
+				.Text_Lambda([this]() { return bIsWaiting ? LOCTEXT("StopBtn", "停止") : LOCTEXT("SendBtn", "发送"); })
+				.OnClicked_Lambda([this]() { return bIsWaiting ? OnInterrupt() : OnSendMessage(); })
+				.ButtonColorAndOpacity_Lambda([this]() { return bIsWaiting ? FLinearColor(0.8f, 0.2f, 0.2f) : FLinearColor::White; })
+				.ContentPadding(FMargin(8, 4))
 			]
 		];
 }
+
+
 
 // ============================================================================
 // Send Message — builds messages, then delegates to SendAIRequest
@@ -533,7 +570,9 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 	{
 		UserMsg.bHasImageAttachment = true;
 		UserMsg.ImageDataURIs = PendingUploadURIs;
+		UserMsg.ImageFileNames = PendingUploadFileNames;
 		PendingUploadURIs.Empty();
+		PendingUploadFileNames.Empty();
 	}
 	AddMessage(UserMsg);
 	InputTextBox->SetText(FText::GetEmpty());
@@ -549,17 +588,25 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 	// so iterating Messages naturally includes it. Do NOT append it again.
 	TArray<TSharedPtr<FJsonValue>> Msgs;
 
-	// Always fresh system prompt (memory may have been updated)
+	// ponytail: cache system prompt — only rebuild when memory/skills/rules change
+	// BuildSystemPrompt reads three disk files (index.md, rules.md) which are expensive.
 	FString MemoryCtx = FMCPToolboxMemoryManager::Get().BuildMemoryContext();
-	FString SystemPrompt = BuildSystemPrompt(MemoryCtx);
+	if (bSystemPromptDirty || CachedSystemPromptMemoryKey != MemoryCtx)
+	{
+		CachedSystemPrompt = BuildSystemPrompt(MemoryCtx);
+		CachedSystemPromptMemoryKey = MemoryCtx;
+		bSystemPromptDirty = false;
+	}
 	TSharedPtr<FJsonObject> SysMsg = MakeShareable(new FJsonObject());
 	SysMsg->SetStringField(TEXT("role"), TEXT("system"));
-	SysMsg->SetStringField(TEXT("content"), SystemPrompt);
+	SysMsg->SetStringField(TEXT("content"), CachedSystemPrompt);
 	Msgs.Add(MakeShareable(new FJsonValueObject(SysMsg)));
 
 	// Append conversation history (includes the user message just added above)
-	for (const auto& Msg : Messages)
+	for (int32 MsgIdx = 0; MsgIdx < Messages.Num(); ++MsgIdx)
 	{
+		const auto& Msg = Messages[MsgIdx];
+
 		// Skip the welcome message — it's UI-only, not for LLM context
 		if (Msg.Role == EMCPToolboxMessageRole::Assistant &&
 			Msg.Content.StartsWith(TEXT("**欢迎使用 MCP Toolbox")))
@@ -577,25 +624,66 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		}
 		MsgObj->SetStringField(TEXT("role"), RoleStr);
 
+		// ponytail: image-to-text conversion — if this image has been analyzed
+		// (followed by an assistant message), replace base64 with text marker
+		// to avoid token waste and model-switching issues
+		bool bImageAlreadyAnalyzed = false;
+		if (Msg.bHasImageAttachment && Msg.ImageDataURIs.Num() > 0 && Msg.Role == EMCPToolboxMessageRole::User)
+		{
+			for (int32 j = MsgIdx + 1; j < Messages.Num(); ++j)
+			{
+				if (Messages[j].Role == EMCPToolboxMessageRole::Assistant &&
+					!Messages[j].Content.IsEmpty())
+				{
+					bImageAlreadyAnalyzed = true;
+					break;
+				}
+			}
+		}
+
 		if (Msg.bHasImageAttachment && Msg.ImageDataURIs.Num() > 0)
 		{
 			TArray<TSharedPtr<FJsonValue>> ContentArray;
 
-			TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
-			TextPart->SetStringField(TEXT("type"), TEXT("text"));
-			TextPart->SetStringField(TEXT("text"), Msg.Content);
-			ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
-
-			for (const FString& ImageURI : Msg.ImageDataURIs)
+			if (bImageAlreadyAnalyzed)
 			{
-				TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
-				ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+				// Replace image with text note — safe for non-vision models
+				FString TextContent = Msg.Content;
+				TextContent += TEXT("\n\n[图片已由AI分析");
+				if (Msg.ImageFileNames.Num() > 0)
+				{
+					TextContent += TEXT(": ");
+					for (int32 i = 0; i < Msg.ImageFileNames.Num(); ++i)
+					{
+						if (i > 0) TextContent += TEXT(", ");
+						TextContent += Msg.ImageFileNames[i];
+					}
+				}
+				TextContent += TEXT("]");
 
-				TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
-				ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
-				ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+				TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+				TextPart->SetStringField(TEXT("type"), TEXT("text"));
+				TextPart->SetStringField(TEXT("text"), TextContent);
+				ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+			}
+			else
+			{
+				TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+				TextPart->SetStringField(TEXT("type"), TEXT("text"));
+				TextPart->SetStringField(TEXT("text"), Msg.Content);
+				ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
 
-				ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+				for (const FString& ImageURI : Msg.ImageDataURIs)
+				{
+					TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+					ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+					TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+					ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
+					ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+					ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+				}
 			}
 
 			MsgObj->SetArrayField(TEXT("content"), ContentArray);
@@ -1022,25 +1110,22 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			TSharedPtr<int32> ChunkIndex = MakeShareable(new int32(0));
 			TSharedPtr<FString> DisplayBuffer = MakeShareable(new FString());
 			TSharedPtr<TArray<FString>> Chunks = MakeShareable(new TArray<FString>(MoveTemp(TextChunks)));
+			// Incremental auto-save counter — save every 20 ticks (~2 seconds)
+			TSharedPtr<int32> SaveCounter = MakeShareable(new int32(0));
 
 			FTSTicker::GetCoreTicker().AddTicker(
-			FTickerDelegate::CreateLambda([this, StreamPtr, ChunkIndex, DisplayBuffer, Chunks](float DeltaTime) -> bool
+			FTickerDelegate::CreateLambda([this, StreamPtr, ChunkIndex, DisplayBuffer, Chunks, SaveCounter](float DeltaTime) -> bool
 			{
 				if (bInterrupted || *ChunkIndex >= Chunks->Num())
 				{
 					StreamPtr->bIsStreaming = false;
 					StreamPtr->Content = *DisplayBuffer;
 					FMCPToolboxMemoryManager::Get().ExtractMemoriesFromResponse(*DisplayBuffer);
+				bSystemPromptDirty = true;  // memory changed, rebuild system prompt next request
 					bIsWaiting = false;
 					// Final rebuild to show cleaned markdown
 					RebuildChatDisplay();
 					// Persist the completed streaming message to the session.
-					// Previously this only called SaveCurrentSession(), which serializes
-					// Session->Messages — but the streaming message was added to the
-					// *widget's* Messages array via Messages.Add() at line 930 and never
-					// transferred into Session->Messages. As a result, every streaming AI
-					// reply was lost on editor restart or session switch.
-					// UpdateCurrentSessionWithMessage adds to Session->Messages AND saves.
 					UpdateCurrentSessionWithMessage(*StreamPtr);
 					RefreshSessionList();
 					StreamingMessageBox.Reset();
@@ -1069,20 +1154,27 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 					}
 					StreamPtr->Content = *DisplayBuffer;
 
-					// Update the text box directly instead of rebuilding everything
-					if (StreamingMessageBox.IsValid())
-					{
-						StreamingMessageBox->SetText(FText::FromString(*DisplayBuffer));
-						if (ChatScrollBox.IsValid())
-							ChatScrollBox->ScrollToEnd();
-					}
-					else
-					{
-						// Fallback: rebuild if text box reference is lost
-						RebuildChatDisplay();
-					}
+				// Update the text box directly instead of rebuilding everything
+				if (StreamingMessageBox.IsValid())
+				{
+					StreamingMessageBox->SetText(FText::FromString(*DisplayBuffer));
+					if (ChatScrollBox.IsValid())
+						ChatScrollBox->ScrollToEnd();
+				}
+				else
+				{
+					// Fallback: rebuild if text box reference is lost
+					RebuildChatDisplay();
+				}
 
-					return true;
+				// Incremental auto-save: persist streaming content every 20 ticks
+				(*SaveCounter)++;
+				if (*SaveCounter % 20 == 0)
+				{
+					UpdateCurrentSessionWithMessage(*StreamPtr);
+				}
+
+				return true;
 				}),
 				0.15f // ~150ms between batches, much smoother than 30ms
 			);
@@ -1303,7 +1395,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 							FMCPToolboxChatMessage ResultMsg;
 							ResultMsg.Role = EMCPToolboxMessageRole::System;
-							ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(500));
+							ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(2000));
 							AddMessage(ResultMsg);
 
 							(*PendingMCP)--;
@@ -1377,7 +1469,8 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 							ScreenshotMsg.Role = EMCPToolboxMessageRole::User;
 							ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
 							ScreenshotMsg.bHasImageAttachment = true;
-							ScreenshotMsg.ImageDataURIs.Add(DataURI);
+						ScreenshotMsg.ImageDataURIs.Add(DataURI);
+						ScreenshotMsg.ImageFileNames.Add(TEXT("screenshot.png"));
 							AddMessage(ScreenshotMsg);
 						}
 					}
@@ -1464,6 +1557,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 		Reply.Content = Content;
 		AddMessage(Reply);
 		FMCPToolboxMemoryManager::Get().ExtractMemoriesFromResponse(Content);
+	bSystemPromptDirty = true;  // memory changed
 		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 响应完成, %d chars, finish=%s"), Content.Len(), *FinishReason);
 
 		// If finish_reason is "length", AI was cut off — ask it to continue
@@ -1512,28 +1606,84 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 // ============================================================================
 FString SMCPToolboxChatWidget::ExecuteToolCall(const FString& ToolName, const FString& ArgsJson)
 {
-	// Fallback: local FunctionTable
+	// ── Stage 4: 结构化错误码 ──
 	if (!ToolFunctionTable.IsValid())
-		return TEXT(R"({"error":"FunctionTable not initialized"})");
+		return MCPToolboxErrorFormat::FormatGenericError(EMCPToolboxErrorCode::InternalError, TEXT("FunctionTable not initialized"));
+
+	// ── Stage 5: JsonValueHelper 容错层 ──
+	// 先用 UE 的 JSON 解析器解析 ArgsJson → FJsonObject
+	// 然后对 FJsonObject 应用 CoerceObject(字符串→强类型自动升级)
+	// 最后序列化回字符串,再用 nlohmann::json 解析传给 FunctionTable
+	FString CoercedArgsJson = ArgsJson;
+	if (!ArgsJson.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> ParsedObj;
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgsJson);
+		if (FJsonSerializer::Deserialize(Reader, ParsedObj) && ParsedObj.IsValid())
+		{
+			// 应用 CoerceObject — 递归将字符串值升级为强类型
+			TSharedPtr<FJsonObject> CoercedObj = FMCPToolboxJsonValueHelper::CoerceObject(ParsedObj);
+
+			// 序列化回字符串
+			FString OutputJson;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+			FJsonSerializer::Serialize(CoercedObj.ToSharedRef(), Writer);
+			CoercedArgsJson = OutputJson;
+		}
+		// 如果 UE JSON 解析失败,回退到原始 ArgsJson(nlohmann 会处理错误)
+	}
 
 	// Parse args
 	assistant::json Args;
 	try
 	{
-		if (!ArgsJson.IsEmpty())
-			Args = assistant::json::parse(TCHAR_TO_UTF8(*ArgsJson));
+		if (!CoercedArgsJson.IsEmpty())
+			Args = assistant::json::parse(TCHAR_TO_UTF8(*CoercedArgsJson));
 		else
 			Args = assistant::json::object();
 	}
+	catch (const std::exception&)
+	{
+		return MCPToolboxErrorFormat::FormatParamError(
+			EMCPToolboxErrorCode::ParamInvalidType,
+			TEXT("arguments"),
+			TEXT("object"),
+			ArgsJson,
+			TEXT("{\"example\":\"{\\\"name\\\":\\\"value\\\"}\"}")
+		);
+	}
 	catch (...)
 	{
-		return TEXT(R"({"error":"Failed to parse arguments JSON"})");
+		return MCPToolboxErrorFormat::FormatParamError(
+			EMCPToolboxErrorCode::ParamInvalidType,
+			TEXT("arguments"),
+			TEXT("object"),
+			ArgsJson
+		);
 	}
 
+	// ── Stage 4: 工具调用(FunctionTable.Call 内部处理不存在情况) ──
 	assistant::FunctionCall FC;
 	FC.name = TCHAR_TO_UTF8(*ToolName);
 	FC.args = Args;
 	assistant::FunctionResult Result = ToolFunctionTable->Call(FC);
+
+	// 如果工具返回错误,包装为结构化错误码(如果还不是结构化的)
+	if (Result.isError)
+	{
+		// 检查是否已经是结构化错误(含 error_code 字段)
+		FString ResultStr = UTF8_TO_TCHAR(Result.text.c_str());
+		if (!ResultStr.Contains(TEXT("error_code")))
+		{
+			// 包装为 TOOL_EXECUTION_FAILED
+			return MCPToolboxErrorFormat::FormatToolError(
+				EMCPToolboxErrorCode::ToolExecutionFailed,
+				ToolName,
+				ResultStr
+			);
+		}
+	}
+
 	return UTF8_TO_TCHAR(Result.text.c_str());
 }
 
@@ -1741,7 +1891,10 @@ FReply SMCPToolboxChatWidget::OnInterrupt()
 // ============================================================================
 FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 {
-	// Pre-allocate to avoid 30+ reallocations
+	// ── VibeUE-style lean system prompt (Stage 1 migration) ──
+	// 旧版注入 60K 字符的 .mcptoolbox/*.md 全量缓存 + 280 行硬编码规则 ≈ 15K tokens
+	// 新版只注入 index.md (~2K tokens) + rules.md (~3K tokens) ≈ 5K tokens
+	// 详细 toolset schema 通过 get_skills 虚拟工具懒加载(阶段 2 实现)
 	FString Prompt;
 	Prompt.Reserve(8192);
 
@@ -1755,208 +1908,45 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += FString::Printf(TEXT("- Content目录: %s\n"), *ContentPath);
 	Prompt += FString::Printf(TEXT("- 资源路径前缀: /Game/ (对应Content目录)\n\n"));
 
-	// ── CRITICAL: tool info source ──
-	// This block must come BEFORE any other rule. The user has repeatedly observed the
-	// LLM wasting turns calling list_toolsets / describe_toolset even though every
-	// toolset's schema is already injected below (from .mcptoolbox/*.md). Putting the
-	// prohibition at the very top maximises the chance the model obeys.
-	Prompt += TEXT("## ⚠ 最高优先级规则（违反=立即失败）\n");
-	Prompt += TEXT("1. **所有 MCP 工具的调用方式（toolset_name / tool_name / arguments schema）已在下方 \"MCP Toolset 缓存\" 章节完整给出**。\n");
-	Prompt += TEXT("2. **绝对禁止调用 list_toolsets 或 describe_toolset**。这两个工具在本会话中不可用、不需要、也不被允许。\n");
-	Prompt += TEXT("3. **需要调用工具时，直接 call_tool(toolset_name=..., tool_name=..., arguments={...})**。参数 schema 就在下方，照抄即可。\n");
-	Prompt += TEXT("4. 如果下方没有 \"MCP Toolset 缓存\" 章节（说明用户尚未点击\"刷新工具\"按钮），**请明确告知用户**：\"请先点击工具栏的 '更多 → 刷新工具' 按钮缓存工具集文档\"，然后停止。不要尝试自行发现工具。\n\n");
-
-	Prompt += TEXT("## 核心规则（必须100%遵守！违反规则=失败）\n");
-	Prompt += TEXT("1. **绝不空口承诺**：禁止说\"我来帮你\"等文字而不调用工具。说一次执行一次\n");
-	Prompt += TEXT("2. **先调用工具再说话**：收到指令→立即调用工具→拿到结果→回复用户。中间不允许纯文字\n");
-	Prompt += TEXT("3. **非工具不可**：创建材质/执行命令/截图/选择Actor—这些操作必须且只能通过工具完成\n");
-	Prompt += TEXT("4. **工具参数必填且正确**：路径加/Game/前缀，命令写完整\n");
-	Prompt += TEXT("5. ** 严禁 Python**：绝对禁止用 command(cmd=\"py ...\") 创建资产、材质、蓝图、PCG等编辑器操作。这些操作容易出错且不稳定。必须通过MCP工具完成。违者=失败！\n");
-	Prompt += TEXT("6. ** MCP工具已内置（禁止重复发现！）**：所有MCP工具已在下方'已发现MCP工具'完整列出。直接 call_tool 调用。list_toolsets/describe_toolset 不可用，也不要尝试调用。\n");
-	Prompt += TEXT("7. **command仅限控制台命令**：command只用于 HighResShot、stat fps 等纯控制台命令，绝不用于Python脚本。\n");
-	Prompt += TEXT("8. **主动记忆总结**：每完成一个有价值的任务或学到新经验后，在回复末尾**单独一行**输出以下任一格式以触发持久化记忆：\n");
-	Prompt += TEXT("   - `记住：xxx`（保存工具使用经验）\n");
-	Prompt += TEXT("   - `重要：xxx`（保存项目关键事实）\n");
-	Prompt += TEXT("   - `偏好：xxx`（保存用户偏好）\n");
-	Prompt += TEXT("   - `总结：xxx`（保存本次任务的核心经验）\n");
-	Prompt += TEXT("   - `经验：xxx`（保存踩坑/最佳实践）\n");
-	Prompt += TEXT("   示例：`记住：call_tool 创建材质时 toolset_name=unreal_editor_asset, tool_name=create_material`\n");
-	Prompt += TEXT("9. **视觉模式**：用户上传的图片和screenshot工具返回的截图，你都可以直接看到并分析。视觉模式开启时screenshot才可用。\n");
-	Prompt += TEXT("10. **工具调用必须通过 tool_calls 字段生成**：禁止在回复文字中用\"调用工具: call_tool\"或\"先查看 XX 的引脚：\"等方式描述工具调用。\n");
-	Prompt += TEXT("    如果你决定调用工具，content 可以为空或简短说明意图，然后**必须**在 tool_calls 字段中生成实际的工具调用 JSON。\n");
-	Prompt += TEXT("    在文字中说\"我要调用工具\"但不生成 tool_calls = 失败！系统会检测到并要求你重试，但反复重试浪费 token。\n\n");
-
-	Prompt += TEXT("##  效率规则（必须严格遵守！目标：减少round-trip，提高速度）\n");
-	Prompt += TEXT("1. **批量读取**：需要读取多个文件时，使用 batch_read_files 一次性读取，禁止逐个调用 read_file\n");
-	Prompt += TEXT("2. **并行工具调用**：如果有多个独立的工具需要调用（如搜索+读取、截图+inspect），在同一次响应中并行调用多个tool_calls，不要分多次\n");
-	Prompt += TEXT("3. **先搜索再读取**：需要找代码时，先用 search_codebase 搜索定位，再用 batch_read_files 批量读取，避免盲目读取大量文件\n");
-	Prompt += TEXT("4. **一次思考完整方案**：不要每次只想一步。先在脑海中规划好完整方案，然后一次性调用所有需要的工具\n");
-	Prompt += TEXT("5. **减少对话轮数**：目标是用最少的轮数完成任务。能一轮完成的绝不两轮，能两轮完成的绝不三轮\n");
-	Prompt += TEXT("6. **善用 glob_search**：找文件用 glob_search，比逐个目录 list_directory 快得多\n");
-	Prompt += TEXT("7. **工具调用是免费的**：不要因为怕调用工具而省着用。但要聪明地用——批量用、并行用、一次用对\n");
-	Prompt += TEXT("8. ** DAG 依赖式并行（LLMCompiler）**：当工具调用有依赖关系时，使用 $tN.xxx 引用语法声明依赖，系统会自动构建DAG并按层并行执行！\n");
-	Prompt += TEXT("   - 格式：每个工具调用可通过参数中的 $t1.result、$t2.data 等引用前面任务的结果\n");
-	Prompt += TEXT("   - 示例：t1=search_codebase(\"bug\"), t2=read_file(path=$t1.result[0]), t3=analyze(data=$t2.content)\n");
-	Prompt += TEXT("   - 执行方式：系统自动检测依赖，构建DAG，无依赖的任务并行执行，大幅提速\n");
-	Prompt += TEXT("   - 任务ID：使用 t1, t2, t3... 作为任务标识，在参数中用 $tN.field 引用\n\n");
-
-	Prompt += TEXT("## 工具优先级（从高到低，严格按此顺序）\n");
-	Prompt += TEXT("1. **MCP call_tool（直接调用！）**：工具已在下方列出，直接用 call_tool 调用。多个独立调用时一次性批量发出（多个tool_calls）\n");
-	Prompt += TEXT("2. **本地工具**：screenshot, select, inspect\n");
-	Prompt += TEXT("3. **command**：仅限控制台命令(HighResShot, stat等)，禁止py脚本\n\n");
-
+	// ── 工具列表(精简) ──
+	// 本地工具的简短描述,不展开 schema(用户问时再说)
 	Prompt += TEXT("## 工具列表\n");
-	Prompt += TEXT("### MCP工具（直接调用，无需发现）\n");
-	Prompt += TEXT("- **call_tool** — 调用MCP工具。参数: toolset_name (string), tool_name (string), arguments (object)。工具集和工具名见下方'已发现MCP工具'列表\n");
-	Prompt += TEXT("### 本地高效工具（优先使用，节省时间）\n");
-	Prompt += TEXT("- **batch_read_files** —  批量读取多个文件。参数: file_paths (array of strings)。**读取多个文件时必须用这个，禁止逐个读**\n");
-	Prompt += TEXT("- **search_codebase** —  搜索整个代码库。参数: pattern (string), path (可选), file_pattern (可选,默认*.cpp,*.h), max_results (可选,默认50)。**找代码先用这个**\n");
-	Prompt += TEXT("- **glob_search** —  按文件名模式搜索文件。参数: pattern (string, 如 *.cpp, **/*.h), path (可选)。**找文件用这个**\n");
-	Prompt += TEXT("- **list_directory** — 列出目录内容。参数: path (string)\n");
+	Prompt += TEXT("### MCP 工具(直接调用,无需发现)\n");
+	Prompt += TEXT("- **call_tool** — 调用 MCP 工具。参数: `toolset_name` (string), `tool_name` (string), `arguments` (object)。具体 toolset/tool 名见下方 \"MCP Toolset 索引\"。\n");
+	Prompt += TEXT("### Skill 懒加载工具(面对陌生任务必先用 list_skills)\n");
+	Prompt += TEXT("- **list_skills** — 列出所有可用 skill 的轻量摘要(name + description + toolset + keywords)。**面对陌生任务时必先调用此工具**发现可用 toolset。无参数。\n");
+	Prompt += TEXT("- **get_skills** — 加载指定 skill 的完整内容(含完整 schema、示例、Critical Rules)。参数: `skill_name` (string,来自 list_skills 结果)。结果会话级缓存(LRU,上限 5)。\n");
+	Prompt += TEXT("### 本地高效工具(优先使用,节省时间)\n");
+	Prompt += TEXT("- **batch_read_files** — 批量读取多个文件。参数: `file_paths` (array of strings)。**读取多个文件时必须用这个,禁止逐个读**\n");
+	Prompt += TEXT("- **search_codebase** — 搜索整个代码库。参数: `pattern` (string), `path` (可选), `file_pattern` (可选,默认 *.cpp,*.h), `max_results` (可选,默认 50)。**找代码先用这个**\n");
+	Prompt += TEXT("- **glob_search** — 按文件名模式搜索文件。参数: `pattern` (string, 如 *.cpp, **/*.h), `path` (可选)。**找文件用这个**\n");
+	Prompt += TEXT("- **list_directory** — 列出目录内容,**创建资产前必须先调用此工具查看目标文件夹**。参数: `path` (string, 如 /Game/Materials/)\n");
 	Prompt += TEXT("### 本地辅助工具\n");
-	Prompt += TEXT("- **screenshot** — 截取屏幕图片，你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
-	Prompt += TEXT("- **select** — 选择Actor。参数: name (string)\n");
-	Prompt += TEXT("- **inspect** — 检查选中Actor属性\n");
+	Prompt += TEXT("- **screenshot** — 截取屏幕图片,你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
+	Prompt += TEXT("- **select** — 选择 Actor。参数: `name` (string)\n");
+	Prompt += TEXT("- **inspect** — 检查选中 Actor 属性\n");
+	Prompt += TEXT("### 控制台工具\n");
+	Prompt += TEXT("- **command** — 纯控制台命令(HighResShot, stat, stat fps 等)\n\n");
+
+	// ── MCP Toolset 索引(从 .mcptoolbox/index.md 加载,~2K tokens) ──
+	// 这是唯一注入的 toolset 信息源。详细 schema 由 get_skills 懒加载(阶段 2)。
+	Prompt += TEXT("## MCP Toolset 索引\n\n");
+	Prompt += SkillService.LoadSkillIndex();
+	Prompt += TEXT("\n\n");
+
+	// ── 调用规则(从 .mcptoolbox/rules.md 加载,~3K tokens,WRONG/CORRECT 范式) ──
+	// 含 call_tool 约定、路径格式、批量调用、DAG 并行、记忆触发词、AI 行为准则(八荣八耻)
+	Prompt += TEXT("## 调用规则与行为准则\n\n");
+	Prompt += SkillService.LoadRulesMD();
+	Prompt += TEXT("\n\n");
 
 	// Inject cached MCP tool descriptions (built once, avoids repeated list_toolsets queries)
+	// 保留作为 fallback — 即使 .mcptoolbox/ 缓存不存在,LLM 仍能基于此调用 call_tool
 	if (!CachedMCPToolDescriptionsMD.IsEmpty())
 	{
-		Prompt += TEXT("\n");
 		Prompt += CachedMCPToolDescriptionsMD;
+		Prompt += TEXT("\n");
 	}
-
-	// ── 加载 .mcptoolbox/ 缓存（由工具栏"刷新工具"按钮预拉取生成）──
-	// 这些 MD 文件包含所有 toolset 的精确 call_tool 调用方式，避免 LLM 反复试探参数。
-	// 即使缓存不存在也不阻塞任务 — LLM 仍可基于 CachedMCPToolDescriptionsMD 调用 call_tool。
-	{
-		FString ToolboxDir = FPaths::ProjectDir() / TEXT(".mcptoolbox");
-		IFileManager& FileMgr = IFileManager::Get();
-		if (FileMgr.DirectoryExists(*ToolboxDir))
-		{
-			Prompt += TEXT("\n##  MCP Toolset 缓存（来自 .mcptoolbox/）\n");
-			Prompt += TEXT("> 以下文档由工具栏\"刷新工具\"按钮预拉取生成，已包含所有 toolset 的精确调用方式（toolset_name/tool_name/arguments）。\n");
-			Prompt += TEXT("> **不要调用 list_toolsets/describe_toolset** — 本章节已包含所有信息。\n");
-			Prompt += TEXT("> **关键**：toolset_name 是完整 toolset 路径（不含 tool_name），tool_name 是 toolset 中的工具名。\n\n");
-
-			int32 LoadedCount = 0;
-			int32 TotalChars = 0;
-			const int32 MaxTotalChars = 60000;  // ~15K tokens 上限
-
-			// 先加载 index.md（总索引）
-			FString IndexPath = ToolboxDir / TEXT("index.md");
-			if (FileMgr.FileExists(*IndexPath))
-			{
-				FString IndexContent;
-				if (FFileHelper::LoadFileToString(IndexContent, *IndexPath))
-				{
-					Prompt += TEXT("### 索引\n\n");
-					Prompt += IndexContent;
-					Prompt += TEXT("\n\n");
-					TotalChars += IndexContent.Len();
-					LoadedCount++;
-				}
-			}
-
-			// 加载所有其他 .md（按字母序）
-			TArray<FString> MdFiles;
-			FileMgr.FindFiles(MdFiles, *ToolboxDir, TEXT(".md"));
-			MdFiles.Sort();
-
-			for (const FString& FileName : MdFiles)
-			{
-				if (FileName == TEXT("index.md")) continue;
-
-				FString FilePath = ToolboxDir / FileName;
-				FString FileContent;
-				if (FFileHelper::LoadFileToString(FileContent, *FilePath))
-				{
-					int32 Remaining = MaxTotalChars - TotalChars;
-					if (Remaining <= 0)
-					{
-						Prompt += FString::Printf(TEXT("<!-- 已达上限，剩余文件未加载: %s -->\n"), *FileName);
-						break;
-					}
-					if (FileContent.Len() > Remaining)
-					{
-						FileContent = FileContent.Left(Remaining) + TEXT("\n... (已截断)\n");
-					}
-					Prompt += FileContent;
-					Prompt += TEXT("\n");
-					TotalChars += FileContent.Len();
-					LoadedCount++;
-				}
-			}
-
-			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Loaded %d toolset docs from .mcptoolbox/ (%d chars)"), LoadedCount, TotalChars);
-		}
-		else
-		{
-			// 缓存目录不存在 — 不阻塞任务。
-			// 把 call_tool 本身的调用格式（从 tools/list 预获取）塞进 prompt，
-			// 让 LLM 即使没有详细 toolset 文档也能正确构造 call_tool 调用。
-			// 推荐用户点"刷新工具"按钮自行构建完整文档。
-			Prompt += TEXT("\n## MCP Toolset 调用指南（预构建）\n");
-			Prompt += TEXT("> 详细 toolset 文档未缓存（`.mcptoolbox/` 目录不存在），但 call_tool 已可用。\n");
-			Prompt += TEXT("> 以下是 call_tool 的标准调用格式，可立即使用。\n\n");
-
-			Prompt += TEXT("### call_tool 参数\n");
-			Prompt += TEXT("- `toolset_name` (string, 必填): toolset 完整路径，**不含** tool_name\n");
-			Prompt += TEXT("  示例: `editor_toolset.toolsets.material.MaterialTools`\n");
-			Prompt += TEXT("- `tool_name` (string, 必填): 工具名（toolset 内的具体工具）\n");
-			Prompt += TEXT("  示例: `CreateMaterial`\n");
-			Prompt += TEXT("- `arguments` (object, 必填): 工具参数对象，嵌套在 arguments 字段内\n\n");
-
-			Prompt += TEXT("### 调用示例\n");
-			Prompt += TEXT("```json\n");
-			Prompt += TEXT("{\n");
-			Prompt += TEXT("  \"toolset_name\": \"editor_toolset.toolsets.material.MaterialTools\",\n");
-			Prompt += TEXT("  \"tool_name\": \"CreateMaterial\",\n");
-			Prompt += TEXT("  \"arguments\": {\n");
-			Prompt += TEXT("    \"name\": \"MyMaterial\",\n");
-			Prompt += TEXT("    \"path\": \"/Game/Materials\"\n");
-			Prompt += TEXT("  }\n");
-			Prompt += TEXT("}\n");
-			Prompt += TEXT("```\n\n");
-
-			Prompt += TEXT("### 常见 toolset 路径模式（参考，实际以刷新工具后获取为准）\n");
-			Prompt += TEXT("UE5 MCP 工具集通常按以下模式组织:\n");
-			Prompt += TEXT("- `editor_toolset.toolsets.material.MaterialTools` — 材质操作\n");
-			Prompt += TEXT("- `editor_toolset.toolsets.actor.ActorTools` — Actor 操作\n");
-			Prompt += TEXT("- `editor_toolset.toolsets.blueprint.BlueprintTools` — 蓝图操作\n");
-			Prompt += TEXT("- `editor_toolset.toolsets.file.FileTools` — 文件操作\n");
-			Prompt += TEXT("- `editor_toolset.toolsets.screenshot.ScreenshotTools` — 截图操作\n");
-			Prompt += TEXT("（以上为常见命名，实际 toolset_name 以用户点击\"刷新工具\"后缓存的文档为准）\n\n");
-
-			Prompt += TEXT("### 参数推断策略\n");
-			Prompt += TEXT("如不确定具体参数名，可参考通用命名约定:\n");
-			Prompt += TEXT("- 资源类: `name`, `path`, `content`\n");
-			Prompt += TEXT("- 变换类: `location`(x,y,z), `rotation`(pitch,yaw,roll), `scale`\n");
-			Prompt += TEXT("- 查询类: `query`, `filter`, `search_path`\n\n");
-
-			Prompt += TEXT("> **建议**: 让用户点击工具栏\"刷新工具\"按钮，可预拉取完整的 toolset 文档（含每个工具的精确参数 schema），避免参数试错。\n\n");
-		}
-	}
-	Prompt += TEXT("### 禁止使用（除非MCP完全不可用）\n");
-	Prompt += TEXT("- **command** —  禁止用于py脚本。仅限纯控制台命令。\n\n");
-
-	Prompt += TEXT("## 行为示例（正确 vs 错误）\n");
-	Prompt += TEXT("用户: 帮我创建自发光白色材质\n");
-	Prompt += TEXT(" 错误: 直接用 command(cmd=\"py ...\") (绕开MCP)\n");
-	Prompt += TEXT(" 正确: 从下方'已发现MCP工具'中找到材质工具 → call_tool 创建材质\n");
-	Prompt += TEXT(" 正确(MCP不可用时): command(cmd=\"py ...创建自发光材质...\")\n\n");
-
-	Prompt += TEXT("##  效率示例（快 vs 慢）\n");
-	Prompt += TEXT("用户: 帮我看看MCPToolboxChatWidget.h和MCPToolboxChatWidget.cpp里的工具调用相关代码\n");
-	Prompt += TEXT(" 慢: 先list_directory找文件 → read_file读.h → read_file读.cpp → 读了5轮\n");
-	Prompt += TEXT(" 快: search_codebase(\"ToolCall\") → 定位到相关行 → batch_read_files([两个文件]) → 1-2轮搞定\n\n");
-
-	Prompt += TEXT("用户: 帮我修改5个文件\n");
-	Prompt += TEXT(" 慢: 读文件1 → 改文件1 → 读文件2 → 改文件2 → ... 10轮\n");
-	Prompt += TEXT(" 快: batch_read_files(5个文件) → 一次性看完 → 并行调用5个call_tool改文件 → 2-3轮搞定\n\n");
-
-	Prompt += TEXT("用户: 搜索bug→读文件→分析→生成修复方案\n");
-	Prompt += TEXT(" 慢: search → read → analyze → report → 4轮\n");
-	Prompt += TEXT(" 快(DAG并行): t1=search, t2=search2(另一个关键词), t3=read(path=$t1.result[0]), t4=analyze(data=$t3.content) → 1轮(t1/t2并行, t3等t1, t4等t3)\n\n");
 
 	// ── Inject cached conversation summary (loaded from ~/.mcptoolbox/conversation_summary.md) ──
 	// This is the "archive" generated by the user via the "归档总结" button, persisted across restarts.
@@ -1985,36 +1975,6 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		Prompt += TEXT("\n");
 	}
 
-	Prompt += TEXT("## 记忆规则\n");
-	Prompt += TEXT("- 每次对话后必须用\"记住：xxx\"保存用户偏好、MCP工具使用经验\n");
-	Prompt += TEXT("- MCP工具调用成功的方法用\"记住：MCP工具 XXX 使用方法：...\"保存\n");
-	Prompt += TEXT("- 项目信息用\"重要：xxx\"保存\n");
-	Prompt += TEXT("- 用户偏好用\"偏好：xxx\"保存\n\n");
-
-	// ── 科学辩证观 — AI 行为准则（八荣八耻） ──
-	// 强制 AI 在每一轮决策前对照这套准则，避免瞎猜/浪费/破坏架构等典型问题。
-	Prompt += TEXT("## AI 行为准则\n");
-	Prompt += TEXT("> 每一轮决策前必须对照此准则自检；违反任意一条视为本轮失败。\n\n");
-	Prompt += TEXT("- 以认真查询为荣，以瞎猜接口为耻\n");
-	Prompt += TEXT("- 以寻求 MD 为荣，以浪费时间为耻\n");
-	Prompt += TEXT("- 以人类确认为荣，以模糊执行为耻\n");
-	Prompt += TEXT("- 以复用现有为荣，以创造求证为耻\n");
-	Prompt += TEXT("- 以诚信无知为荣，以假装理解为耻\n");
-	Prompt += TEXT("- 以遵循规范为荣，以破坏架构为耻\n");
-	Prompt += TEXT("- 以谨慎重构为荣，以盲目脚本为耻\n");
-	Prompt += TEXT("- 以备份数据为荣，以覆盖丢失为耻\n\n");
-	Prompt += TEXT("具体落地：\n");
-	Prompt += TEXT("1. 不确定的接口/路径/枚举值必须先 search/read 文件再使用，不得凭印象编写\n");
-	Prompt += TEXT("2. 项目内已有 .mcptoolbox/*.md 缓存（工具集说明、归档总结）必须先读再行动\n");
-	Prompt += TEXT("3. 涉及破坏性操作（删除/覆盖/重命名/批量修改）前必须先告知用户并获得确认\n");
-	Prompt += TEXT("4. 优先复用现有函数/工具/抽象，禁止为了\"清洁\"而创造新接口\n");
-	Prompt += TEXT("5. 不知道就说不知道，不得编造虚假 API 或参数\n");
-	Prompt += TEXT("6. 严格遵守项目硬约束（见上下文中的 project_memory）\n");
-	Prompt += TEXT("7. 重构必须最小化、谨慎进行，禁止\"顺手\"批量改架构\n");
-	Prompt += TEXT("8. 覆盖任何持久化文件（MD/JSON/配置）前必须先备份原文件\n\n");
-
-	Prompt += TEXT("## 格式\n");
-	Prompt += TEXT("- 工具执行完后用中文Markdown回复结果\n");
 	return Prompt;
 }
 
@@ -2315,13 +2275,13 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 				return {.isError = true, .text = R"({"error":"Missing path parameter"})"};
 
 			FString DirPath = UTF8_TO_TCHAR(Path.c_str());
-			
+
 			TArray<FString> Files;
 			TArray<FString> Dirs;
-			
+
 			IFileManager::Get().FindFiles(Files, *(DirPath / TEXT("*")), true, false);
 			IFileManager::Get().FindFiles(Dirs, *(DirPath / TEXT("*")), false, true);
-			
+
 			std::string Result = R"({"status":"ok","path":")" + Path + R"(","directories":[)";
 			for (int32 i = 0; i < Dirs.Num(); ++i)
 			{
@@ -2338,7 +2298,466 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			return {.isError = false, .text = Result};
 		}).Build());
 
-	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 已注册 %d 个MCP工具"), ToolFunctionTable->GetFunctionsCount());
+	// ── Stage 2: Skill lazy-loading virtual tools (VibeUE ListSkills/GetSkills protocol) ──
+	// list_skills: 列出所有可用 skill 的轻量摘要(name + description + toolset + keywords)
+	// 不返回 body — LLM 看完摘要后决定是否需要 get_skills 加载详细内容。
+	ToolFunctionTable->Add(assistant::FunctionBuilder("list_skills")
+		.SetDescription("List all available MCP toolset skills (lightweight summaries only). "
+			"Returns name + description + toolset + keywords for each skill in .mcptoolbox/toolsets/. "
+			"Does NOT include the skill body — use get_skills to load detailed content on demand. "
+			"Call this FIRST when facing an unfamiliar task to discover available toolsets.")
+		.SetCallback([this](const assistant::json& args) -> assistant::FunctionResult {
+			FString Result = SkillService.ListSkills();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	// get_skills: 按需加载指定 skill 的完整内容(frontmatter 已剥离)
+	// 会话级 LRU 缓存(上限 5),避免重复磁盘 IO。
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_skills")
+		.SetDescription("Load detailed content of a specific skill by name. "
+			"Returns the full skill body (frontmatter stripped) with complete tool schemas, "
+			"examples, and Critical Rules. Results are cached per-session (LRU, max 5). "
+			"Use after list_skills to get the detailed documentation for a specific toolset.")
+		.AddRequiredParam("skill_name", "Name of the skill to load (from list_skills result)", "string")
+		.SetCallback([this](const assistant::json& args) -> assistant::FunctionResult {
+			std::string StdName = args.value("skill_name", "");
+			if (StdName.empty())
+				return {.isError = true, .text = R"({"error":"Missing skill_name parameter"})"};
+			FString SkillName = UTF8_TO_TCHAR(StdName.c_str());
+			FString Result = SkillService.GetSkill(SkillName);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	// =====================================================================
+	// Transaction Service — 编辑器 Undo/Redo 工具 (Stage 6.1)
+	// 移植自 VibeUE UTransactionService,封装 GEditor->Trans
+	// 让 agent 可驱动 undo/redo、组合编辑、检查历史、重置缓冲区
+	// =====================================================================
+	ToolFunctionTable->Add(assistant::FunctionBuilder("undo")
+		.SetDescription("Undo the most recent editor transaction (Ctrl+Z equivalent). "
+			"Returns {success, undone} where undone=true if an undo was performed.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxTransactionService::Undo();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("redo")
+		.SetDescription("Redo the most recently undone transaction (Ctrl+Y equivalent). "
+			"Returns {success, redone} where redone=true if a redo was performed.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxTransactionService::Redo();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("undo_multiple")
+		.SetDescription("Undo the last N transactions. Returns {success, undone_count}.")
+		.AddRequiredParam("count", "Number of transactions to undo (must be positive)", "number")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			int32 Count = args.value("count", 1);
+			FString Result = FMCPToolboxTransactionService::UndoMultiple(Count);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("redo_multiple")
+		.SetDescription("Redo the last N undone transactions. Returns {success, redone_count}.")
+		.AddRequiredParam("count", "Number of transactions to redo (must be positive)", "number")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			int32 Count = args.value("count", 1);
+			FString Result = FMCPToolboxTransactionService::RedoMultiple(Count);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("begin_transaction")
+		.SetDescription("Begin a named transaction so subsequent edits collapse into a single undo step. "
+			"Must pair with end_transaction or cancel_transaction. Returns {success, transaction_index}.")
+		.AddOptionalParam("description", "Human-readable description of the transaction", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Desc = args.value("description", "");
+			FString Result = FMCPToolboxTransactionService::BeginTransaction(UTF8_TO_TCHAR(Desc.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("end_transaction")
+		.SetDescription("End the active transaction opened with begin_transaction. Returns {success, transaction_index}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxTransactionService::EndTransaction();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("cancel_transaction")
+		.SetDescription("Cancel the active transaction, rolling back everything since begin_transaction. "
+			"Implementation: End + Undo trick (GEditor->CancelTransaction only discards the record). "
+			"The reverted transaction remains as a redo candidate. Returns {success, rolled_back}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxTransactionService::CancelTransaction();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_transaction_state")
+		.SetDescription("Get a snapshot of the editor's undo/redo state. "
+			"Returns {success, can_undo, can_redo, undo_count, redo_count, next_undo_title, next_redo_title}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxTransactionService::GetState();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_transaction_history")
+		.SetDescription("List the undo history (most recent last). Each entry has title, queue_index, is_undone. "
+			"Returns {success, total_count, returned_count, history:[...]}.")
+		.AddOptionalParam("max_entries", "Maximum number of entries to return (default 20, 0=all)", "number")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			int32 Max = args.value("max_entries", 20);
+			FString Result = FMCPToolboxTransactionService::GetHistory(Max);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("reset_transaction_buffer")
+		.SetDescription("Reset (clear) the entire undo/redo buffer. Clears HISTORY ONLY — does NOT change "
+			"anything in the level/world. Returns {success}.")
+		.AddOptionalParam("reason", "Reason for resetting the buffer (logged)", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Reason = args.value("reason", "");
+			FString Result = FMCPToolboxTransactionService::ResetBuffer(UTF8_TO_TCHAR(Reason.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	// =====================================================================
+	// PerformanceService 工具注册 (Stage 6.2)
+	// 移植自 VibeUE UPerformanceService — 帧率诊断 + Unreal Insights trace
+	// 推荐流程: frame_timing 第一步(bound 判定) → start_trace → 复现 → stop_trace → analyse
+	// =====================================================================
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("frame_timing")
+		.SetDescription("Report Game/Render/RHI/GPU thread ms + a CPU-vs-GPU bound verdict and optimization hint "
+			"for the most recently rendered frame (the same data as the on-screen 'stat unit'). "
+			"RUN THIS FIRST in any frame-rate investigation — optimising the GPU does nothing if the frame is "
+			"game- or render-thread bound. Returns {game_thread_ms, render_thread_ms, rhi_thread_ms, gpu_ms, "
+			"frame_ms, fps, bound:GPU|RenderThread|GameThread, hint, pie_running, note}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxPerformanceService::FrameTiming();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("start_trace")
+		.SetDescription("Start an Unreal Insights trace to file. Call StopTrace when done, then Analyse to read results. "
+			"Returns {status:tracing, trace_file, channels, hint}.")
+		.AddOptionalParam("name", "Trace file name (without extension). Empty uses 'mcp_capture'.", "string")
+		.AddOptionalParam("channels", "Comma-separated trace channels (frame,cpu,gpu,log,loadtime,object,stats,bookmark,region). Empty uses defaults.", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Name = args.value("name", "");
+			std::string Channels = args.value("channels", "");
+			FString Result = FMCPToolboxPerformanceService::StartTrace(
+				UTF8_TO_TCHAR(Name.c_str()), UTF8_TO_TCHAR(Channels.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("stop_trace")
+		.SetDescription("Stop the active trace. Returns the trace file path and size in MB. "
+			"Returns {status:stopped, trace_file, file_size_mb, hint}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxPerformanceService::StopTrace();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_trace_status")
+		.SetDescription("Report whether a trace is active and which channels are enabled. "
+			"Returns {tracing, destination, active_channels, last_trace_file}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxPerformanceService::GetTraceStatus();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("trace_bookmark")
+		.SetDescription("Drop a named bookmark in the active trace. Useful for marking moments during profiling. "
+			"Returns {bookmark, status:ok}.")
+		.AddRequiredParam("name", "Bookmark name (visible in Unreal Insights)", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Name = args.value("name", "");
+			FString Result = FMCPToolboxPerformanceService::Bookmark(UTF8_TO_TCHAR(Name.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("trace_region_start")
+		.SetDescription("Begin a named region in the active trace. Pair with trace_region_end. "
+			"Useful for enclosing a workload you want to isolate in the trace timeline. "
+			"Returns {region, status:started}.")
+		.AddRequiredParam("name", "Region name", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Name = args.value("name", "");
+			FString Result = FMCPToolboxPerformanceService::RegionStart(UTF8_TO_TCHAR(Name.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("trace_region_end")
+		.SetDescription("End a named region in the active trace. Returns {region, status:ended}.")
+		.AddRequiredParam("name", "Region name (must match a region started by trace_region_start)", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Name = args.value("name", "");
+			FString Result = FMCPToolboxPerformanceService::RegionEnd(UTF8_TO_TCHAR(Name.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("analyse_performance")
+		.SetDescription("Read back a trace and/or the log and return a perf summary. "
+			"For trace: frame_count, avg_frame_ms, avg_fps, max_frame_ms, p95_frame_ms, worst_frames[10]. "
+			"For logs: total_lines, errors, warnings, pso_hitches, notable_lines[<=40]. "
+			"Returns combined object when source='both'.")
+		.AddOptionalParam("source", "Analysis source: 'trace', 'logs', or 'both' (default).", "string")
+		.AddOptionalParam("file", "Optional file path override; empty uses the last trace/log from start_trace/stop_trace.", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Source = args.value("source", "both");
+			std::string File = args.value("file", "");
+			FString Result = FMCPToolboxPerformanceService::Analyse(
+				UTF8_TO_TCHAR(Source.c_str()), UTF8_TO_TCHAR(File.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("start_standalone_trace")
+		.SetDescription("Launch the game as a separate standalone process with a trace attached "
+			"(representative readings that the editor viewport can't give). Connects back to the editor's "
+			"Unreal Trace Server. Returns {status, trace_file, log_file, channels, hint}.")
+		.AddOptionalParam("name", "Trace file name (without extension). Empty uses 'standalone_capture'.", "string")
+		.AddOptionalParam("channels", "Comma-separated trace channels. Empty uses defaults.", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Name = args.value("name", "");
+			std::string Channels = args.value("channels", "");
+			FString Result = FMCPToolboxPerformanceService::StartStandalone(
+				UTF8_TO_TCHAR(Name.c_str()), UTF8_TO_TCHAR(Channels.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("stop_standalone_trace")
+		.SetDescription("Stop the standalone process and finalise its trace/log. "
+			"Returns {status, trace_file, log_file, uts_store, hint}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxPerformanceService::StopStandalone();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_standalone_status")
+		.SetDescription("Report whether a standalone session is running and which trace/log it is writing. "
+			"Returns {running, last_trace_file, last_log_file}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxPerformanceService::GetStandaloneStatus();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	// =====================================================================
+	// Python 执行工具 (已禁用 — AI 总是绕过 MCP 直接用 Python,导致冲突和循环)
+	// 保留代码以备将来通过 command(cmd="py ...") 手动调用时使用
+	// =====================================================================
+	/*
+	ToolFunctionTable->Add(assistant::FunctionBuilder("execute_python_code")
+		.SetDescription("Execute Python code in the Unreal Editor. "
+			"WARNING: This is a LAST RESORT — only use when call_tool has NO matching MCP toolset. "
+			"Python cannot handle asset conflicts (will fail on existing objects), lacks transaction support, "
+			"and is slower than MCP. For materials, blueprints, actors, levels etc. ALWAYS prefer call_tool. "
+			"Returns: {success:true/false, output, error_message, execution_time_ms}.")
+		.AddRequiredParam("code", "Python code to execute", "string")
+		.AddOptionalParam("scope", "Execution scope: 'private' (isolated, default) or 'public' (shared console state)", "string")
+		.AddOptionalParam("timeout_ms", "Timeout in milliseconds (default: 30000)", "number")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Code = args.value("code", "");
+			if (Code.empty())
+				return {.isError = true, .text = R"({"error":"Missing code parameter"})"};
+
+			std::string ScopeStr = args.value("scope", "private");
+			EPythonFileExecutionScope Scope = (ScopeStr == "public")
+				? EPythonFileExecutionScope::Public : EPythonFileExecutionScope::Private;
+
+			int32 Timeout = args.value("timeout_ms", 30000);
+
+			auto ExecResult = FMCPToolboxPythonExecutionService::ExecuteCode(
+				UTF8_TO_TCHAR(Code.c_str()), Scope, Timeout);
+
+			if (ExecResult.IsError())
+			{
+				FString ErrJson = FString::Printf(TEXT("{\"error\":\"%s\",\"error_code\":\"%s\"}"),
+					*ExecResult.GetErrorMessage(), *ExecResult.GetErrorCode());
+				return {.isError = true, .text = TCHAR_TO_UTF8(*ErrJson)};
+			}
+
+			const auto& Data = ExecResult.GetValue();
+			FString OutJson = FString::Printf(
+				TEXT("{\"success\":true,\"output\":\"%s\",\"execution_time_ms\":%.1f}"),
+				*Data.Output, Data.ExecutionTimeMs);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*OutJson)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("evaluate_python")
+		.SetDescription("Evaluate a single Python expression. LAST RESORT — prefer call_tool. "
+			"Use only for quick value lookups when no MCP tool provides the info. "
+			"Returns {success:true, result:...}.")
+		.AddRequiredParam("expression", "Python expression to evaluate", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Expr = args.value("expression", "");
+			if (Expr.empty())
+				return {.isError = true, .text = R"({"error":"Missing expression parameter"})"};
+
+			auto EvalResult = FMCPToolboxPythonExecutionService::EvaluateExpression(
+				UTF8_TO_TCHAR(Expr.c_str()));
+
+			if (EvalResult.IsError())
+			{
+				FString ErrJson = FString::Printf(TEXT("{\"error\":\"%s\"}"), *EvalResult.GetErrorMessage());
+				return {.isError = true, .text = TCHAR_TO_UTF8(*ErrJson)};
+			}
+
+			const auto& Data = EvalResult.GetValue();
+			FString OutJson = FString::Printf(TEXT("{\"success\":true,\"result\":\"%s\"}"),
+				*Data.Result);
+			return {.isError = false, .text = TCHAR_TO_UTF8(*OutJson)};
+		}).Build());
+	*/
+
+	// =====================================================================
+	// Python 内省工具 (移植自 VibeUE PythonDiscoveryService)
+	// 让 LLM 发现 Python API、内省类/函数、搜索源码
+	// =====================================================================
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("discover_python_module")
+		.SetDescription("Discover members of the unreal Python module. Returns classes, functions, and constants "
+			"filtered by name pattern. Use this to understand what's available before calling specific APIs.")
+		.AddRequiredParam("filter", "Name pattern to filter (case-insensitive, e.g., 'Editor' or 'Blueprint')", "string")
+		.AddOptionalParam("include_classes", "Include class names (default: true)", "boolean")
+		.AddOptionalParam("include_functions", "Include function names (default: false)", "boolean")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Filter = args.value("filter", "");
+			bool bClasses = args.value("include_classes", true);
+			bool bFuncs = args.value("include_functions", false);
+
+			auto Result = FMCPToolboxPythonDiscoveryService::DiscoverUnrealModule(
+				1, UTF8_TO_TCHAR(Filter.c_str()), 200, bClasses, bFuncs);
+
+			if (Result.IsError())
+				return {.isError = true, .text = TCHAR_TO_UTF8(
+					*FString::Printf(TEXT("{\"error\":\"%s\"}"), *Result.GetErrorMessage()))};
+
+			const auto& Info = Result.GetValue();
+			FString Json;
+			Json.Reserve(4096);
+			Json += TEXT("{\"module\":\"unreal\",\"total_members\":");
+			Json.AppendInt(Info.TotalMembers);
+
+			Json += TEXT(",\"classes\":[");
+			for (int32 i = 0; i < Info.Classes.Num(); ++i)
+			{
+				if (i > 0) Json += TEXT(",");
+				Json += TEXT("\"") + Info.Classes[i] + TEXT("\"");
+			}
+			Json += TEXT("],\"functions\":[");
+			for (int32 i = 0; i < Info.Functions.Num(); ++i)
+			{
+				if (i > 0) Json += TEXT(",");
+				Json += TEXT("\"") + Info.Functions[i] + TEXT("\"");
+			}
+			Json += TEXT("]}");
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Json)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("discover_python_class")
+		.SetDescription("Introspect a Python class in the unreal module. Returns methods with signatures, "
+			"properties, base classes, and docstring. Use before calling class methods to verify they exist.")
+		.AddRequiredParam("class_name", "Class name (e.g., 'EditorActorSubsystem')", "string")
+		.AddOptionalParam("method_filter", "Filter methods by name (e.g., 'get|set|spawn')", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string ClassName = args.value("class_name", "");
+			std::string MethodFilter = args.value("method_filter", "");
+
+			auto Result = FMCPToolboxPythonDiscoveryService::DiscoverClass(
+				UTF8_TO_TCHAR(ClassName.c_str()),
+				UTF8_TO_TCHAR(MethodFilter.c_str()));
+
+			if (Result.IsError())
+				return {.isError = true, .text = TCHAR_TO_UTF8(
+					*FString::Printf(TEXT("{\"error\":\"%s\"}"), *Result.GetErrorMessage()))};
+
+			const auto& Info = Result.GetValue();
+			FString Json;
+			Json.Reserve(8192);
+			Json += FString::Printf(TEXT("{\"class\":\"%s\",\"full_path\":\"%s\",\"docstring\":\"%s\",\"is_abstract\":%s,"),
+				*Info.Name, *Info.FullPath, *Info.Docstring,
+				Info.bIsAbstract ? TEXT("true") : TEXT("false"));
+
+			Json += TEXT("\"base_classes\":[");
+			for (int32 i = 0; i < Info.BaseClasses.Num(); ++i)
+			{
+				if (i > 0) Json += TEXT(",");
+				Json += TEXT("\"") + Info.BaseClasses[i] + TEXT("\"");
+			}
+			Json += TEXT("],\"methods\":[");
+			for (int32 i = 0; i < Info.Methods.Num(); ++i)
+			{
+				if (i > 0) Json += TEXT(",");
+				const auto& M = Info.Methods[i];
+				Json += FString::Printf(TEXT("{\"name\":\"%s\",\"sig\":\"%s\"}"),
+					*M.Name, *M.Signature);
+			}
+			Json += TEXT("],\"properties\":[");
+			for (int32 i = 0; i < Info.Properties.Num(); ++i)
+			{
+				if (i > 0) Json += TEXT(",");
+				Json += TEXT("\"") + Info.Properties[i] + TEXT("\"");
+			}
+			Json += TEXT("]}");
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Json)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("discover_python_function")
+		.SetDescription("Introspect a Python function or method. Returns full signature with parameter names, "
+			"types, return type, and docstring. Use for 'class.method' paths like 'EditorActorSubsystem.spawn_actor'.")
+		.AddRequiredParam("function_path", "Function path (e.g., 'load_asset' or 'EditorActorSubsystem.spawn_actor')", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string FuncPath = args.value("function_path", "");
+			auto Result = FMCPToolboxPythonDiscoveryService::DiscoverFunction(
+				UTF8_TO_TCHAR(FuncPath.c_str()));
+
+			if (Result.IsError())
+				return {.isError = true, .text = TCHAR_TO_UTF8(
+					*FString::Printf(TEXT("{\"error\":\"%s\"}"), *Result.GetErrorMessage()))};
+
+			const auto& Info = Result.GetValue();
+			FString Json;
+			Json.Reserve(2048);
+			Json += FString::Printf(
+				TEXT("{\"name\":\"%s\",\"signature\":\"%s\",\"return_type\":\"%s\",\"docstring\":\"%s\",\"is_method\":%s}"),
+				*Info.Name, *Info.Signature, *Info.ReturnType,
+				*Info.Docstring,
+				Info.bIsMethod ? TEXT("true") : TEXT("false"));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Json)};
+		}).Build());
+
+	// =====================================================================
+	// Service Registry 内省工具 (Stage 6.4)
+	// 让 LLM 查询当前已注册的所有 Service,了解工具来源和归属
+	// =====================================================================
+
+	// 注册服务元数据到 Registry
+	FMCPToolboxServiceRegistry::Get().Register(FMCPToolboxTransactionService::GetServiceInfo());
+	FMCPToolboxServiceRegistry::Get().Register(FMCPToolboxPerformanceService::GetServiceInfo());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("list_services")
+		.SetDescription("List all registered Services with their metadata (name, description, source, tool_count). "
+			"Use this to understand which Services are available and how tools are grouped. "
+			"Returns {status:ok, count:N, services:[{name, description, source, tool_count}, ...]}.")
+		.SetCallback([](const assistant::json&) -> assistant::FunctionResult {
+			FString Result = FMCPToolboxServiceRegistry::Get().ListServices();
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	ToolFunctionTable->Add(assistant::FunctionBuilder("get_service_info")
+		.SetDescription("Get detailed info about a specific Service, including its full tool list. "
+			"Returns {status:ok, name, description, source, tool_count, tools:[...]}. "
+			"On unknown service returns SERVICE_NOT_FOUND with valid_services list for self-correction.")
+		.AddRequiredParam("service", "Service name (e.g., 'transaction', 'performance')", "string")
+		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Svc = args.value("service", "");
+			FString Result = FMCPToolboxServiceRegistry::Get().GetServiceInfo(UTF8_TO_TCHAR(Svc.c_str()));
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
+		}).Build());
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 已注册 %d 个MCP工具 (%d 个 Service)"),
+		ToolFunctionTable->GetFunctionsCount(), FMCPToolboxServiceRegistry::Get().GetServiceCount());
 }
 
 assistant::FunctionTable& SMCPToolboxChatWidget::GetFunctionTable()
@@ -2377,7 +2796,10 @@ FReply SMCPToolboxChatWidget::OnUploadFile()
 			FileList += FPaths::GetCleanFilename(F) + TEXT("\n");
 			FString URI = EncodeFileToDataURI(F);
 			if (!URI.IsEmpty())
+			{
 				PendingUploadURIs.Add(URI);
+				PendingUploadFileNames.Add(FPaths::GetCleanFilename(F));
+			}
 		}
 
 		// If input box is empty, inject a default prompt so OnSendMessage actually sends.
@@ -2427,105 +2849,202 @@ FReply SMCPToolboxChatWidget::OnOptimizePrompt()
 	FString CurrentText = InputTextBox->GetText().ToString().TrimStartAndEnd();
 	if (CurrentText.IsEmpty()) return FReply::Handled();
 
-	// Save original to undo buffer
+	const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+	if (!ActiveEntry)
+	{
+		FNotificationInfo Info(FText::FromString(TEXT("请先在 API密钥 页添加模型")));
+		Info.ExpireDuration = 3.0f;
+		FSlateNotificationManager::Get().AddNotification(Info);
+		return FReply::Handled();
+	}
+
+	// Save original for undo
 	UndoBuffer = CurrentText;
 	bOptimizingPrompt = true;
 	bPromptOptimized = false;
 
-	// ── Semantic optimization prompt ──
-	// Goal: make the prompt clearer, more specific, better structured — NOT just shorter.
-	// Allowed to expand (add details, constraints, format) when it improves clarity.
-	FString OptPrompt;
-	OptPrompt += TEXT("你是提示词工程师。请优化下面的用户输入,让它更清晰、更具体、更易执行。要求:\n");
-	OptPrompt += TEXT("1. 明确目标:说清要做什么、预期结果是什么\n");
-	OptPrompt += TEXT("2. 补充约束:如果输入模糊,根据上下文补充合理的细节约束(技术栈、格式、范围)\n");
-	OptPrompt += TEXT("3. 结构化:多个步骤或要求用编号列表组织\n");
-	OptPrompt += TEXT("4. 移除冗余:删除口语化重复表达,保留所有关键意图\n");
-	OptPrompt += TEXT("5. 保持中文,直接输出优化后的提示词,不要解释、不要前后缀、不要Markdown代码块\n\n");
-	OptPrompt += TEXT("用户输入:\n");
-	OptPrompt += CurrentText;
-	OptPrompt += TEXT("\n\n优化后:");
+	// Build API URL (same logic as SendAIRequestInternal for provider compatibility)
+	FString ApiKey;
+	FBase64::Decode(ActiveEntry->EncryptedKey, ApiKey);
+	FString ApiUrl = ActiveEntry->BaseURL;
 
-	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
+	if (ActiveEntry->ProviderId == TEXT("google"))
+	{
+		// Gemini: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+		if (ApiUrl.EndsWith(TEXT("/"))) ApiUrl.RemoveFromEnd(TEXT("/"));
+		ApiUrl += TEXT("/models/") + ActiveEntry->ModelId + TEXT(":generateContent?key=") + ApiKey;
+	}
+	else if (ActiveEntry->ProviderId == TEXT("baidu"))
+	{
+		if (!ApiUrl.Contains(TEXT("access_token=")))
+			ApiUrl += TEXT("?access_token=") + ApiKey;
+		if (!ApiUrl.EndsWith(TEXT("/chat/completions")))
+		{
+			if (ApiUrl.EndsWith(TEXT("/"))) ApiUrl.RemoveFromEnd(TEXT("/"));
+			ApiUrl += TEXT("/chat/completions");
+		}
+	}
+	else
+	{
+		if (!ApiUrl.EndsWith(TEXT("/chat/completions")))
+		{
+			if (ApiUrl.EndsWith(TEXT("/"))) ApiUrl.RemoveFromEnd(TEXT("/"));
+			ApiUrl += TEXT("/chat/completions");
+		}
+	}
+
+	// Build request: single system message + user text, no tools
+	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
+	if (ActiveEntry->ProviderId != TEXT("google"))
+		Body->SetStringField(TEXT("model"), ActiveEntry->ModelId);
+	Body->SetNumberField(TEXT("max_tokens"), 512);
+	Body->SetNumberField(TEXT("temperature"), 0.3);
+
+	TArray<TSharedPtr<FJsonValue>> Msgs;
+	if (ActiveEntry->ProviderId == TEXT("google"))
+	{
+		// Gemini uses "contents" array with "parts"
+		TSharedPtr<FJsonObject> SysPart = MakeShareable(new FJsonObject());
+		SysPart->SetStringField(TEXT("text"), TEXT("你是文案优化助手。将用户输入改写为更清晰简洁的表达,只做去冗余和明确意图,不添加原文没有的信息。直接输出改写结果。"));
+		TArray<TSharedPtr<FJsonValue>> SysParts;
+		SysParts.Add(MakeShareable(new FJsonValueObject(SysPart)));
+		TSharedPtr<FJsonObject> SysContent = MakeShareable(new FJsonObject());
+		SysContent->SetStringField(TEXT("role"), TEXT("user"));
+		SysContent->SetArrayField(TEXT("parts"), SysParts);
+		Msgs.Add(MakeShareable(new FJsonValueObject(SysContent)));
+
+		TSharedPtr<FJsonObject> UsrPart = MakeShareable(new FJsonObject());
+		UsrPart->SetStringField(TEXT("text"), CurrentText);
+		TArray<TSharedPtr<FJsonValue>> UsrParts;
+		UsrParts.Add(MakeShareable(new FJsonValueObject(UsrPart)));
+		TSharedPtr<FJsonObject> UsrContent = MakeShareable(new FJsonObject());
+		UsrContent->SetStringField(TEXT("role"), TEXT("user"));
+		UsrContent->SetArrayField(TEXT("parts"), UsrParts);
+		Msgs.Add(MakeShareable(new FJsonValueObject(UsrContent)));
+
+		Body->SetArrayField(TEXT("contents"), Msgs);
+	}
+	else
+	{
+		TSharedPtr<FJsonObject> Sys = MakeShareable(new FJsonObject());
+		Sys->SetStringField(TEXT("role"), TEXT("system"));
+		Sys->SetStringField(TEXT("content"), TEXT("你是文案优化助手。将用户输入改写为更清晰简洁的表达,只做去冗余和明确意图,不添加原文没有的信息。直接输出改写结果。"));
+		Msgs.Add(MakeShareable(new FJsonValueObject(Sys)));
+
+		TSharedPtr<FJsonObject> Usr = MakeShareable(new FJsonObject());
+		Usr->SetStringField(TEXT("role"), TEXT("user"));
+		Usr->SetStringField(TEXT("content"), CurrentText);
+		Msgs.Add(MakeShareable(new FJsonValueObject(Usr)));
+
+		Body->SetArrayField(TEXT("messages"), Msgs);
+	}
+
+	FString BodyStr;
+	TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&BodyStr);
+	FJsonSerializer::Serialize(Body.ToSharedRef(), W);
+
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+	Req->SetURL(ApiUrl);
+	Req->SetVerb(TEXT("POST"));
+	Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Req->SetHeader(TEXT("Content-Length"), FString::FromInt(BodyStr.Len()));
+	if (ActiveEntry->ProviderId != TEXT("google") && ActiveEntry->ProviderId != TEXT("baidu"))
+		Req->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + ApiKey);
+	Req->SetContentAsString(BodyStr);
+	Req->SetTimeout(30.0f);
+
 	TWeakPtr<SMultiLineEditableTextBox> WeakInput = InputTextBox;
 	FString OriginalText = CurrentText;
+	FString Provider = ActiveEntry->ProviderId;
 
-	AuxMgr.InferAsync(OptPrompt, 512,
-		[this, WeakInput, OriginalText](bool bSuccess, const FString& Output)
+	Req->OnProcessRequestComplete().BindLambda(
+		[this, WeakInput, OriginalText, Provider](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
 		{
 			bOptimizingPrompt = false;
 
-			if (!bSuccess || Output.IsEmpty())
+			if (!bOk || !Resp.IsValid() || Resp->GetResponseCode() != 200)
 			{
-				UndoBuffer.Empty();
-				FNotificationInfo Info(FText::FromString(TEXT("优化失败:辅助模型未响应")));
+				FNotificationInfo Info(FText::FromString(FString::Printf(TEXT("优化失败: HTTP %d"), Resp.IsValid() ? Resp->GetResponseCode() : 0)));
 				Info.ExpireDuration = 3.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
+				UndoBuffer.Empty();
 				return;
 			}
 
-			FString Cleaned = Output.TrimStartAndEnd();
-
-			// Strip common Markdown code fences if model added them despite instructions
-			if (Cleaned.StartsWith(TEXT("```")))
+			// Parse response
+			TSharedPtr<FJsonObject> RespObj;
+			TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(Resp->GetContentAsString());
+			if (!FJsonSerializer::Deserialize(R, RespObj))
 			{
-				int32 FirstNewline = Cleaned.Find(TEXT("\n"));
-				if (FirstNewline != INDEX_NONE) Cleaned = Cleaned.Mid(FirstNewline + 1);
-				if (Cleaned.EndsWith(TEXT("```")))
+				FNotificationInfo Info(FText::FromString(TEXT("优化失败:响应解析错误")));
+				Info.ExpireDuration = 3.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+				UndoBuffer.Empty();
+				return;
+			}
+
+			FString Content;
+			if (Provider == TEXT("google"))
+			{
+				// Gemini: candidates[0].content.parts[0].text
+				const TArray<TSharedPtr<FJsonValue>>* Candidates;
+				if (RespObj->TryGetArrayField(TEXT("candidates"), Candidates) && Candidates->Num() > 0)
 				{
-					Cleaned = Cleaned.LeftChop(3).TrimEnd();
+					const TSharedPtr<FJsonObject>* ContentObj;
+					if ((*Candidates)[0]->AsObject()->TryGetObjectField(TEXT("content"), ContentObj))
+					{
+						const TArray<TSharedPtr<FJsonValue>>* Parts;
+						if ((*ContentObj)->TryGetArrayField(TEXT("parts"), Parts) && Parts->Num() > 0)
+							(*Parts)[0]->AsObject()->TryGetStringField(TEXT("text"), Content);
+					}
+				}
+			}
+			else
+			{
+				// OpenAI-compatible: choices[0].message.content
+				const TArray<TSharedPtr<FJsonValue>>* Choices;
+				if (RespObj->TryGetArrayField(TEXT("choices"), Choices) && Choices->Num() > 0)
+				{
+					const TSharedPtr<FJsonObject>* MsgObj;
+					if ((*Choices)[0]->AsObject()->TryGetObjectField(TEXT("message"), MsgObj))
+						(*MsgObj)->TryGetStringField(TEXT("content"), Content);
 				}
 			}
 
-			// ── Garbage detection ──
-			// Reject if output contains the original text repeated many times (model looping).
-			// NOTE: We no longer reject "output > 3x original length" — optimization may
-			// legitimately expand the prompt (add details, structure, constraints).
-			int32 OrigCount = 0;
-			int32 Pos = 0;
-			FString CheckSub = OriginalText.Left(FMath::Min(20, OriginalText.Len()));
-			while ((Pos = Cleaned.Find(CheckSub, ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos)) != INDEX_NONE)
+			FString Cleaned = Content.TrimStartAndEnd();
+			// Strip Markdown fences
+			if (Cleaned.StartsWith(TEXT("```")))
 			{
-				OrigCount++;
-				Pos += CheckSub.Len();
+				int32 Nl = Cleaned.Find(TEXT("\n"));
+				if (Nl != INDEX_NONE) Cleaned = Cleaned.Mid(Nl + 1);
+				if (Cleaned.EndsWith(TEXT("```"))) Cleaned = Cleaned.LeftChop(3).TrimEnd();
 			}
 
-			// Reject only on: heavy repetition of original (>3x), or obvious meta-echoes
-			// (the model echoing prompt template fragments instead of producing output).
-			bool bIsGarbage = (OrigCount > 3) ||
-				Cleaned.Contains(TEXT("优化规则")) ||
-				Cleaned.Contains(TEXT("原始提示词")) ||
-				Cleaned.Contains(TEXT("用户输入中提取")) ||
-				Cleaned.Contains(TEXT("你是提示词工程师")) ||
-				Cleaned.Contains(TEXT("保持中文,直接输出"));
-
-			if (bIsGarbage || !WeakInput.IsValid())
+			if (Cleaned.IsEmpty() || Cleaned.Len() > OriginalText.Len() * 4)
 			{
-				UndoBuffer.Empty();
-				FNotificationInfo Info(FText::FromString(TEXT("优化结果不可用(模型输出无效),已自动恢复原文")));
-				Info.ExpireDuration = 4.0f;
+				FNotificationInfo Info(FText::FromString(TEXT("优化结果不可用,已保留原文")));
+				Info.ExpireDuration = 3.0f;
 				FSlateNotificationManager::Get().AddNotification(Info);
-				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Prompt optimization rejected (garbage): orig=%d chars, out=%d chars, repeats=%d"),
-					OriginalText.Len(), Cleaned.Len(), OrigCount);
+				UndoBuffer.Empty();
 				return;
 			}
 
-			// ── Acceptable output ──
-			WeakInput.Pin()->SetText(FText::FromString(Cleaned));
+			if (WeakInput.IsValid())
+			{
+				WeakInput.Pin()->SetText(FText::FromString(Cleaned));
+			}
 			bPromptOptimized = true;
 
-			FString Direction = (Cleaned.Len() < OriginalText.Len()) ? TEXT("精简") : TEXT("扩展");
 			FNotificationInfo Info(FText::FromString(FString::Printf(
-				TEXT("提示词已优化(%s, %d → %d 字符),不满意可点「退回」恢复原文"),
-				*Direction, OriginalText.Len(), Cleaned.Len())));
-			Info.ExpireDuration = 4.0f;
+				TEXT("已优化(%d→%d字符),不满意可点「退回」"), OriginalText.Len(), Cleaned.Len())));
+			Info.ExpireDuration = 3.0f;
 			FSlateNotificationManager::Get().AddNotification(Info);
-			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Prompt optimized (%d → %d chars, direction=%s)"),
-				OriginalText.Len(), Cleaned.Len(), *Direction);
 		});
 
+	Req->ProcessRequest();
 	return FReply::Handled();
 }
+
 
 FReply SMCPToolboxChatWidget::OnUndoOptimization()
 {
@@ -2557,25 +3076,30 @@ FReply SMCPToolboxChatWidget::OnRefreshToolCache()
 		return FReply::Handled();
 	}
 
-	FNotificationInfo Info(FText::FromString(TEXT("正在感知项目 MCP 工具集...")));
-	Info.ExpireDuration = 5.0f;
-	FSlateNotificationManager::Get().AddNotification(Info);
+	// Create a persistent notification that we can update with progress
+	FNotificationInfo ProgressInfo(FText::FromString(TEXT("正在获取工具集列表...")));
+	ProgressInfo.bFireAndForget = false;
+	ProgressInfo.ExpireDuration = 0.0f;
+	TSharedPtr<SNotificationItem> ProgressNotif = FSlateNotificationManager::Get().AddNotification(ProgressInfo);
 
 	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] OnRefreshToolCache: calling DiscoverRealTools..."));
 
 	MCPServerClient.DiscoverRealTools(
-		[this](const TArray<TSharedPtr<FJsonObject>>& Tools)
+		[this, ProgressNotif](const TArray<TSharedPtr<FJsonObject>>& Tools)
 		{
 			// Per project rules, MCP callbacks must execute on the game thread
 			// to prevent cross-thread Slate/UObject access.
 			AsyncTask(ENamedThreads::GameThread,
-				[this, Tools]()
+				[this, Tools, ProgressNotif]()
 				{
 					if (Tools.Num() == 0)
 					{
-						FNotificationInfo Err(FText::FromString(TEXT("未感知到任何 MCP 工具,请确认 UE5 MCP 服务器已启用")));
-						Err.ExpireDuration = 4.0f;
-						FSlateNotificationManager::Get().AddNotification(Err);
+						if (ProgressNotif.IsValid())
+						{
+							ProgressNotif->SetText(FText::FromString(TEXT("未感知到任何 MCP 工具,请确认 UE5 MCP 服务器已启用")));
+							ProgressNotif->SetCompletionState(SNotificationItem::CS_Fail);
+							ProgressNotif->ExpireAndFadeout();
+						}
 						return;
 					}
 
@@ -2610,14 +3134,33 @@ FReply SMCPToolboxChatWidget::OnRefreshToolCache()
 					CachedMCPToolDescriptionsMD = Md;
 
 					FString OkText = FString::Printf(
-						TEXT("已缓存 %d 个 toolset / %d 个工具到 .mcptoolbox/"),
+						TEXT("已缓存 %d 个 toolset / %d 个工具到 .mcptoolbox/ (下次系统提示词将自动加载)"),
 						Grouped.Num(), Tools.Num());
-					FNotificationInfo Ok(FText::FromString(OkText));
-					Ok.ExpireDuration = 4.0f;
-					FSlateNotificationManager::Get().AddNotification(Ok);
+					if (ProgressNotif.IsValid())
+					{
+						ProgressNotif->SetText(FText::FromString(OkText));
+						ProgressNotif->SetCompletionState(SNotificationItem::CS_Success);
+						ProgressNotif->ExpireAndFadeout();
+					}
 
 					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Toolset cache refreshed: %d toolsets, %d tools"),
 						Grouped.Num(), Tools.Num());
+				});
+		},
+		// OnProgress callback — called after each describe_toolset completes
+		[ProgressNotif](int32 Done, int32 Total, const FString& CurrentToolset)
+		{
+			AsyncTask(ENamedThreads::GameThread,
+				[ProgressNotif, Done, Total, CurrentToolset]()
+				{
+					if (ProgressNotif.IsValid())
+					{
+						FString ProgressText = FString::Printf(
+							TEXT("正在获取工具集 %d/%d: %s"),
+							Done, Total, *CurrentToolset);
+						ProgressNotif->SetText(FText::FromString(ProgressText));
+					}
+					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Refresh progress: %d/%d (%s)"), Done, Total, *CurrentToolset);
 				});
 		});
 
@@ -2626,12 +3169,20 @@ FReply SMCPToolboxChatWidget::OnRefreshToolCache()
 
 void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJsonObject>>& Tools)
 {
+	// ── VibeUE-style three-tier structure ──
+	// .mcptoolbox/
+	//   ├── index.md       (lean index ~2K tokens, ONLY file injected into system prompt)
+	//   ├── rules.md       (WRONG/CORRECT rules + scientific vibe, created once, user-editable)
+	//   └── toolsets/      (per-toolset detailed docs, lazy-loaded via get_skills)
+	//       ├── <toolset>.md (with YAML frontmatter)
+	//       └── ...
 	FString ToolboxDir = FPaths::ProjectDir() / TEXT(".mcptoolbox");
+	FString ToolsetsDir = ToolboxDir / TEXT("toolsets");
 
 	IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-	if (!PF.CreateDirectoryTree(*ToolboxDir))
+	if (!PF.CreateDirectoryTree(*ToolsetsDir))
 	{
-		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] WriteToolsetCacheToDisk: failed to create dir %s"), *ToolboxDir);
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] WriteToolsetCacheToDisk: failed to create dir %s"), *ToolsetsDir);
 		return;
 	}
 
@@ -2644,6 +3195,17 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 		S.ReplaceInline(TEXT("\\"), TEXT("_"));
 		S.ReplaceInline(TEXT(":"),  TEXT("_"));
 		return S;
+	};
+
+	// Extract short name from full toolset path (last segment after final '.')
+	auto ShortName = [](const FString& Ts) -> FString
+	{
+		int32 LastDot;
+		if (Ts.FindLastChar(TEXT('.'), LastDot))
+		{
+			return Ts.RightChop(LastDot + 1);
+		}
+		return Ts;
 	};
 
 	// Group tools by _toolset field (set by ExtractToolsFromDescribeResult)
@@ -2662,24 +3224,38 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 		Grouped[Ts].Add(Tool);
 	}
 
-	// Write index.md
+	// ── Write index.md (with YAML frontmatter, VibeUE-style) ──
+	// This is the ONLY file injected into system prompt by BuildSystemPrompt.
+	// Kept lean (~2K tokens) — detailed docs are lazy-loaded via get_skills().
 	FString Index;
-	Index += TEXT("# MCP Toolset 索引(运行时感知)\n\n");
-	Index += FString::Printf(TEXT("生成时间: %s\n"), *FDateTime::Now().ToString());
-	Index += FString::Printf(TEXT("工具集总数: %d, 工具总数: %d\n\n"), ToolsetOrder.Num(), Tools.Num());
+	Index += TEXT("---\n");
+	Index += FString::Printf(TEXT("generated_at: %s\n"), *FDateTime::Now().ToString());
+	Index += FString::Printf(TEXT("toolset_count: %d\n"), ToolsetOrder.Num());
+	Index += FString::Printf(TEXT("tool_count: %d\n"), Tools.Num());
+	Index += TEXT("---\n\n");
+	Index += TEXT("# MCP Toolset 索引\n\n");
 	Index += TEXT("## 工具集列表\n\n");
+	Index += TEXT("| Toolset | 工具数 | 描述 |\n");
+	Index += TEXT("|---------|-------|------|\n");
 	for (const FString& Ts : ToolsetOrder)
 	{
 		const TArray<TSharedPtr<FJsonObject>>& TsTools = Grouped[Ts];
-		Index += FString::Printf(TEXT("- **%s** (%d 个工具) — 详见 `%s.md`\n"),
-			*Ts, TsTools.Num(), *SafeFileName(Ts));
+		FString Summary;
+		if (TsTools.Num() > 0)
+		{
+			TsTools[0]->TryGetStringField(TEXT("description"), Summary);
+			Summary = Summary.Replace(TEXT("\n"), TEXT(" ")).Left(80);
+		}
+		Index += FString::Printf(TEXT("| `%s` | %d | %s |\n"),
+			*Ts, TsTools.Num(), *Summary);
 	}
 	Index += TEXT("\n## 调用约定\n\n");
 	Index += TEXT("使用 `call_tool` 工具调用,参数:\n");
 	Index += TEXT("- `toolset_name`: toolset 完整路径(如 `editor_toolset.toolsets.material.MaterialTools`),**不含** tool_name\n");
 	Index += TEXT("- `tool_name`: 工具名(如 `CreateMaterial`)\n");
-	Index += TEXT("- `arguments`: 工具参数对象,具体 schema 见各 toolset 的 MD 文件\n\n");
-	Index += TEXT("**禁止**调用 `list_toolsets` 或 `describe_toolset` — 该缓存已包含全部可用工具的 schema。\n");
+	Index += TEXT("- `arguments`: 工具参数对象,具体 schema 通过 `get_skills(skills=[\"<toolset_name>\"])` 按需加载\n\n");
+	Index += TEXT("**禁止**调用 `list_toolsets` 或 `describe_toolset` — 本索引已包含全部可用 toolset。\n");
+	Index += TEXT("**需要详细 schema 时**调用 `get_skills` 加载对应 toolset 文档(懒加载,节省 token)。\n");
 
 	FString IndexPath = ToolboxDir / TEXT("index.md");
 	if (!FFileHelper::SaveStringToFile(Index, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
@@ -2687,12 +3263,40 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 		UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Failed to write %s"), *IndexPath);
 	}
 
-	// Write one MD per toolset
+	// ── Write rules.md (only if missing — user may have customized it) ──
+	// Contains WRONG/CORRECT paradigm rules + scientific vibe (AI 行为准则).
+	// BuildSystemPrompt loads this file and injects it verbatim.
+	FString RulesPath = ToolboxDir / TEXT("rules.md");
+	if (!PF.FileExists(*RulesPath))
+	{
+		FString DefaultRules = FMCPToolboxSkillService::GenerateDefaultRulesMD();
+		if (!FFileHelper::SaveStringToFile(DefaultRules, *RulesPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Failed to write default %s"), *RulesPath);
+		}
+		else
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Created default rules.md at %s"), *RulesPath);
+		}
+	}
+
+	// ── Write one MD per toolset (with YAML frontmatter, in toolsets/ subdir) ──
+	// These are lazy-loaded by get_skills() — NOT injected into system prompt.
 	int32 WrittenFiles = 1; // index.md already written
 	for (const FString& Ts : ToolsetOrder)
 	{
 		const TArray<TSharedPtr<FJsonObject>>& TsTools = Grouped[Ts];
+		FString Short = ShortName(Ts);
+
 		FString Md;
+		// YAML frontmatter (VibeUE-style)
+		Md += TEXT("---\n");
+		Md += FString::Printf(TEXT("name: %s\n"), *Short);
+		Md += FString::Printf(TEXT("toolset: %s\n"), *Ts);
+		Md += FString::Printf(TEXT("tool_count: %d\n"), TsTools.Num());
+		Md += TEXT("keywords: []\n");
+		Md += TEXT("---\n\n");
+
 		Md += FString::Printf(TEXT("# Toolset: `%s`\n\n"), *Ts);
 		Md += FString::Printf(TEXT("工具数: %d\n\n"), TsTools.Num());
 		Md += TEXT("## 工具列表\n\n");
@@ -2745,7 +3349,7 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 		}
 
 		FString FileName = SafeFileName(Ts) + TEXT(".md");
-		FString FilePath = ToolboxDir / FileName;
+		FString FilePath = ToolsetsDir / FileName;
 		if (FFileHelper::SaveStringToFile(Md, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 		{
 			WrittenFiles++;
@@ -2756,9 +3360,24 @@ void SMCPToolboxChatWidget::WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJso
 		}
 	}
 
-	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] WriteToolsetCacheToDisk: wrote %d files to %s"),
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] WriteToolsetCacheToDisk: wrote %d files to %s (index.md + rules.md + toolsets/)"),
 		WrittenFiles, *ToolboxDir);
 }
+
+// ============================================================================
+// VibeUE-style Skill system helpers (Stage 1 migration)
+// ============================================================================
+// 设计参考: e:\YBAI\VibeUE\Content\Python\init_unreal.py (_parse_frontmatter)
+// 设计参考: e:\YBAI\VibeUE\Content\Skills\materials\SKILL.md (WRONG/CORRECT 范式)
+// ============================================================================
+
+// ============================================================================
+// Skill 相关方法已移至 FMCPToolboxSkillService (God Object 拆分阶段 A1)
+// - ParseFrontmatter / GenerateDefaultRulesMD / LoadRulesMD / LoadSkillIndex
+// - ListSkills / GetSkill / TouchSkillCache
+// - IsSkillDisabled / ToggleSkillEnabled
+// widget 通过 SkillService 成员委托调用,详见 MCPToolboxSkillService.h
+// ============================================================================
 
 // ============================================================================
 // Stubs & helpers
@@ -2796,136 +3415,137 @@ FReply SMCPToolboxChatWidget::OnToggleSidebar()
 // ============================================================================
 TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 {
+	// ponytail: 单行极简布局 — 原 3 行(模型/状态/按钮)压缩为 1 行
+	// 5 个状态 TextBlock 合并为单个紧凑标签(●/○ 前缀 + 悬停 tooltip)
 	RefreshEntryList();
 
 	return SNew(SBorder)
 		.Padding(FMargin(2))
 		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight()
+			SNew(SHorizontalBox)
+			// 模型下拉(占满宽度)
+			+ SHorizontalBox::Slot().FillWidth(1.0).VAlign(VAlign_Center)
 			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(0, 0, 6, 0))
+				SAssignNew(EntryComboBox, SComboBox<TSharedPtr<FString>>)
+				.OptionsSource(&EntryOptions)
+				.OnSelectionChanged(this, &SMCPToolboxChatWidget::OnEntrySelected)
+				.OnGenerateWidget(this, &SMCPToolboxChatWidget::GenerateEntryRow)
+				.Content()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("ModelLabel", "模型:"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 10))
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0).VAlign(VAlign_Center)
-				[
-					SAssignNew(EntryComboBox, SComboBox<TSharedPtr<FString>>)
-					.OptionsSource(&EntryOptions)
-					.OnSelectionChanged(this, &SMCPToolboxChatWidget::OnEntrySelected)
-					.OnGenerateWidget(this, &SMCPToolboxChatWidget::GenerateEntryRow)
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() -> FText
-						{
-							if (SelectedEntry.IsValid())
-								return FText::FromString(*SelectedEntry);
-							const FMCPToolboxAPIKeyEntry* Active = FMCPToolboxAPIManager::Get().GetActiveEntry();
-							if (Active)
-								return FText::FromString(FString::Printf(TEXT("%s - %s"), *Active->ProviderName, *Active->ModelId));
-							return LOCTEXT("NoModel", "未选择模型");
-						})
-					]
+					.Text_Lambda([this]() -> FText
+					{
+						if (SelectedEntry.IsValid())
+							return FText::FromString(*SelectedEntry);
+						const FMCPToolboxAPIKeyEntry* Active = FMCPToolboxAPIManager::Get().GetActiveEntry();
+						if (Active)
+							return FText::FromString(FString::Printf(TEXT("%s - %s"), *Active->ProviderName, *Active->ModelId));
+						return LOCTEXT("NoModel", "未选择模型");
+					})
 				]
 			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 2, 0, 0))
+			// 紧凑状态指示器(单 TextBlock,● 已就绪 / ○ 未就绪)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(8, 0, 4, 0))
 			[
-				SNew(SHorizontalBox)
-				// MCP status — static display, no auto-retry
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(0, 0, 12, 0))
-				[
-					SNew(STextBlock)
-					.Text_Lambda([this]() -> FText
-					{
-						if (MCPServerClient.IsConnected())
-							return LOCTEXT("MCPReady", "MCP就绪");
-						if (FMCPToolboxModule::IsMCPServerStarted())
-							return LOCTEXT("MCPStarting", "MCP连接中…");
-						return LOCTEXT("MCPOffline", "MCP未连接");
-					})
-					.ToolTipText_Lambda([this]() -> FText
-					{
-						if (MCPServerClient.IsConnected())
-							return LOCTEXT("MCPReadyTip", "MCP 服务器已连接，可调用工具");
-						if (FMCPToolboxModule::IsMCPServerStarted())
-							return LOCTEXT("MCPStartingTip", "MCP 服务器启动中，正在建立连接");
-						return LOCTEXT("MCPOfflineTip", "MCP 服务器未启动，点击'启动MCP'按钮");
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity_Lambda([this]() -> FLinearColor
-					{
-						if (MCPServerClient.IsConnected())
-							return FLinearColor(0.3f, 0.85f, 0.4f);
-						if (FMCPToolboxModule::IsMCPServerStarted())
-							return FLinearColor(1.0f, 0.8f, 0.2f);
-						return FLinearColor(0.5f, 0.5f, 0.5f);
-					})
-				]
-				// Aux Model status
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(10, 0, 0, 0))
-				[
-					SNew(STextBlock)
-					.Text_Lambda([]() -> FText
-					{
-						return FMCPToolboxAuxModelManager::Get().IsReady()
-							? LOCTEXT("AuxReady", "Aux就绪")
-							: LOCTEXT("AuxOffline", "Aux未就绪");
-					})
-					.ToolTipText_Lambda([]() -> FText
-					{
-						return FMCPToolboxAuxModelManager::Get().IsReady()
-							? LOCTEXT("AuxReadyTip", "本地辅助模型就绪（如 llama-server），可用于归档总结/视觉预处理")
-							: LOCTEXT("AuxOfflineTip", "本地辅助模型未就绪，归档总结将回退到主模型");
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity_Lambda([]() -> FLinearColor
-					{
-						return FMCPToolboxAuxModelManager::Get().IsReady()
-							? FLinearColor(0.3f, 0.85f, 0.4f)
-							: FLinearColor(0.4f, 0.4f, 0.4f);
-					})
-				]
-				// AI status
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(STextBlock)
-					.Text_Lambda([this]() -> FText
-					{
-						if (bIsWaiting)
-							return LOCTEXT("AIThinking", "AI…");
-						return LOCTEXT("AIIdle", "AI");
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity_Lambda([this]() -> FLinearColor
-					{
-						return bIsWaiting ? FLinearColor(1.0f, 0.8f, 0.2f) : FLinearColor(0.5f, 0.5f, 0.5f);
-					})
-				]
-				// Spacer pushes action buttons to the right edge
-				+ SHorizontalBox::Slot().FillWidth(1.0f)
-				[
-					SNew(SBox)
-				]
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(SButton)
-					.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
-					{
-						return bVisionModeEnabled ? FLinearColor(0.2f, 0.45f, 0.65f, 1.0f) : FLinearColor(0.13f, 0.13f, 0.15f, 1.0f);
-					})
-					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleVisionMode)
+				SNew(STextBlock)
+				.Text_Lambda([this]() -> FText
+				{
+					auto Ch = [](bool b) -> TCHAR { return b ? 0x25CF : 0x25CB; }; // ● / ○
+					FString S;
+					S += Ch(MCPServerClient.IsConnected());
+					S += TEXT("MCP  ");
+					S += Ch(FMCPToolboxAuxModelManager::Get().IsReady());
+					S += TEXT("Aux  ");
+					IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
+					S += Ch(Py && Py->IsPythonAvailable());
+					S += TEXT("Py  ");
+					const bool bHasMem = !CachedMemorySummary.IsEmpty() || !CachedToolsSummary.IsEmpty();
+					S += Ch(bHasMem);
+					S += TEXT("Mem");
+					if (bIsWaiting) { S += TEXT("  "); S += Ch(true); S += TEXT(" AI..."); }
+					return FText::FromString(S);
+				})
+				.ToolTipText_Lambda([this]() -> FText
+				{
+					FString T;
+					T += FString::Printf(TEXT("MCP: %s\n"), MCPServerClient.IsConnected() ? TEXT("已连接") : TEXT("未连接"));
+					T += FString::Printf(TEXT("Aux: %s\n"), FMCPToolboxAuxModelManager::Get().IsReady() ? TEXT("就绪") : TEXT("未就绪"));
+					IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
+					T += FString::Printf(TEXT("Py:  %s\n"), (Py && Py->IsPythonAvailable()) ? TEXT("可用") : TEXT("不可用"));
+					const bool bHasMem = !CachedMemorySummary.IsEmpty() || !CachedToolsSummary.IsEmpty();
+					T += FString::Printf(TEXT("Mem: %s"), bHasMem ? TEXT("有内容") : TEXT("为空"));
+					return FText::FromString(T);
+				})
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+				.ColorAndOpacity_Lambda([this]() -> FLinearColor
+				{
+					return bIsWaiting ? FLinearColor(1.0f, 0.8f, 0.2f) : FLinearColor(0.55f, 0.7f, 0.6f);
+				})
+			]
+			// 侧栏按钮
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
 				.ContentPadding(FMargin(6, 2))
-				.ToolTipText(LOCTEXT("VisionTooltip", "切换视觉模式: 启用后可处理图片输入"))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
+				.ToolTipText(LOCTEXT("SidebarTooltip", "显示/隐藏会话历史侧边栏"))
 				.Content()
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() -> FText
-						{
-							return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "视觉开") : LOCTEXT("VisionDisabled", "视觉");
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this]() -> FText
+					{
+						return bSidebarCollapsed ? LOCTEXT("SidebarShow", "侧栏") : LOCTEXT("SidebarHide", "侧栏");
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+				]
+			]
+			// 更多按钮(展开后显示:视觉/获取工具/归档总结/Skill)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked_Lambda([this]() -> FReply
+				{
+					bMoreExpanded = !bMoreExpanded;
+					SaveWidgetState();
+					return FReply::Handled();
+				})
+				.ToolTipText(LOCTEXT("MoreTooltip", "展开/收起更多操作"))
+				.Content()
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this]() -> FText
+					{
+						return bMoreExpanded ? LOCTEXT("MoreCollapse", "收起") : LOCTEXT("MoreExpand", "更多");
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+				]
+			]
+			// 视觉(展开时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Visibility_Lambda([this]() -> EVisibility
+				{
+					return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
+				{
+					return bVisionModeEnabled ? FLinearColor(0.2f, 0.45f, 0.65f, 1.0f) : FLinearColor(0.13f, 0.13f, 0.15f, 1.0f);
+				})
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnToggleVisionMode)
+				.ToolTipText(LOCTEXT("VisionTooltip", "切换视觉模式"))
+				.Content()
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this]() -> FText
+					{
+						return bVisionModeEnabled ? LOCTEXT("VisionEnabled", "视觉开") : LOCTEXT("VisionDisabled", "视觉");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					.ColorAndOpacity_Lambda([this]() -> FLinearColor
@@ -2933,97 +3553,70 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 						return bVisionModeEnabled ? FLinearColor(0.9f, 0.95f, 1.0f) : FLinearColor(0.7f, 0.7f, 0.7f);
 					})
 				]
-				]
-				// ── "更多" toggle: expands/collapses the secondary action buttons (Sidebar/RefreshTool) ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
+			]
+			// 获取工具(展开时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Visibility_Lambda([this]() -> EVisibility
+				{
+					return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
+				.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "获取 MCP 服务器所有工具集用法并缓存为 .mcptoolbox/*.md"))
+				.Content()
 				[
-					SNew(SButton)
-					.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
-					.ContentPadding(FMargin(6, 2))
-					.OnClicked_Lambda([this]() -> FReply
-					{
-						bMoreExpanded = !bMoreExpanded;
-						SaveWidgetState();
-						return FReply::Handled();
-					})
-					.ToolTipText(LOCTEXT("MoreTooltip", "展开/收起更多操作"))
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() -> FText
-						{
-							return bMoreExpanded ? LOCTEXT("MoreCollapse", "收起") : LOCTEXT("MoreExpand", "更多");
-						})
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-						.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
-					]
+					SNew(STextBlock)
+					.Text(LOCTEXT("RefreshToolCacheBtn", "获取工具"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
 				]
-				// ── Sidebar toggle (visible only when "更多" is expanded) ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(6, 0, 0, 0))
+			]
+			// 归档总结(展开时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Visibility_Lambda([this]() -> EVisibility
+				{
+					return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.ButtonColorAndOpacity(FLinearColor(0.25f, 0.20f, 0.35f, 1.0f))
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnArchiveSummary)
+				.ToolTipText(LOCTEXT("ArchiveSummaryTooltip", "总结当前会话并归档，下次启动自动加载"))
+				.Content()
 				[
-					SNew(SButton)
-					.Visibility_Lambda([this]() -> EVisibility
-					{
-						return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
-					})
-					.ButtonColorAndOpacity(FLinearColor(0.13f, 0.13f, 0.15f, 1.0f))
-					.ContentPadding(FMargin(6, 2))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnToggleSidebar)
-					.ToolTipText(LOCTEXT("SidebarTooltip", "显示/隐藏会话历史侧边栏"))
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() -> FText
-						{
-							return bSidebarCollapsed ? LOCTEXT("SidebarShow", "显示侧栏") : LOCTEXT("SidebarHide", "隐藏侧栏");
-						})
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-						.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
-					]
+					SNew(STextBlock)
+					.Text(LOCTEXT("ArchiveSummaryBtn", "归档总结"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.90f, 0.85f, 0.95f))
 				]
-				// ── Refresh MCP Toolset Cache: discovers all toolsets and writes them to <ProjectDir>/.mcptoolbox/*.md ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
+			]
+			// Skill 管理(展开时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Visibility_Lambda([this]() -> EVisibility
+				{
+					return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.ButtonColorAndOpacity(FLinearColor(0.20f, 0.30f, 0.35f, 1.0f))
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked(this, &SMCPToolboxChatWidget::OnOpenSkillManager)
+				.ToolTipText(LOCTEXT("SkillManagerTooltip", "管理 skill 启用/禁用"))
+				.Content()
 				[
-					SNew(SButton)
-					.Visibility_Lambda([this]() -> EVisibility
-					{
-						return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
-					})
-					.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
-					.ContentPadding(FMargin(6, 2))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnRefreshToolCache)
-					.ToolTipText(LOCTEXT("RefreshToolCacheTooltip", "感知当前项目启用的所有 MCP 工具集，缓存为 .mcptoolbox/*.md 供 AI 直接调用，省去询问 list_toolsets/describe_toolset 的时间"))
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("RefreshToolCacheBtn", "刷新工具"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-						.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
-					]
+					SNew(STextBlock)
+					.Text(LOCTEXT("SkillManagerBtn", "Skill"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.95f))
 				]
-				// ── Archive Summary: generate a conversation summary and store it to ~/.mcptoolbox/ ──
-				+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4, 0, 0, 0))
-				[
-					SNew(SButton)
-					.Visibility_Lambda([this]() -> EVisibility
-					{
-						return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
-					})
-					.ButtonColorAndOpacity(FLinearColor(0.25f, 0.20f, 0.35f, 1.0f))
-					.ContentPadding(FMargin(6, 2))
-					.OnClicked(this, &SMCPToolboxChatWidget::OnArchiveSummary)
-					.ToolTipText(LOCTEXT("ArchiveSummaryTooltip", "总结当前会话并归档到 ~/.mcptoolbox/。下次启动自动加载到系统提示词，避免每次重复说明上下文"))
-					.Content()
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("ArchiveSummaryBtn", "归档总结"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-						.ColorAndOpacity(FLinearColor(0.90f, 0.85f, 0.95f))
-					]
-				]
-		]
-	];
+			]
+		];
 }
+
 // ============================================================================
 // Entry Selection
 // ============================================================================
@@ -3233,6 +3826,148 @@ void SMCPToolboxChatWidget::ConvertToolCallsToDAGFormat(
 	}
 }
 
+// ============================================================================
+// DAG $tN.field.path Resolution — Stage 5 subtask
+// ============================================================================
+TSharedPtr<FJsonValue> SMCPToolboxChatWidget::ResolveDAGFieldPath(const FString& ResultJsonStr, const FString& FieldPath)
+{
+	// 无字段路径 → 返回整个结果解析为 FJsonValue
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResultJsonStr);
+	TSharedPtr<FJsonValue> Root;
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		// 结果不是合法 JSON — 作为字符串值返回
+		return MakeShared<FJsonValueString>(ResultJsonStr);
+	}
+
+	// FieldPath 为空 → 返回整个根值
+	if (FieldPath.IsEmpty())
+	{
+		return Root;
+	}
+
+	TSharedPtr<FJsonValue> Current = Root;
+	FString Remaining = FieldPath;
+
+	// 按 '.' 分割路径,每段支持 "field" 或 "field[index]" 或 "[index]"
+	while (!Remaining.IsEmpty() && Current.IsValid())
+	{
+		FString Token;
+		int32 DotIdx;
+		if (Remaining.FindChar(TEXT('.'), DotIdx))
+		{
+			Token = Remaining.Left(DotIdx);
+			Remaining = Remaining.Mid(DotIdx + 1);
+		}
+		else
+		{
+			Token = Remaining;
+			Remaining = TEXT("");
+		}
+
+		if (Token.IsEmpty())
+			continue;
+
+		// 分离字段名与数组索引后缀: "field[0][1]" → FieldName="field", Indices=[0,1]
+		FString FieldName;
+		TArray<int32> ArrayIndices;
+		int32 FirstBracket = Token.Find(TEXT("["));
+		if (FirstBracket != INDEX_NONE)
+		{
+			FieldName = Token.Left(FirstBracket);
+			FString IndexPart = Token.Mid(FirstBracket);
+			// 解析所有 [N] 后缀
+			int32 Pos = 0;
+			while (Pos < IndexPart.Len())
+			{
+				int32 Open = IndexPart.Find(TEXT("["), ESearchCase::IgnoreCase, ESearchDir::FromStart, Pos);
+				if (Open == INDEX_NONE) break;
+				int32 Close = IndexPart.Find(TEXT("]"), ESearchCase::IgnoreCase, ESearchDir::FromStart, Open + 1);
+				if (Close == INDEX_NONE) break;
+				FString IdxStr = IndexPart.Mid(Open + 1, Close - Open - 1);
+				int32 ArrIdx = FCString::Atoi(*IdxStr);
+				ArrayIndices.Add(ArrIdx);
+				Pos = Close + 1;
+			}
+		}
+		else
+		{
+			FieldName = Token;
+		}
+
+		// 1) 取字段(如果 FieldName 非空)
+		if (!FieldName.IsEmpty())
+		{
+			if (Current->Type != EJson::Object)
+				return nullptr;
+			Current = Current->AsObject()->TryGetField(FieldName);
+			if (!Current.IsValid())
+				return nullptr;
+		}
+
+		// 2) 按数组索引依次取元素
+		for (int32 ArrIdx : ArrayIndices)
+		{
+			if (!Current.IsValid() || Current->Type != EJson::Array)
+				return nullptr;
+			const TArray<TSharedPtr<FJsonValue>>& Arr = Current->AsArray();
+			if (ArrIdx < 0 || ArrIdx >= Arr.Num())
+				return nullptr;
+			Current = Arr[ArrIdx];
+		}
+	}
+
+	return Current;
+}
+
+void SMCPToolboxChatWidget::SetResolvedParam(TSharedPtr<FJsonObject>& Target, const FString& Key, const TSharedPtr<FJsonValue>& Value)
+{
+	if (!Target.IsValid() || !Value.IsValid())
+		return;
+
+	switch (Value->Type)
+	{
+	case EJson::String:
+		Target->SetStringField(Key, Value->AsString());
+		break;
+	case EJson::Number:
+		Target->SetNumberField(Key, Value->AsNumber());
+		break;
+	case EJson::Boolean:
+		Target->SetBoolField(Key, Value->AsBool());
+		break;
+	case EJson::Object:
+		Target->SetObjectField(Key, Value->AsObject());
+		break;
+	case EJson::Array:
+		Target->SetArrayField(Key, Value->AsArray());
+		break;
+	case EJson::Null:
+		Target->SetField(Key, MakeShared<FJsonValueNull>());
+		break;
+	default:
+		// 兜底:序列化为字符串
+		{
+			FString JsonStr;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonStr);
+			if (Value->Type == EJson::Array)
+			{
+				FJsonSerializer::Serialize(Value->AsArray(), Writer);
+			}
+			else if (Value->Type == EJson::Object && Value->AsObject().IsValid())
+			{
+				FJsonSerializer::Serialize(Value->AsObject().ToSharedRef(), Writer);
+			}
+			Writer->Close();
+			Target->SetStringField(Key, JsonStr);
+			break;
+		}
+	}
+}
+
+// ============================================================================
+// Execute Tool Calls DAG — parallel scheduling with $tN.field.path resolution
+// ============================================================================
 void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 	const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
 	const TArray<TSharedPtr<FJsonValue>>& SentMessages,
@@ -3396,11 +4131,12 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 							ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
 							ScreenshotMsg.bHasImageAttachment = true;
 							ScreenshotMsg.ImageDataURIs.Add(DataURI);
-							AddMessage(ScreenshotMsg);
-						}
+						ScreenshotMsg.ImageFileNames.Add(TEXT("screenshot.png"));
+						AddMessage(ScreenshotMsg);
 					}
 				}
 			}
+		}
 
 			// IdleSpec: inject speculation hint to accelerate next round
 			InjectSpeculationHint(*NewMsgs, LastSpeculation, bSpeculationPending);
@@ -3428,7 +4164,7 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 			FString TaskId = Task.TaskId;
 			FString ToolId = Task.ToolId;
 
-			// 解析参数依赖
+			// 解析参数依赖 ($tN.field.path 语法 — Stage 5: 真正字段路径解析)
 			TSharedPtr<FJsonObject> ResolvedParams = MakeShareable(new FJsonObject());
 			if (Task.Parameters.IsValid())
 			{
@@ -3437,27 +4173,64 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 					const FString Key(ParamPair.Key);
 					const TSharedPtr<FJsonValue>& Val = ParamPair.Value;
 
+					// 仅字符串值可能是 $tN.field 引用
 					if (Val->Type == EJson::String)
 					{
 						FString StrVal = Val->AsString();
 						if (StrVal.StartsWith(TEXT("$")))
 						{
-							FString Ref = StrVal.Mid(1);
+							// 解析 $tN.field.path 语法
+							FString Ref = StrVal.Mid(1);             // 去掉前缀 $
 							FString RefTaskId = Ref;
+							FString FieldPath;
+
 							int32 DotIdx;
 							if (Ref.FindChar(TEXT('.'), DotIdx))
+							{
 								RefTaskId = Ref.Left(DotIdx);
+								FieldPath = Ref.Mid(DotIdx + 1);
+							}
 
 							const FTaskExecutionResult* DepResult = AllResults->Find(RefTaskId);
 							if (DepResult)
 							{
-								ResolvedParams->SetStringField(Key, DepResult->ResultJson);
+								// 用 ResolveDAGFieldPath 真正解析字段路径
+								TSharedPtr<FJsonValue> ResolvedValue = ResolveDAGFieldPath(DepResult->ResultJson, FieldPath);
+								if (ResolvedValue.IsValid())
+								{
+									// 按原始类型设置(保留 string/number/bool/array/object)
+									SetResolvedParam(ResolvedParams, Key, ResolvedValue);
+									UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] Resolved $%s.%s -> type=%d"), *RefTaskId, *FieldPath, (int32)ResolvedValue->Type);
+								}
+								else
+								{
+									// 字段路径无法解析 — 返回结构化错误 + 回退到整个结果
+									UE_LOG(LogMCPToolbox, Warning, TEXT("[DAG] Unresolved field path '%s' from task %s, fallback to whole result"), *FieldPath, *RefTaskId);
+									ResolvedParams->SetStringField(Key, MCPToolboxErrorFormat::FormatGenericError(
+										EMCPToolboxErrorCode::DagRefUnresolved,
+										FString::Printf(TEXT("Cannot resolve field path '%s' from task '%s' result"), *FieldPath, *RefTaskId)
+									));
+								}
+								continue;
+							}
+							else
+							{
+								// 引用任务不存在 — 返回结构化错误
+								UE_LOG(LogMCPToolbox, Warning, TEXT("[DAG] Unresolved task ref '%s' in param '%s'"), *RefTaskId, *Key);
+								ResolvedParams->SetStringField(Key, MCPToolboxErrorFormat::FormatGenericError(
+									EMCPToolboxErrorCode::DagRefUnresolved,
+									FString::Printf(TEXT("Task ref '$%s' not found in completed results"), *RefTaskId)
+								));
 								continue;
 							}
 						}
 					}
+					// 普通值 — 原样保留
 					ResolvedParams->SetField(Key, Val);
 				}
+
+				// Stage 5: 对解析后的参数应用 JsonValueHelper CoerceObject(字符串→强类型自动升级)
+				ResolvedParams = FMCPToolboxJsonValueHelper::CoerceObject(ResolvedParams);
 			}
 
 			FString ArgsJson;
@@ -3789,8 +4562,24 @@ void SMCPToolboxChatWidget::LoadWidgetState()
 	Json->TryGetBoolField(TEXT("more_expanded"), bMoreExpanded);
 	Json->TryGetBoolField(TEXT("summary_declined"), bSummaryDeclined);
 	Json->TryGetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
-	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Widget state loaded: vision=%d sidebar=%d more=%d summary_declined=%d auto_archive=%d"),
-		(int32)bVisionModeEnabled, (int32)bSidebarCollapsed, (int32)bMoreExpanded, (int32)bSummaryDeclined, (int32)bAutoArchiveEnabled);
+
+	// Stage 6.3 + 阶段 A1: 读取 disabled_skills 数组,委托给 SkillService
+	{
+		TArray<FString> LoadedDisabled;
+		const TArray<TSharedPtr<FJsonValue>>* DisabledArr = nullptr;
+		if (Json->TryGetArrayField(TEXT("disabled_skills"), DisabledArr) && DisabledArr)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *DisabledArr)
+			{
+				FString S = V->AsString();
+				if (!S.IsEmpty()) LoadedDisabled.AddUnique(S);
+			}
+		}
+		SkillService.SetDisabledSkills(LoadedDisabled);
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Widget state loaded: vision=%d sidebar=%d more=%d summary_declined=%d auto_archive=%d disabled_skills=%d"),
+		(int32)bVisionModeEnabled, (int32)bSidebarCollapsed, (int32)bMoreExpanded, (int32)bSummaryDeclined, (int32)bAutoArchiveEnabled, SkillService.GetDisabledSkills().Num());
 }
 
 void SMCPToolboxChatWidget::SaveWidgetState() const
@@ -3802,6 +4591,14 @@ void SMCPToolboxChatWidget::SaveWidgetState() const
 	Json->SetBoolField(TEXT("summary_declined"), bSummaryDeclined);
 	Json->SetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
 
+	// Stage 6.3 + 阶段 A1: 持久化 disabled_skills(从 SkillService 读取)
+	TArray<TSharedPtr<FJsonValue>> DisabledArr;
+	for (const FString& S : SkillService.GetDisabledSkills())
+	{
+		DisabledArr.Add(MakeShared<FJsonValueString>(S));
+	}
+	Json->SetArrayField(TEXT("disabled_skills"), DisabledArr);
+
 	FString Output;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
 	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
@@ -3810,6 +4607,205 @@ void SMCPToolboxChatWidget::SaveWidgetState() const
 	FString Dir = FPaths::GetPath(Path);
 	IFileManager::Get().MakeDirectory(*Dir, true);
 	FFileHelper::SaveStringToFile(Output, *Path);
+}
+
+// ============================================================================
+// Skill Manager — enable/disable individual skills (Stage 6.3)
+// IsSkillDisabled / ToggleSkillEnabled 已移至 FMCPToolboxSkillService (阶段 A1)
+// widget 通过 SkillService 成员委托调用
+// ============================================================================
+
+FReply SMCPToolboxChatWidget::OnOpenSkillManager()
+{
+	// 防重复打开
+	if (SkillManagerWindow.IsValid())
+	{
+		TSharedPtr<SWindow> Existing = SkillManagerWindow.Pin();
+		Existing->BringToFront();
+		return FReply::Handled();
+	}
+
+	// 扫描 .mcptoolbox/toolsets/*.md,提取 skill 列表(name + description + enabled)
+	FString ToolsetsDir = FPaths::ProjectDir() / TEXT(".mcptoolbox") / TEXT("toolsets");
+	IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PF.DirectoryExists(*ToolsetsDir))
+	{
+		// 目录不存在,提示用户先刷新工具
+		FMessageDialog::Open(EAppMsgType::Ok,
+			FText::FromString(TEXT("Skill 目录不存在。请先点击 \"获取工具\" 按钮生成 .mcptoolbox/toolsets/ 后再使用 Skill 管理。")));
+		return FReply::Handled();
+	}
+
+	TArray<FString> MdFiles;
+	PF.FindFiles(MdFiles, *ToolsetsDir, TEXT(".md"));
+	MdFiles.Sort();
+
+	if (MdFiles.Num() == 0)
+	{
+		FMessageDialog::Open(EAppMsgType::Ok,
+			FText::FromString(TEXT("没有发现任何 skill 文件。请先点击 \"获取工具\" 按钮发现并缓存 MCP 工具集。")));
+		return FReply::Handled();
+	}
+
+	// 准备 skill 信息(name + description + enabled)用于 UI 显示
+	struct FSkillItem
+	{
+		FString Name;
+		FString Description;
+		bool bEnabled;
+	};
+	TArray<FSkillItem> Items;
+	Items.Reserve(MdFiles.Num());
+	for (const FString& FilePath : MdFiles)
+	{
+		FSkillItem It;
+		It.Name = FPaths::GetBaseFilename(FilePath);
+		It.bEnabled = !SkillService.IsSkillDisabled(It.Name);
+
+		FString Content;
+		if (FFileHelper::LoadFileToString(Content, *FilePath))
+		{
+			FString Desc, Body;
+			SkillService.ParseFrontmatter(Content, Desc, Body);
+			It.Description = Desc;
+		}
+		Items.Add(MoveTemp(It));
+	}
+
+	// 创建独立窗口
+	TSharedRef<SWindow> Window = SNew(SWindow)
+		.Title(FText::FromString(TEXT("Skill 管理")))
+		.ClientSize(FVector2D(640, 520))
+		.SupportsMinimize(false)
+		.SupportsMaximize(false)
+		.AutoCenter(EAutoCenter::PreferredWorkArea);
+
+	// 窗口内容: 标题 + 列表 + 底部状态栏
+	TSharedRef<SVerticalBox> ContentBox = SNew(SVerticalBox);
+
+	// 顶部说明
+	ContentBox->AddSlot()
+		.AutoHeight()
+		.Padding(FMargin(12, 10, 12, 6))
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(TEXT("勾选启用 / 取消勾选禁用对应 skill。禁用后 LLM 在 list_skills 中看不到该 skill。")))
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+			.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+		];
+
+	// Skill 列表(每行一项: 复选框 + 名称 + description)
+	TSharedRef<SScrollBox> ListScroll = SNew(SScrollBox);
+	for (const FSkillItem& Item : Items)
+	{
+		TSharedRef<SWidget> Row = SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(12, 4, 8, 4))
+			[
+				SNew(SCheckBox)
+				.IsChecked(Item.bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
+				.OnCheckStateChanged_Lambda([this, Name = Item.Name](ECheckBoxState NewState)
+				{
+					const bool bWantsEnabled = (NewState == ECheckBoxState::Checked);
+					const bool bCurrentlyEnabled = !SkillService.IsSkillDisabled(Name);
+					if (bWantsEnabled != bCurrentlyEnabled)
+					{
+						SkillService.ToggleSkillEnabled(Name);
+					}
+				})
+			]
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0, 4, 12, 4))
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(Item.Name))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					.ColorAndOpacity(FLinearColor(0.92f, 0.92f, 0.95f))
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(FMargin(0, 2, 0, 0))
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(Item.Description))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f))
+					.WrapTextAt(560.0f)
+				]
+			];
+
+		ListScroll->AddSlot()
+			[
+				Row
+			];
+	}
+
+	ContentBox->AddSlot()
+		.FillHeight(1.0f)
+		[
+			ListScroll
+		];
+
+	// 底部状态栏:总览 + 关闭按钮
+	const int32 EnabledCount = Items.FilterByPredicate([](const FSkillItem& I) { return I.bEnabled; }).Num();
+	ContentBox->AddSlot()
+		.AutoHeight()
+		.Padding(FMargin(12, 8, 12, 10))
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::Format(FText::FromString(TEXT("已启用 {0} / {1} 个 skill")), EnabledCount, Items.Num()))
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				.ColorAndOpacity(FLinearColor(0.7f, 0.85f, 0.7f))
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			[
+				SNew(SButton)
+				.ButtonColorAndOpacity(FLinearColor(0.15f, 0.28f, 0.18f, 1.0f))
+				.ContentPadding(FMargin(20, 4))
+				.OnClicked_Lambda([WindowRef = TWeakPtr<SWindow>(Window)]() -> FReply
+				{
+					TSharedPtr<SWindow> W = WindowRef.Pin();
+					if (W.IsValid()) W->RequestDestroyWindow();
+					return FReply::Handled();
+				})
+				.Content()
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(TEXT("关闭")))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 10))
+					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.85f))
+				]
+			]
+		];
+
+	Window->SetContent(ContentBox);
+
+	// 注册窗口销毁回调,清理 WeakPtr
+	Window->GetOnWindowClosedEvent().AddLambda([this](const TSharedRef<SWindow>&)
+	{
+		SkillManagerWindow.Reset();
+	});
+
+	SkillManagerWindow = Window;
+
+	// 添加到 Slate 应用(独立顶级窗口,跟随现有 OnArchiveSummary 的模式)
+	FSlateApplication::Get().AddWindow(Window);
+
+	return FReply::Handled();
 }
 
 // ============================================================================
@@ -3935,6 +4931,7 @@ void SMCPToolboxChatWidget::OnSummaryGenerated(bool bSuccess, const FString& Too
 	// Update in-memory caches (kept across the session so subsequent BuildSystemPrompt calls pick them up)
 	if (!ToolsSummary.IsEmpty()) CachedToolsSummary = ToolsSummary;
 	if (!MemorySummary.IsEmpty()) CachedMemorySummary = MemorySummary;
+	bSystemPromptDirty = true;  // summary changed, rebuild system prompt
 
 	// Persist to ~/.mcptoolbox/conversation_summary.md (overwrite) + summaries/*.md (archive)
 	FMCPToolboxMemoryManager::Get().SaveConversationSummary(

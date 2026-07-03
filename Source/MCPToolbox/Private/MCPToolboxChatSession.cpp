@@ -4,13 +4,25 @@
 #include "Serialization/JsonWriter.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/App.h"
+#include "MCPToolbox.h"
 
 FString FMCPToolboxChatSessionManager::GetProjectName() const
 {
-	FString ProjectDir = FPaths::ProjectDir();
-	FString ProjectName = FPaths::GetBaseFilename(ProjectDir);
+	// FPaths::GetBaseFilename(FPaths::ProjectDir()) returns empty for paths ending with
+	// a slash (e.g. "E:/YBAI/"), causing sessions to be saved under "DefaultProject"
+	// and lost on restart. FApp::GetProjectName() is the reliable UE5 way.
+	FString ProjectName = FApp::GetProjectName();
 	if (ProjectName.IsEmpty())
-		ProjectName = TEXT("DefaultProject");
+	{
+		// Fallback: strip trailing slash before GetBaseFilename
+		FString ProjectDir = FPaths::ProjectDir();
+		ProjectDir.RemoveFromEnd(TEXT("/"));
+		ProjectDir.RemoveFromEnd(TEXT("\\"));
+		ProjectName = FPaths::GetBaseFilename(ProjectDir);
+		if (ProjectName.IsEmpty())
+			ProjectName = TEXT("DefaultProject");
+	}
 	return ProjectName;
 }
 
@@ -66,6 +78,11 @@ bool FMCPToolboxChatSession::Serialize(FJsonObject& OutJson) const
 			ImageURIs.Add(MakeShareable(new FJsonValueString(Uri)));
 		MsgObj->SetArrayField(TEXT("image_data_uris"), ImageURIs);
 		
+		TArray<TSharedPtr<FJsonValue>> ImageNames;
+		for (const auto& Name : Msg.ImageFileNames)
+			ImageNames.Add(MakeShareable(new FJsonValueString(Name)));
+		MsgObj->SetArrayField(TEXT("image_file_names"), ImageNames);
+		
 		TArray<TSharedPtr<FJsonValue>> Attachments;
 		for (const auto& Att : Msg.FileAttachments)
 			Attachments.Add(MakeShareable(new FJsonValueString(Att)));
@@ -113,13 +130,20 @@ bool FMCPToolboxChatSession::Deserialize(const FJsonObject& Json)
 			MsgObj->TryGetStringField(TEXT("model_name"), Msg.ModelName);
 			
 			const TArray<TSharedPtr<FJsonValue>>* ImageURIs;
-			if (MsgObj->TryGetArrayField(TEXT("image_data_uris"), ImageURIs))
-			{
-				for (const auto& Uri : *ImageURIs)
-					Msg.ImageDataURIs.Add(Uri->AsString());
-			}
-			
-			const TArray<TSharedPtr<FJsonValue>>* Attachments;
+		if (MsgObj->TryGetArrayField(TEXT("image_data_uris"), ImageURIs))
+		{
+			for (const auto& Uri : *ImageURIs)
+				Msg.ImageDataURIs.Add(Uri->AsString());
+		}
+		
+		const TArray<TSharedPtr<FJsonValue>>* ImageNames;
+		if (MsgObj->TryGetArrayField(TEXT("image_file_names"), ImageNames))
+		{
+			for (const auto& Name : *ImageNames)
+				Msg.ImageFileNames.Add(Name->AsString());
+		}
+		
+		const TArray<TSharedPtr<FJsonValue>>* Attachments;
 			if (MsgObj->TryGetArrayField(TEXT("file_attachments"), Attachments))
 			{
 				for (const auto& Att : *Attachments)
@@ -234,18 +258,31 @@ FString FMCPToolboxChatSessionManager::GetSessionFilePath(const FString& Session
 void FMCPToolboxChatSessionManager::SaveSession(FMCPToolboxChatSession& Session)
 {
 	FString Dir = GetSessionsDirectory();
-	IFileManager::Get().MakeDirectory(*Dir, true);
-	
+	if (!IFileManager::Get().MakeDirectory(*Dir, true))
+	{
+		UE_LOG(LogMCPToolbox, Error, TEXT("[Session] Failed to create sessions directory: %s"), *Dir);
+		return;
+	}
+
 	FString FilePath = GetSessionFilePath(Session.SessionId);
-	
+	FString AbsPath = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*FilePath);
+
 	TSharedPtr<FJsonObject> Json = MakeShareable(new FJsonObject());
 	Session.Serialize(*Json);
-	
+
 	FString JsonStr;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonStr);
 	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
-	
-	FFileHelper::SaveStringToFile(JsonStr, *FilePath);
+
+	if (!FFileHelper::SaveStringToFile(JsonStr, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8))
+	{
+		UE_LOG(LogMCPToolbox, Error, TEXT("[Session] Failed to save session %s to %s"), *Session.SessionId, *AbsPath);
+	}
+	else
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Session] Saved session '%s' (%d messages) to %s"),
+			*Session.Title, Session.Messages.Num(), *AbsPath);
+	}
 }
 
 void FMCPToolboxChatSessionManager::SaveCurrentSession()
@@ -261,39 +298,57 @@ void FMCPToolboxChatSessionManager::SaveCurrentSession()
 void FMCPToolboxChatSessionManager::LoadAllSessions()
 {
 	Sessions.Empty();
-	
+
 	FString Dir = GetSessionsDirectory();
 	if (!IFileManager::Get().DirectoryExists(*Dir))
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Session] Sessions directory does not exist yet: %s"), *Dir);
 		return;
-	
+	}
+
 	TArray<FString> Files;
 	IFileManager::Get().FindFiles(Files, *(Dir / TEXT("*.json")), false, false);
-	
+
+	FString AbsDir = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*Dir);
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Session] Found %d session files in %s"), Files.Num(), *AbsDir);
+
 	for (const FString& File : Files)
 	{
 		LoadSessionFromFile(Dir / File);
 	}
-	
+
 	Sessions.Sort([](const TUniquePtr<FMCPToolboxChatSession>& A, const TUniquePtr<FMCPToolboxChatSession>& B) {
 		return A->UpdatedAt > B->UpdatedAt;
 	});
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Session] Loaded %d sessions successfully"), Sessions.Num());
 }
 
 void FMCPToolboxChatSessionManager::LoadSessionFromFile(const FString& FilePath)
 {
 	FString JsonStr;
 	if (!FFileHelper::LoadFileToString(JsonStr, *FilePath))
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Session] Failed to load session file: %s"), *FilePath);
 		return;
-	
+	}
+
 	TSharedPtr<FJsonObject> Json;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonStr);
 	if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Session] Failed to parse session JSON: %s"), *FilePath);
 		return;
-	
+	}
+
 	TUniquePtr<FMCPToolboxChatSession> Session = MakeUnique<FMCPToolboxChatSession>();
 	if (Session->Deserialize(*Json))
 	{
 		Sessions.Add(MoveTemp(Session));
+	}
+	else
+	{
+		UE_LOG(LogMCPToolbox, Warning, TEXT("[Session] Failed to deserialize session: %s"), *FilePath);
 	}
 }
 

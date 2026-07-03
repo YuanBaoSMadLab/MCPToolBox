@@ -359,46 +359,8 @@ void FMCPToolboxModule::ValidateRuntimeEnvironment()
 {
 	UE_LOG(LogMCPToolbox, Log, TEXT("Validating MCPToolbox runtime environment..."));
 
-	TArray<FString> RequiredModules = {
-		TEXT("Core"),
-		TEXT("CoreUObject"),
-		TEXT("Engine"),
-		TEXT("Slate"),
-		TEXT("SlateCore"),
-		TEXT("EditorStyle"),
-		TEXT("UnrealEd"),
-		TEXT("LevelEditor"),
-		TEXT("MainFrame"),
-		TEXT("InputCore"),
-		TEXT("HTTP"),
-		TEXT("WebSockets"),
-		TEXT("Json"),
-		TEXT("JsonUtilities"),
-		TEXT("Projects"),
-		TEXT("ApplicationCore"),
-		TEXT("ImageWrapper"),
-		TEXT("DesktopPlatform"),
-		TEXT("AssetRegistry")
-	};
-
-	bool bAllModulesLoaded = true;
-	for (const FString& ModuleName : RequiredModules)
-	{
-		if (!FModuleManager::Get().IsModuleLoaded(*ModuleName))
-		{
-			UE_LOG(LogMCPToolbox, Warning, TEXT("  Required module not loaded: %s"), *ModuleName);
-			bAllModulesLoaded = false;
-		}
-	}
-
-	if (bAllModulesLoaded)
-	{
-		UE_LOG(LogMCPToolbox, Log, TEXT("  All required modules are loaded"));
-	}
-	else
-	{
-		UE_LOG(LogMCPToolbox, Warning, TEXT("  Some required modules are not loaded - MCPToolbox may not function correctly"));
-	}
+	// ponytail: 模块依赖由 Build.cs 保证,跳过冗余验证
+	// 原 IsModuleLoaded 在启动早期误报,删掉避免噪音
 
 	// Check for screenshot module
 	if (FModuleManager::Get().IsModuleLoaded("MCPToolboxScreenshot"))

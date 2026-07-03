@@ -15,7 +15,14 @@ public class MCPToolbox : ModuleRules
             "ToolMenus", "InputCore", "HTTP", "WebSockets",
             "Json", "JsonUtilities", "Projects", "ApplicationCore",
             "ImageWrapper", "DesktopPlatform", "AssetRegistry", "EditorSubsystem",
-            "DeveloperSettings", "Sockets", "Networking"
+            "DeveloperSettings", "Sockets", "Networking",
+            // Stage 6.2 PerformanceService: frame timing + Unreal Insights trace capture/analysis
+            "RenderCore",   // GGameThreadTime / GRenderThreadTime / GRHIThreadTime (RenderTimer.h)
+            "RHI",           // RHIGetGPUFrameCycles (RHIGlobals.h)
+            "TraceServices", // IAnalysisService / IAnalysisSession / IFrameProvider (Analyse method)
+            "TraceLog",       // FTraceAuxiliary / TRACE_BOOKMARK / TRACE_BEGIN_REGION / TRACE_END_REGION
+            // Python infrastructure (移植自 VibeUE): safe Python execution + API introspection
+            "PythonScriptPlugin"  // IPythonScriptPlugin for Python code execution
         });
 
         PrivateDependencyModuleNames.AddRange(new string[] { "MCPToolboxScreenshot" });

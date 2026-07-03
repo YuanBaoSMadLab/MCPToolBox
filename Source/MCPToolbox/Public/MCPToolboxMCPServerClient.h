@@ -25,8 +25,11 @@ public:
 	/** Check if connected and initialized */
 	bool IsConnected() const { return bInitialized; }
 
-	/** Auto-discover actual tools (not just meta-tools) via list_toolsets → describe_toolset */
-	void DiscoverRealTools(TFunction<void(const TArray<TSharedPtr<FJsonObject>>&)> OnComplete);
+	/** Auto-discover actual tools (not just meta-tools) via list_toolsets → describe_toolset.
+	 *  OnProgress is called after each describe_toolset completes (Done/Total/ToolsetName). */
+	void DiscoverRealTools(
+		TFunction<void(const TArray<TSharedPtr<FJsonObject>>&)> OnComplete,
+		TFunction<void(int32 Done, int32 Total, const FString& CurrentToolset)> OnProgress = nullptr);
 
 	/** Execute a tool by name with JSON arguments (sends tools/call) */
 	void ExecuteTool(const FString& ToolName, const FString& ArgumentsJson,

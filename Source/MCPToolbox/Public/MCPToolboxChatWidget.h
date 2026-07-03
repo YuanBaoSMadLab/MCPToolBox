@@ -37,6 +37,9 @@
 // Auxiliary Model Manager (IdleSpec + SWE-Pruner)
 #include "MCPToolboxAuxModelManager.h"
 
+// Skill Service (God Object 拆分阶段 A1: Skill 内容管理抽取为独立 Service)
+#include "MCPToolboxSkillService.h"
+
 // ---- Forward declarations ----
 class FMCPToolboxMCPClient;
 struct FMCPToolboxChatSession;
@@ -159,6 +162,16 @@ private:
 	/** Write discovered tools to .mcptoolbox/ directory as multiple MD files (one per toolset) */
 	void WriteToolsetCacheToDisk(const TArray<TSharedPtr<FJsonObject>>& Tools);
 
+	// ---- Skill Manager UI (Stage 6.3) ----
+	// Skill 内容管理逻辑已抽取到 FMCPToolboxSkillService (God Object 拆分阶段 A1)
+	// widget 仅保留 UI 事件处理,逻辑委托给 SkillService
+
+	/** Open the Skill Manager window (one at a time, prevents duplicate dialogs) */
+	FReply OnOpenSkillManager();
+
+	/** Weak reference to the Skill Manager window (prevent duplicate open) */
+	TWeakPtr<SWindow> SkillManagerWindow;
+
 	// ---- Conversation Summary (Archive) ----
 
 	/** Summary model strategy for the OnArchiveSummary dialog */
@@ -250,7 +263,7 @@ private:
 	/** Handle MCP tool call extracted from AI response */
 	void HandleMCPToolCall(const FString& ToolCallJson);
 
-	/** Build system prompt with memory context */
+	/** Build system prompt with memory context (lazy-loaded: only injects index.md + rules.md) */
 	FString BuildSystemPrompt(const FString& MemoryContext);
 
 	/** Register MCP tools in the local FunctionTable */
@@ -276,6 +289,25 @@ private:
 		const TArray<TSharedPtr<FJsonValue>>& ToolCalls,
 		TArray<TSharedPtr<FJsonObject>>& OutDAGCalls
 	) const;
+
+	/**
+	 * Resolve a `$tN.field.path` reference into a concrete value from a task's result JSON.
+	 * Supports dot navigation and array indexing:
+	 *   - `$t1` → whole result string
+	 *   - `$t1.result` → field "result" of the result object
+	 *   - `$t1.result[0]` → first element of the "result" array
+	 *   - `$t1.data.path.deep` → nested object navigation
+	 * @param ResultJsonStr  The raw JSON string result from a prior DAG task
+	 * @param FieldPath      The field path after `$tN.` (e.g. "result[0].name")
+	 * @return Resolved FJsonValue, or nullptr if path cannot be resolved
+	 */
+	TSharedPtr<FJsonValue> ResolveDAGFieldPath(const FString& ResultJsonStr, const FString& FieldPath);
+
+	/**
+	 * Apply a resolved FJsonValue to a target JSON object field, preserving the original type.
+	 * Used by ExecuteToolCallsDAG when substituting `$tN.field` references.
+	 */
+	void SetResolvedParam(TSharedPtr<FJsonObject>& Target, const FString& Key, const TSharedPtr<FJsonValue>& Value);
 
 public:
 	/** Try connecting to MCP server and discovering tools */
@@ -385,6 +417,7 @@ private:
 	 *  This avoids the previous design where OnUploadFile called AddMessage(FileMsg) then OnSendMessage(),
 	 *  which either sent a duplicate user message or (if input was empty) skipped sending entirely. */
 	TArray<FString> PendingUploadURIs;
+	TArray<FString> PendingUploadFileNames;
 
 	/** Local FunctionTable for tool registration */
 	TUniquePtr<assistant::FunctionTable> ToolFunctionTable;
@@ -424,6 +457,11 @@ private:
 	/** True if user previously declined the first-time summary dialog (persisted) */
 	bool bSummaryDeclined = false;
 
+	/** Cached system prompt to avoid rebuilding every request (expensive: reads disk files) */
+	FString CachedSystemPrompt;
+	FString CachedSystemPromptMemoryKey;	// MemoryCtx that the cache was built with
+	bool bSystemPromptDirty = true;			// Set true when memory/skills/rules change
+
 	/** Cached conversation summary sections loaded at startup (injected into BuildSystemPrompt) */
 	FString CachedToolsSummary;
 	FString CachedMemorySummary;
@@ -458,6 +496,11 @@ private:
 
 	/** DAG execution planner for parallel tool calls */
 	FExecutionPlanner ExecutionPlanner;
+
+	// ---- Skill Service (God Object 拆分阶段 A1) ----
+	/** Skill 内容管理服务(ListSkills/GetSkill/LoadRulesMD/LoadSkillIndex/启停状态)
+	 *  从 widget 抽取的独立 Service,降低 God Object 耦合度 */
+	FMCPToolboxSkillService SkillService;
 
 	// ---- Auxiliary Model Integration ----
 

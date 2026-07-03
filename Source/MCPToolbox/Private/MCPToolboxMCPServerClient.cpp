@@ -53,6 +53,7 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 	Req->SetVerb(TEXT("POST"));
 	Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Req->SetHeader(TEXT("Accept"), TEXT("application/json, text/event-stream"));
+	Req->SetHeader(TEXT("Content-Length"), FString::FromInt(Body.Len()));
 	Req->SetTimeout(5.0f);
 	Req->SetContentAsString(Body);
 
@@ -202,7 +203,9 @@ bool FMCPToolboxMCPServerClient::Connect(const FString& InHost, int32 InPort)
 // ============================================================================
 // DiscoverRealTools — chains list_toolsets → describe_toolset to get all real tools
 // ============================================================================
-void FMCPToolboxMCPServerClient::DiscoverRealTools(TFunction<void(const TArray<TSharedPtr<FJsonObject>>&)> OnComplete)
+void FMCPToolboxMCPServerClient::DiscoverRealTools(
+	TFunction<void(const TArray<TSharedPtr<FJsonObject>>&)> OnComplete,
+	TFunction<void(int32 Done, int32 Total, const FString& CurrentToolset)> OnProgress)
 {
 	if (!bInitialized)
 	{
@@ -217,7 +220,7 @@ void FMCPToolboxMCPServerClient::DiscoverRealTools(TFunction<void(const TArray<T
 	ListParams->SetStringField(TEXT("name"), TEXT("list_toolsets"));
 
 	SendJsonRpc(TEXT("tools/call"), ListParams,
-		[this, OnComplete](bool bSuccess, const TSharedPtr<FJsonObject>& Result)
+		[this, OnComplete, OnProgress](bool bSuccess, const TSharedPtr<FJsonObject>& Result)
 		{
 			if (!bSuccess || !Result.IsValid())
 			{
@@ -249,6 +252,7 @@ void FMCPToolboxMCPServerClient::DiscoverRealTools(TFunction<void(const TArray<T
 			// Step 2: For each toolset, call describe_toolset
 			TSharedPtr<TArray<TSharedPtr<FJsonObject>>> AllTools = MakeShared<TArray<TSharedPtr<FJsonObject>>>();
 			TSharedPtr<int32> Remaining = MakeShared<int32>(ToolsetNames.Num());
+			int32 Total = ToolsetNames.Num();
 
 			for (const FString& ToolsetName : ToolsetNames)
 			{
@@ -259,7 +263,7 @@ void FMCPToolboxMCPServerClient::DiscoverRealTools(TFunction<void(const TArray<T
 				DescParams->SetObjectField(TEXT("arguments"), Args);
 
 				SendJsonRpc(TEXT("tools/call"), DescParams,
-					[this, AllTools, Remaining, OnComplete, ToolsetName](bool bOk, const TSharedPtr<FJsonObject>& DescResult)
+					[this, AllTools, Remaining, OnComplete, OnProgress, ToolsetName, Total](bool bOk, const TSharedPtr<FJsonObject>& DescResult)
 					{
 						if (bOk && DescResult.IsValid())
 						{
@@ -268,6 +272,13 @@ void FMCPToolboxMCPServerClient::DiscoverRealTools(TFunction<void(const TArray<T
 						}
 
 						(*Remaining)--;
+						int32 Done = Total - (*Remaining);
+
+						if (OnProgress)
+						{
+							OnProgress(Done, Total, ToolsetName);
+						}
+
 						if (*Remaining <= 0)
 						{
 							UE_LOG(LogMCPToolbox, Log, TEXT("[MCPSrv] Discovered %d real tools"), AllTools->Num());
@@ -573,6 +584,7 @@ void FMCPToolboxMCPServerClient::SendJsonRpc(const FString& Method, const TShare
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("Connection"), TEXT("keep-alive")); // TCP连接复用
+	Request->SetHeader(TEXT("Content-Length"), FString::FromInt(Body.Len()));
 
 	if (!McpSessionId.IsEmpty())
 		Request->SetHeader(TEXT("Mcp-Session-Id"), McpSessionId);
