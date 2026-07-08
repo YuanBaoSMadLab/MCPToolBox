@@ -4001,6 +4001,11 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 		{
 			Content.ReplaceInline(TEXT("{{PROJECT_NAME}}"), *ProjectName);
 			Content.ReplaceInline(TEXT("{{CONTENT_PATH}}"), *ContentPath);
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Prompt] Loaded: %s (%d chars)"), *Filename, Content.Len());
+		}
+		else
+		{
+			UE_LOG(LogMCPToolbox, Error, TEXT("[Prompt] FAILED to load: %s"), *Path);
 		}
 		return Content;
 	};
