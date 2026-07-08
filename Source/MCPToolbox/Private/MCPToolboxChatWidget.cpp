@@ -9,6 +9,7 @@
 #include "MCPToolboxTransactionService.h"
 #include "MCPToolboxPerformanceService.h"
 #include "MCPToolboxServiceRegistry.h"
+#include "Interfaces/IPluginManager.h"
 
 // Assistant library — only FunctionBuilder/FunctionTable (no HTTP layer)
 #include "assistant/function.hpp"
@@ -653,6 +654,11 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		return FReply::Handled();
 	}
 
+	bool bModelSupportsVision = ActiveEntry->ModelId.Contains(TEXT("gpt-4o")) ||
+		ActiveEntry->ModelId.Contains(TEXT("claude-3")) || ActiveEntry->ModelId.Contains(TEXT("claude-4")) ||
+		ActiveEntry->ModelId.Contains(TEXT("gemini")) ||
+		ActiveEntry->ModelId.Contains(TEXT("vl")) || ActiveEntry->ModelId.Contains(TEXT("vision"));
+
 	if (UserText.StartsWith(TEXT("/test_image")))
 	{
 		FString TestPrompt = UserText.Mid(11).TrimStartAndEnd();
@@ -782,7 +788,9 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		// Skip assistant messages with image attachments — these are generated images
 		// that have been displayed in UI. Non-vision models like DeepSeek don't support
 		// image_url content type, and AI should describe the image in text instead.
-		if (Msg.Role == EMCPToolboxMessageRole::Assistant && Msg.bHasImageAttachment)
+		// ponytail: also skip User messages with bHasImageAttachment for non-vision models,
+		// preventing generated-image content from leaking into follow-up requests.
+		if (Msg.bHasImageAttachment && (Msg.Role == EMCPToolboxMessageRole::Assistant || !bModelSupportsVision))
 			continue;
 
 		TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject());
@@ -1207,55 +1215,86 @@ FString SMCPToolboxChatWidget::GenerateImage_ComfyUI(const FMCPToolboxAPIKeyEntr
 			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(WorkflowContent);
 			if (FJsonSerializer::Deserialize(Reader, Workflow) && Workflow.IsValid())
 			{
+				// Find KSampler to identify which CLIPTextEncode nodes are positive vs negative
+				FString PosNodeId, NegNodeId;
+				for (auto& Pair : Workflow->Values)
+				{
+					TSharedPtr<FJsonObject> Node = Pair.Value->AsObject();
+					if (!Node.IsValid()) continue;
+					FString ClassType;
+					Node->TryGetStringField(TEXT("class_type"), ClassType);
+					if (ClassType == TEXT("KSampler") || ClassType == TEXT("KSamplerAdvanced"))
+					{
+						const TSharedPtr<FJsonObject>* InputsPtr;
+						if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr)
+						{
+							// "positive" input links to the positive CLIPTextEncode node
+							const TArray<TSharedPtr<FJsonValue>>* PosLink;
+							if ((*InputsPtr)->TryGetArrayField(TEXT("positive"), PosLink) && PosLink->Num() > 0)
+						{
+							const TArray<TSharedPtr<FJsonValue>>* LinkArr;
+							if ((*PosLink)[0]->TryGetArray(LinkArr) && LinkArr->Num() > 0)
+								(*LinkArr)[0]->TryGetString(PosNodeId);
+						}
+							// "negative" input links to the negative CLIPTextEncode node
+							const TArray<TSharedPtr<FJsonValue>>* NegLink;
+							if ((*InputsPtr)->TryGetArrayField(TEXT("negative"), NegLink) && NegLink->Num() > 0)
+						{
+							const TArray<TSharedPtr<FJsonValue>>* LinkArr;
+							if ((*NegLink)[0]->TryGetArray(LinkArr) && LinkArr->Num() > 0)
+								(*LinkArr)[0]->TryGetString(NegNodeId);
+						}
+						}
+						break;
+					}
+				}
+
+				// Inject prompts into identified CLIPTextEncode nodes
 				int32 ClipEncodeCount = 0;
 				for (auto& Pair : Workflow->Values)
 				{
 					TSharedPtr<FJsonObject> Node = Pair.Value->AsObject();
-					if (Node.IsValid())
+					if (!Node.IsValid()) continue;
+					FString ClassType;
+					Node->TryGetStringField(TEXT("class_type"), ClassType);
+					if (ClassType.Contains(TEXT("CLIPTextEncode")))
 					{
-						FString ClassType;
-						Node->TryGetStringField(TEXT("class_type"), ClassType);
-						// Match any CLIP text encode variant: CLIPTextEncode, CLIPTextEncodeFlux, CLIPTextEncodeSDXL, etc.
-						if (ClassType.Contains(TEXT("CLIPTextEncode")))
+						const TSharedPtr<FJsonObject>* InputsPtr;
+						if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
 						{
-							const TSharedPtr<FJsonObject>* InputsPtr;
-							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
-							{
-								TSharedPtr<FJsonObject> NewInputs = MakeShareable(new FJsonObject());
-								*NewInputs = *(*InputsPtr);
-								// First CLIPTextEncode = positive prompt, second = negative prompt
-								if (ClipEncodeCount == 0)
-									NewInputs->SetStringField(TEXT("text"), Prompt);
-								else
-									NewInputs->SetStringField(TEXT("text"), NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt);
-								Node->SetObjectField(TEXT("inputs"), NewInputs);
-								ClipEncodeCount++;
-							}
+							TSharedPtr<FJsonObject> NewInputs = MakeShareable(new FJsonObject());
+							*NewInputs = *(*InputsPtr);
+							bool bIsNegative = NegNodeId == Pair.Key;
+							NewInputs->SetStringField(TEXT("text"), bIsNegative
+								? (NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt)
+								: Prompt);
+							Node->SetObjectField(TEXT("inputs"), NewInputs);
+							ClipEncodeCount++;
 						}
-						else if (ClassType == TEXT("EmptyLatentImage"))
+					}
+					else if (ClassType == TEXT("EmptyLatentImage"))
+					{
+						const TSharedPtr<FJsonObject>* InputsPtr;
+						if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
 						{
-							const TSharedPtr<FJsonObject>* InputsPtr;
-							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
-							{
-								TSharedPtr<FJsonObject> Inputs = *InputsPtr;
-								Inputs->SetNumberField(TEXT("width"), Width);
-								Inputs->SetNumberField(TEXT("height"), Height);
-							}
+							TSharedPtr<FJsonObject> Inputs = *InputsPtr;
+							Inputs->SetNumberField(TEXT("width"), Width);
+							Inputs->SetNumberField(TEXT("height"), Height);
 						}
-						else if (ClassType == TEXT("KSampler") || ClassType == TEXT("KSamplerAdvanced"))
+					}
+					else if (ClassType == TEXT("KSampler") || ClassType == TEXT("KSamplerAdvanced"))
+					{
+						const TSharedPtr<FJsonObject>* InputsPtr;
+						if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
 						{
-							const TSharedPtr<FJsonObject>* InputsPtr;
-							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
-							{
-								TSharedPtr<FJsonObject> Inputs = *InputsPtr;
-								Inputs->SetNumberField(TEXT("steps"), Steps);
-								Inputs->SetNumberField(TEXT("cfg"), CfgScale);
-							}
+							TSharedPtr<FJsonObject> Inputs = *InputsPtr;
+							Inputs->SetNumberField(TEXT("steps"), Steps);
+							Inputs->SetNumberField(TEXT("cfg"), CfgScale);
 						}
 					}
 				}
-				UE_LOG(LogMCPToolbox, Log, TEXT("[ComfyUI] Workflow loaded: %s, CLIPTextEncode nodes: %d, prompt=%s, size=%dx%d"),
-					*WorkflowPath, ClipEncodeCount, *Prompt.Left(50), Width, Height);
+				UE_LOG(LogMCPToolbox, Log, TEXT("[ComfyUI] Workflow loaded: %s, CLIPTextEncode nodes: %d, positive=node_%s negative=node_%s, prompt=%s, size=%dx%d"),
+					*WorkflowPath, ClipEncodeCount, *PosNodeId, *NegNodeId, *Prompt.Left(50), Width, Height);
 				if (ClipEncodeCount == 0)
 					UE_LOG(LogMCPToolbox, Warning, TEXT("[ComfyUI] No CLIPTextEncode nodes found in workflow! Prompt may not be injected. Check workflow JSON for correct class_type."));
 			}
@@ -3964,67 +4003,35 @@ FReply SMCPToolboxChatWidget::OnInterrupt()
 // ============================================================================
 FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 {
-	// ── VibeUE-style lean system prompt (Stage 1 migration) ──
-	// 旧版注入 60K 字符的 .mcptoolbox/*.md 全量缓存 + 280 行硬编码规则 ≈ 15K tokens
-	// 新版只注入 index.md (~2K tokens) + rules.md (~3K tokens) ≈ 5K tokens
-	// 详细 toolset schema 通过 get_skills 虚拟工具懒加载(阶段 2 实现)
 	FString Prompt;
 	Prompt.Reserve(8192);
 
-	// Get project Content path
 	FString ContentPath = FPaths::ProjectContentDir();
 	FString ProjectName = FApp::GetProjectName();
+	FString PluginDir = FPaths::GetPath(FPaths::GetPath(FModuleManager::Get().GetModuleFilename("MCPToolbox")));
 
-	Prompt += TEXT("你是 MCP Toolbox AI助手，运行在 Unreal Engine 5.8 编辑器内部。用中文回复。\n\n");
-	Prompt += FString::Printf(TEXT("## 工作环境\n"));
-	Prompt += FString::Printf(TEXT("- 项目: %s\n"), *ProjectName);
-	Prompt += FString::Printf(TEXT("- Content目录: %s\n"), *ContentPath);
-	Prompt += FString::Printf(TEXT("- 资源路径前缀: /Game/ (对应Content目录)\n\n"));
+	// ponytail: resolve PluginDir from uplugin file for reliability
+	TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("MCPToolbox"));
+	if (Plugin.IsValid()) PluginDir = Plugin->GetBaseDir();
 
-	// ── 生图模式说明 ──
-	Prompt += TEXT("## 生图模式\n");
-	Prompt += TEXT("### 方式一: AI自动调用(推荐)\n");
-	Prompt += TEXT("当用户要求生成图片时，**你必须调用 `generate_image` 工具**来生成图片，而不是自己生成或描述。\n");
-	Prompt += TEXT("参数: `prompt` (必需,详细描述图片内容), `negative_prompt` (可选,排除内容), `width`/`height` (可选,默认1024), `steps`/`cfg_scale` (可选,SD专用)\n");
-	Prompt += TEXT("### 方式二: 用户直接模式\n");
-	Prompt += TEXT("当用户手动开启\"生图\"模式按钮时，输入的提示词会直接发送到生图模型生成图片。\n");
-	Prompt += TEXT("### 支持的生图服务商\n");
-	Prompt += TEXT("- OpenAI DALL-E\n");
-	Prompt += TEXT("- SD WebUI (本地,如 http://127.0.0.1:7860)\n");
-	Prompt += TEXT("- Replicate (支持 SDXL、Flux 等模型)\n");
-	Prompt += TEXT("- Pollinations AI (免费,无需API Key)\n");
-	Prompt += TEXT("- ComfyUI (自动探测,如 http://127.0.0.1:8200)\n\n");
+	// ── Load prompt fragments from MD files (ponytail: keep prompts out of C++) ──
+	auto LoadPromptFile = [&](const FString& Filename) -> FString {
+		FString Path = PluginDir / TEXT("Prompts") / Filename;
+		FString Content;
+		if (FFileHelper::LoadFileToString(Content, *Path))
+		{
+			Content.ReplaceInline(TEXT("{{PROJECT_NAME}}"), *ProjectName);
+			Content.ReplaceInline(TEXT("{{CONTENT_PATH}}"), *ContentPath);
+		}
+		return Content;
+	};
 
-	// ── 工具列表(精简) ──
-	// 本地工具的简短描述,不展开 schema(用户问时再说)
-	Prompt += TEXT("## 工具列表\n");
-	Prompt += TEXT("### MCP 工具(直接调用,无需发现)\n");
-	Prompt += TEXT("- **call_tool** — 调用 MCP 工具。参数: `toolset_name` (string), `tool_name` (string), `arguments` (object)。具体 toolset/tool 名见下方 \"MCP Toolset 索引\"。\n");
-	Prompt += TEXT("### Skill 懒加载工具(面对陌生任务必先用 list_skills)\n");
-	Prompt += TEXT("- **list_skills** — 列出所有可用 skill 的轻量摘要(name + description + toolset + keywords)。**面对陌生任务时必先调用此工具**发现可用 toolset。无参数。\n");
-	Prompt += TEXT("- **get_skills** — 加载指定 skill 的完整内容(含完整 schema、示例、Critical Rules)。参数: `skill_name` (string,来自 list_skills 结果)。结果会话级缓存(LRU,上限 5)。\n");
-	Prompt += TEXT("### 本地高效工具(优先使用,节省时间)\n");
-	Prompt += TEXT("- **batch_read_files** — 批量读取多个文件。参数: `file_paths` (array of strings)。**读取多个文件时必须用这个,禁止逐个读**\n");
-	Prompt += TEXT("- **search_codebase** — 搜索整个代码库。参数: `pattern` (string), `path` (可选), `file_pattern` (可选,默认 *.cpp,*.h), `max_results` (可选,默认 50)。**找代码先用这个**\n");
-	Prompt += TEXT("- **glob_search** — 按文件名模式搜索文件。参数: `pattern` (string, 如 *.cpp, **/*.h), `path` (可选)。**找文件用这个**\n");
-	Prompt += TEXT("- **list_directory** — 列出目录内容,**创建资产前必须先调用此工具查看目标文件夹**。参数: `path` (string, 如 /Game/Materials/)\n");
-	Prompt += TEXT("### 本地辅助工具\n");
-	Prompt += TEXT("- **screenshot** — 截取屏幕图片,你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
-	Prompt += TEXT("- **select** — 选择 Actor。参数: `name` (string)\n");
-	Prompt += TEXT("- **inspect** — 检查选中 Actor 属性\n");
-	Prompt += TEXT("- **generate_image** — 调用生图模型生成图片。**当用户要求生成/创建/绘制图片时必须调用此工具**。\n");
-	Prompt += TEXT("  参数: `prompt` (必需,详细描述), `negative_prompt` (可选), `width`/`height` (可选), `steps`/`cfg_scale` (SD专用), `save_path` (必需,保存路径)\n");
-	Prompt += TEXT("  返回: `status` (ok/error), `image_url` (图片URL), `image_data` (base64图片数据), `saved_path` (保存路径)\n");
-	Prompt += TEXT("  save_path 支持: `project:/Textures/` (项目Content目录), `saved:/Images/` (项目Saved目录), 或绝对路径如 `C:/Project/Textures/`\n");
-	Prompt += TEXT("  默认保存到 `saved:/GeneratedImages/`（项目Saved目录下），无需每次都指定。\n");
-	Prompt += TEXT("  **重要**: 调用时必须指定 `save_path`，否则图片将保存在临时目录并可能被清理。\n");
-	Prompt += TEXT("  重要: 工具返回后，**不要用 Markdown 图片语法显示图片**，图片会自动显示在对话中。你只需用自然语言描述图片内容即可。\n");
-	Prompt += TEXT("  ✅ 正确调用示例:\n");
-	Prompt += TEXT("  content: \"正在生成图片...\"\n");
-	Prompt += TEXT("  tool_calls: [{ \"name\": \"generate_image\", \"arguments\": { \"prompt\": \"一只可爱的小猫咪，写实风格\", \"save_path\": \"project:/Textures/\" } }]\n");
-	Prompt += TEXT("  ❌ 错误: 在 content 中描述生图意图但不生成 tool_calls，系统会检测并要求重试。\n");
-	Prompt += TEXT("### 控制台工具\n");
-	Prompt += TEXT("- **command** — 纯控制台命令(HighResShot, stat, stat fps 等)\n\n");
+	Prompt += LoadPromptFile(TEXT("system_base.md"));
+	Prompt += TEXT("\n\n");
+	Prompt += LoadPromptFile(TEXT("image_gen.md"));
+	Prompt += TEXT("\n\n");
+	Prompt += LoadPromptFile(TEXT("tools_local.md"));
+	Prompt += TEXT("\n\n");
 
 	// ── MCP Toolset 索引(从 .mcptoolbox/index.md 加载,~2K tokens) ──
 	// 这是唯一注入的 toolset 信息源。详细 schema 由 get_skills 懒加载(阶段 2)。
@@ -4257,46 +4264,44 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 
 	// Batch read files tool
 	ToolFunctionTable->Add(assistant::FunctionBuilder("batch_read_files")
-		.SetDescription("Read multiple files at once. Returns contents of all files in a single response. Use this instead of reading files one by one to save time.")
+		.SetDescription("Read multiple files at once. Returns contents of all files in a single response.")
 		.AddRequiredParam("file_paths", "Array of absolute file paths to read", "array")
 		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
 			if (!args.contains("file_paths") || !args["file_paths"].is_array())
-			return {.isError = true, .text = R"RAW({"error":"Missing file_paths parameter (must be array)"})RAW"};
+				return {.isError = true, .text = R"({"error":"Missing file_paths parameter (must be array)"})"};
 
-			std::string Result = R"({"status":"ok","files":[)";
-			bool bFirst = true;
-			
+			assistant::json Result;
+			Result["status"] = "ok";
+			Result["files"] = assistant::json::array();
+
 			for (const auto& PathItem : args["file_paths"])
 			{
 				if (!PathItem.is_string()) continue;
-				std::string StdPath = PathItem.get<std::string>();
-				FString FilePath = UTF8_TO_TCHAR(StdPath.c_str());
-				
+				FString FilePath = UTF8_TO_TCHAR(PathItem.get<std::string>().c_str());
 				FString Content;
 				bool bSuccess = FFileHelper::LoadFileToString(Content, *FilePath);
-				
-				if (!bFirst) Result += ",";
-				bFirst = false;
-				
-				Result += R"({"path":")" + StdPath + R"(",)";
+
+				assistant::json FileResult;
+				FileResult["path"] = PathItem.get<std::string>();
 				if (bSuccess)
 				{
-					std::string StdContent = TCHAR_TO_UTF8(*Content);
-					Result += R"("success":true,"content":")" + StdContent + R"("})";
+					FileResult["success"] = true;
+					FileResult["content"] = TCHAR_TO_UTF8(*Content);
 				}
 				else
 				{
-					Result += R"("success":false,"error":"Failed to read file"})";
+					FileResult["success"] = false;
+					FileResult["error"] = "Failed to read file";
 				}
+				Result["files"].push_back(FileResult);
 			}
-			Result += "]}";
-			return {.isError = false, .text = Result};
+			return {.isError = false, .text = Result.dump()};
 		}).Build());
 
 	// Search codebase tool
 	ToolFunctionTable->Add(assistant::FunctionBuilder("search_codebase")
-		.SetDescription("Search for code patterns across the entire codebase using regex. Returns matching files and line numbers.")
-		.AddRequiredParam("pattern", "Regex pattern to search for", "string")
+		.SetDescription("Search for code patterns across the codebase using substring match. Returns matching files and line numbers.")
+		.AddRequiredParam("pattern", "Substring to search for", "string")
 		.AddOptionalParam("path", "Directory to search in (defaults to project source directory)", "string")
 		.AddOptionalParam("file_pattern", "File glob pattern, e.g. *.cpp, *.h (defaults to *.cpp,*.h)", "string")
 		.AddOptionalParam("max_results", "Maximum number of results to return (default 50)", "number")
@@ -4305,59 +4310,47 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			if (Pattern.empty())
 				return {.isError = true, .text = R"({"error":"Missing pattern parameter"})"};
 
-			std::string SearchPath = args.value("path", "");
-			FString BaseDir = SearchPath.empty() ? FPaths::ProjectDir() / TEXT("Source") : UTF8_TO_TCHAR(SearchPath.c_str());
-			
-			std::string FilePattern = args.value("file_pattern", "*.cpp,*.h");
+			FString BaseDir = args.contains("path") ? UTF8_TO_TCHAR(args["path"].get<std::string>().c_str()) : FPaths::ProjectDir() / TEXT("Source");
+			FString FilePatternStr = UTF8_TO_TCHAR(args.value("file_pattern", "*.cpp,*.h").c_str());
 			int32 MaxResults = args.value("max_results", 50);
-			
+
 			TArray<FString> FileTypes;
-			FString FilePatternStr = UTF8_TO_TCHAR(FilePattern.c_str());
 			FilePatternStr.ParseIntoArray(FileTypes, TEXT(","), true);
-			
-			TArray<FString> AllFiles;
+
+			FString SearchStr = UTF8_TO_TCHAR(Pattern.c_str());
+			assistant::json Result;
+			Result["status"] = "ok";
+			Result["pattern"] = Pattern;
+			Result["results"] = assistant::json::array();
+			int32 Count = 0;
+
 			for (const FString& Ext : FileTypes)
 			{
 				TArray<FString> FoundFiles;
 				IFileManager::Get().FindFilesRecursive(FoundFiles, *BaseDir, *Ext.TrimStartAndEnd(), true, false);
-				AllFiles.Append(FoundFiles);
-			}
-			
-			std::string Result = R"({"status":"ok","pattern":")" + Pattern + R"(","results":[)";
-			int32 ResultCount = 0;
-			bool bFirst = true;
-			
-			FString SearchPattern = UTF8_TO_TCHAR(Pattern.c_str());
-			
-			for (const FString& FilePath : AllFiles)
-			{
-				if (ResultCount >= MaxResults) break;
-				
-				FString Content;
-				if (!FFileHelper::LoadFileToString(Content, *FilePath)) continue;
-				
-				TArray<FString> Lines;
-				Content.ParseIntoArrayLines(Lines);
-				
-				for (int32 i = 0; i < Lines.Num() && ResultCount < MaxResults; ++i)
+				for (const FString& Fp : FoundFiles)
 				{
-					if (Lines[i].Contains(SearchPattern))
+					if (Count >= MaxResults) break;
+					FString Content;
+					if (!FFileHelper::LoadFileToString(Content, *Fp)) continue;
+					TArray<FString> Lines;
+					Content.ParseIntoArrayLines(Lines);
+					for (int32 Li = 0; Li < Lines.Num() && Count < MaxResults; ++Li)
 					{
-						if (!bFirst) Result += ",";
-						bFirst = false;
-						
-						std::string StdPath = TCHAR_TO_UTF8(*FilePath);
-						std::string StdLine = TCHAR_TO_UTF8(*Lines[i].TrimStartAndEnd());
-						
-						Result += R"({"file":")" + StdPath + R"(",)"
-							+ R"("line":)" + std::to_string(i + 1) + R"(,)"
-							+ R"("content":")" + StdLine + R"("})";
-						ResultCount++;
+						if (Lines[Li].Contains(SearchStr))
+						{
+							assistant::json Hit;
+							Hit["file"] = TCHAR_TO_UTF8(*Fp);
+							Hit["line"] = Li + 1;
+							Hit["content"] = TCHAR_TO_UTF8(*Lines[Li].TrimStartAndEnd());
+							Result["results"].push_back(Hit);
+							Count++;
+						}
 					}
 				}
 			}
-			Result += R"(],"total":)" + std::to_string(ResultCount) + "}";
-			return {.isError = false, .text = Result};
+			Result["total"] = Count;
+			return {.isError = false, .text = Result.dump()};
 		}).Build());
 
 	// Glob search tool
@@ -4370,12 +4363,10 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			if (Pattern.empty())
 				return {.isError = true, .text = R"({"error":"Missing pattern parameter"})"};
 
-			std::string BasePath = args.value("path", "");
-			FString BaseDir = BasePath.empty() ? FPaths::ProjectDir() : UTF8_TO_TCHAR(BasePath.c_str());
+			FString BaseDir = args.contains("path") ? UTF8_TO_TCHAR(args["path"].get<std::string>().c_str()) : FPaths::ProjectDir();
 			FString SearchPattern = UTF8_TO_TCHAR(Pattern.c_str());
-			
+
 			TArray<FString> FoundFiles;
-			
 			if (SearchPattern.Contains(TEXT("**")))
 			{
 				FString LeafPattern = FPaths::GetCleanFilename(SearchPattern);
@@ -4384,18 +4375,17 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			}
 			else
 			{
-				IFileManager::Get().FindFiles(FoundFiles, *(BaseDir / SearchPattern), false, false);
+				IFileManager::Get().FindFiles(FoundFiles, *(BaseDir / SearchPattern), true, false);
 			}
-			
-			std::string Result = R"({"status":"ok","pattern":")" + Pattern + R"(","files":[)";
+
+			assistant::json Result;
+			Result["status"] = "ok";
+			Result["pattern"] = Pattern;
+			Result["files"] = assistant::json::array();
 			for (int32 i = 0; i < FoundFiles.Num(); ++i)
-			{
-				if (i > 0) Result += ",";
-				FString FullPath = BaseDir / FoundFiles[i];
-				Result += R"(")" + std::string(TCHAR_TO_UTF8(*FullPath)) + R"(")";
-			}
-			Result += R"(],"count":)" + std::to_string(FoundFiles.Num()) + "}";
-			return {.isError = false, .text = Result};
+				Result["files"].push_back(TCHAR_TO_UTF8(*(BaseDir / FoundFiles[i])));
+			Result["count"] = FoundFiles.Num();
+			return {.isError = false, .text = Result.dump()};
 		}).Build());
 
 	// List directory tool
@@ -4415,20 +4405,16 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			IFileManager::Get().FindFiles(Files, *(DirPath / TEXT("*")), true, false);
 			IFileManager::Get().FindFiles(Dirs, *(DirPath / TEXT("*")), false, true);
 
-			std::string Result = R"({"status":"ok","path":")" + Path + R"(","directories":[)";
+			assistant::json J;
+			J["status"] = "ok";
+			J["path"] = Path;
+			J["directories"] = assistant::json::array();
+			J["files"] = assistant::json::array();
 			for (int32 i = 0; i < Dirs.Num(); ++i)
-			{
-				if (i > 0) Result += ",";
-				Result += R"(")" + std::string(TCHAR_TO_UTF8(*Dirs[i])) + R"(")";
-			}
-			Result += R"(],"files":[)";
+				J["directories"].push_back(TCHAR_TO_UTF8(*Dirs[i]));
 			for (int32 i = 0; i < Files.Num(); ++i)
-			{
-				if (i > 0) Result += ",";
-				Result += R"(")" + std::string(TCHAR_TO_UTF8(*Files[i])) + R"(")";
-			}
-			Result += "]}";
-			return {.isError = false, .text = Result};
+				J["files"].push_back(TCHAR_TO_UTF8(*Files[i]));
+			return {.isError = false, .text = J.dump()};
 		}).Build());
 
 	// ── Stage 2: Skill lazy-loading virtual tools (VibeUE ListSkills/GetSkills protocol) ──
