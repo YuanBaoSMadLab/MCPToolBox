@@ -1155,7 +1155,7 @@ FString SMCPToolboxChatWidget::GenerateImage_WebUI(const FMCPToolboxAPIKeyEntry*
 
 			FString Filename = FPaths::GetCleanFilename(FinalPath);
 			if (Filename.IsEmpty() || FPaths::GetExtension(Filename).IsEmpty())
-				Filename = FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp());
+				Filename = FString::Printf(TEXT("img_%s.png"), *FGuid::NewGuid().ToString().Left(8));
 
 			FString FullPath = FPaths::Combine(Folder, Filename);
 
@@ -1520,7 +1520,7 @@ FString SMCPToolboxChatWidget::GenerateImage_ComfyUI(const FMCPToolboxAPIKeyEntr
 										FString DestFilename = FPaths::GetCleanFilename(FinalPath);
 										if (DestFilename.IsEmpty() || FPaths::GetExtension(DestFilename).IsEmpty())
 											DestFilename = Filename.IsEmpty()
-												? FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp())
+												? FString::Printf(TEXT("img_%s.png"), *FGuid::NewGuid().ToString().Left(8))
 												: Filename;
 
 										FString FullPath = FPaths::Combine(Folder, DestFilename);
@@ -1704,7 +1704,7 @@ FString SMCPToolboxChatWidget::GenerateImage_MultimodalLLM(const FMCPToolboxAPIK
 
 			FString DestFilename = FPaths::GetCleanFilename(FinalPath);
 			if (DestFilename.IsEmpty() || FPaths::GetExtension(DestFilename).IsEmpty())
-				DestFilename = FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp());
+				DestFilename = FString::Printf(TEXT("img_%s.png"), *FGuid::NewGuid().ToString().Left(8));
 
 			FString FullPath = FPaths::Combine(Folder, DestFilename);
 
@@ -3321,6 +3321,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 
 					TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
 					ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
+					ArgsObj->SetStringField(TEXT("save_path"), TEXT("project:/Pictures/"));
 						FString OutputJson;
 						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
 						FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
