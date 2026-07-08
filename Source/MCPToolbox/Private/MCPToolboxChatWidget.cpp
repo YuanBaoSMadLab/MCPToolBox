@@ -1264,7 +1264,7 @@ FString SMCPToolboxChatWidget::GenerateImage_ComfyUI(const FMCPToolboxAPIKeyEntr
 						{
 							TSharedPtr<FJsonObject> NewInputs = MakeShareable(new FJsonObject());
 							*NewInputs = *(*InputsPtr);
-							bool bIsNegative = NegNodeId == Pair.Key;
+							bool bIsNegative = NegNodeId == FString(Pair.Key);
 							NewInputs->SetStringField(TEXT("text"), bIsNegative
 								? (NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt)
 								: Prompt);
@@ -4268,7 +4268,7 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 		.AddRequiredParam("file_paths", "Array of absolute file paths to read", "array")
 		.SetCallback([](const assistant::json& args) -> assistant::FunctionResult {
 			if (!args.contains("file_paths") || !args["file_paths"].is_array())
-				return {.isError = true, .text = R"({"error":"Missing file_paths parameter (must be array)"})"};
+				return {.isError = true, .text = R"({"error":"Missing file_paths parameter, must be an array"})"};
 
 			assistant::json Result;
 			Result["status"] = "ok";
