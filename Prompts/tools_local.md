@@ -21,7 +21,7 @@
   Params: `prompt` (required, English), `negative_prompt` (optional, English), `width`/`height` (optional, default 512), `steps`/`cfg_scale` (SD only), `save_path` (required)
   Returns: `status` (ok/error), `image_url`, `image_data` (base64), `saved_path`
   save_path: `project:/Textures/` (Content dir), `saved:/Images/` (Saved dir), or absolute path
-  Default: `project:/GeneratedImages/` (project Content directory).
+  Default: `project:/Pictures/` (project Content/Pictures directory).
   **Important**: always specify `save_path`.
   After tool returns, **do NOT use Markdown image syntax** — image auto-displays in chat.
   Example:

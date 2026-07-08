@@ -681,7 +681,7 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		Async(EAsyncExecution::Thread,
 			[this, TestPrompt]()
 		{
-			FString Result = GenerateImageSync(TestPrompt, TEXT(""), 512, 512, 20, 7.0f, TEXT("project:/GeneratedImages/"));
+			FString Result = GenerateImageSync(TestPrompt, TEXT(""), 512, 512, 20, 7.0f, TEXT("project:/Pictures/"));
 
 			AsyncTask(ENamedThreads::GameThread,
 				[this, Result]()
@@ -4148,7 +4148,7 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 				return {.isError = true, .text = R"({"error":"Missing prompt parameter"})"};
 
 			std::string NegativePrompt = args.value("negative_prompt", "");
-			std::string SavePath = args.value("save_path", "project:/GeneratedImages/");
+			std::string SavePath = args.value("save_path", "project:/Pictures/");
 			int32 Width = args.value("width", 512);
 			int32 Height = args.value("height", 512);
 			int32 Steps = args.value("steps", 20);
@@ -8392,7 +8392,7 @@ void SMCPToolboxChatWidget::HandleStreamingTextCompletion(const FString& Content
 		{
 			TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
 			ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
-			ArgsObj->SetStringField(TEXT("save_path"), TEXT("project:/GeneratedImages/"));
+			ArgsObj->SetStringField(TEXT("save_path"), TEXT("project:/Pictures/"));
 			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&FuncArgs);
 			FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
 		}
