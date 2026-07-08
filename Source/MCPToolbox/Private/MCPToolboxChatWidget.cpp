@@ -681,7 +681,7 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		Async(EAsyncExecution::Thread,
 			[this, TestPrompt]()
 		{
-			FString Result = GenerateImageSync(TestPrompt, TEXT(""), 512, 512, 20, 7.0f, TEXT("saved:/GeneratedImages/"));
+			FString Result = GenerateImageSync(TestPrompt, TEXT(""), 512, 512, 20, 7.0f, TEXT("project:/GeneratedImages/"));
 
 			AsyncTask(ENamedThreads::GameThread,
 				[this, Result]()
@@ -3403,25 +3403,10 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 								{
 									FString DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
 
-									TArray<TSharedPtr<FJsonValue>> ContentArray;
-
-									TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
-									TextPart->SetStringField(TEXT("type"), TEXT("text"));
-									TextPart->SetStringField(TEXT("text"), TEXT("图片已生成，请分析。"));
-									ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
-
-									TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
-									ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
-
-									TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
-									ImageUrlObj->SetStringField(TEXT("url"), DisplayURL);
-									ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
-
-									ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
-
+									// ponytail: don't send image data to AI — display in chat, send text-only to API
 									TSharedPtr<FJsonObject> ImageUserMsg = MakeShareable(new FJsonObject());
 									ImageUserMsg->SetStringField(TEXT("role"), TEXT("user"));
-									ImageUserMsg->SetArrayField(TEXT("content"), ContentArray);
+									ImageUserMsg->SetStringField(TEXT("content"), TEXT("图片已生成，请查看对话中的图片继续回复。"));
 									PendingMsgs->Add(MakeShareable(new FJsonValueObject(ImageUserMsg)));
 
 									FMCPToolboxChatMessage ImageMsg;
@@ -4163,7 +4148,7 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 				return {.isError = true, .text = R"({"error":"Missing prompt parameter"})"};
 
 			std::string NegativePrompt = args.value("negative_prompt", "");
-			std::string SavePath = args.value("save_path", "saved:/GeneratedImages/");
+			std::string SavePath = args.value("save_path", "project:/GeneratedImages/");
 			int32 Width = args.value("width", 512);
 			int32 Height = args.value("height", 512);
 			int32 Steps = args.value("steps", 20);
@@ -8407,7 +8392,7 @@ void SMCPToolboxChatWidget::HandleStreamingTextCompletion(const FString& Content
 		{
 			TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
 			ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
-			ArgsObj->SetStringField(TEXT("save_path"), TEXT("saved:/GeneratedImages/"));
+			ArgsObj->SetStringField(TEXT("save_path"), TEXT("project:/GeneratedImages/"));
 			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&FuncArgs);
 			FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
 		}

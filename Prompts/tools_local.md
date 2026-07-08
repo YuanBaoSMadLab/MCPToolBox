@@ -17,15 +17,16 @@
 - **select** — 选择 Actor。参数: `name` (string)
 - **inspect** — 检查选中 Actor 属性
 - **generate_image** — 调用生图模型生成图片。**当用户要求生成/创建/绘制图片时必须调用此工具**。
-  参数: `prompt` (必需,详细描述), `negative_prompt` (可选), `width`/`height` (可选,默认512), `steps`/`cfg_scale` (SD专用), `save_path` (必需,保存路径)
+  **prompt 必须使用英文**, 生图模型只理解英文提示词。
+  参数: `prompt` (必需,英文详细描述), `negative_prompt` (可选,英文), `width`/`height` (可选,默认512), `steps`/`cfg_scale` (SD专用), `save_path` (必需,保存路径)
   返回: `status` (ok/error), `image_url` (图片URL), `image_data` (base64图片数据), `saved_path` (保存路径)
-  save_path 支持: `project:/Textures/` (项目Content目录), `saved:/Images/` (项目Saved目录), 或绝对路径如 `C:/Project/Textures/`
-  默认保存到 `saved:/GeneratedImages/`（项目Saved目录下），无需每次都指定。
+  save_path 支持: `project:/Textures/` (项目Content目录), `saved:/Images/` (项目Saved目录), 或绝对路径
+  默认保存到 `project:/GeneratedImages/`（项目 Content 目录下）。
   **重要**: 调用时必须指定 `save_path`，否则图片将保存在临时目录并可能被清理。
-  重要: 工具返回后，**不要用 Markdown 图片语法显示图片**，图片会自动显示在对话中。你只需用自然语言描述图片内容即可。
+  重要: 工具返回后，**不要用 Markdown 图片语法显示图片**，图片会自动显示在对话中。
   ✅ 正确调用示例:
   content: "正在生成图片..."
-  tool_calls: [{ "name": "generate_image", "arguments": { "prompt": "一只可爱的小猫咪，写实风格", "save_path": "project:/Textures/" } }]
+  tool_calls: [{ "name": "generate_image", "arguments": { "prompt": "a cute orange kitten, big round eyes, sleeping on soft cushion, warm lighting, photorealistic", "save_path": "project:/Textures/" } }]
   ❌ 错误: 在 content 中描述生图意图但不生成 tool_calls，系统会检测并要求重试。
   **禁止使用 Python 脚本下载/获取图片**。图片的获取、生成、创建只能通过 `generate_image` 工具。
 
