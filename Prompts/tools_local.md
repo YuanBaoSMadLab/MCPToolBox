@@ -16,9 +16,9 @@
 - **screenshot** — Capture screen. Vision mode required.
 - **select** — Select Actor. Param: name.
 - **inspect** — Inspect selected Actor.
-- **generate_image** — Generate image via SD WebUI/ComfyUI/DALL-E. **MUST call this for ANY image request. Translate user's description to English prompt.**
+- **generate_image** — Generate image via SD WebUI/ComfyUI/DALL-E. **MUST call this for ANY image request. You CAN generate images — try the tool first. Only if it returns error, tell user honestly.**
   Params: prompt (required, English), negative_prompt? (English), width?/height? (default 512), steps?/cfg_scale? (SD only), save_path? (default project:/Pictures/)
-  Never describe images with ASCII art or text — call this tool immediately.
+  Translate user's description to English prompt immediately — don't describe with ASCII or text.
 - **command** — Console command.
 
 ### Python
