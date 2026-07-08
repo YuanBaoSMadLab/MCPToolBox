@@ -3305,10 +3305,22 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 							UserPrompt = Content;
 
 						// Generate image of: ... — SD models need English context
-						UserPrompt = TEXT("Generate a high quality image of: ") + UserPrompt;
+						// Strip Chinese command prefixes (画一张/生成一个/etc.) to keep subject only
+					static const TCHAR* CmdPrefixes[] = {
+						TEXT("画一张"), TEXT("画一个"), TEXT("画个"), TEXT("画一幅"),
+						TEXT("帮我画"), TEXT("给我画"), TEXT("来一张"), TEXT("来一个"),
+						TEXT("生成一张"), TEXT("生成一个"), TEXT("生成一幅"),
+						TEXT("创建一张"), TEXT("创建一个"), TEXT("绘制一张"),
+					};
+					for (const TCHAR* Pfx : CmdPrefixes)
+					{
+						if (UserPrompt.StartsWith(Pfx))
+							{ UserPrompt = UserPrompt.Mid(FCString::Strlen(Pfx)).TrimStart(); break; }
+					}
+					UserPrompt = TEXT("masterpiece, best quality, ") + UserPrompt;
 
-						TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
-						ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
+					TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
+					ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
 						FString OutputJson;
 						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
 						FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
@@ -3987,11 +3999,29 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 
 	FString ContentPath = FPaths::ProjectContentDir();
 	FString ProjectName = FApp::GetProjectName();
+	// ponytail: resolve Prompts/ dir. BuildPlugin packages into Output but doesn't
+	// copy Prompts/ — fall back to source tree when running from packaged output.
 	FString PluginDir = FPaths::GetPath(FPaths::GetPath(FModuleManager::Get().GetModuleFilename("MCPToolbox")));
-
-	// ponytail: resolve PluginDir from uplugin file for reliability
-	TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("MCPToolbox"));
-	if (Plugin.IsValid()) PluginDir = Plugin->GetBaseDir();
+	auto FindPromptsDir = [&]() -> FString {
+		// 1) Try the resolved plugin dir (works when running from source)
+		if (FPaths::FileExists(PluginDir / TEXT("Prompts") / TEXT("system_base.md")))
+			return PluginDir;
+		// 2) Try IPluginManager (works for registered plugins)
+		TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("MCPToolbox"));
+		if (Plugin.IsValid())
+		{
+			FString D = Plugin->GetBaseDir();
+			if (FPaths::FileExists(D / TEXT("Prompts") / TEXT("system_base.md")))
+				return D;
+		}
+		// 3) Fallback: replace Output path pattern with source path
+		FString SrcDir = PluginDir;
+		SrcDir.ReplaceInline(TEXT("MCPToolbox_Output/HostProject/Plugins/MCPToolbox"), TEXT("MCPToolbox"));
+		if (FPaths::FileExists(SrcDir / TEXT("Prompts") / TEXT("system_base.md")))
+			return SrcDir;
+		return PluginDir; // last resort, will log errors
+	};
+	PluginDir = FindPromptsDir();
 
 	// ── Load prompt fragments from MD files (ponytail: keep prompts out of C++) ──
 	auto LoadPromptFile = [&](const FString& Filename) -> FString {
