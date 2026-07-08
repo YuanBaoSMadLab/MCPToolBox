@@ -27,6 +27,10 @@
   content: "正在生成图片..."
   tool_calls: [{ "name": "generate_image", "arguments": { "prompt": "一只可爱的小猫咪，写实风格", "save_path": "project:/Textures/" } }]
   ❌ 错误: 在 content 中描述生图意图但不生成 tool_calls，系统会检测并要求重试。
+  **禁止使用 Python 脚本下载/获取图片**。图片的获取、生成、创建只能通过 `generate_image` 工具。
 
 ### 控制台工具
 - **command** — 纯控制台命令(HighResShot, stat, stat fps 等)
+
+### Python 使用限制
+- **禁止使用 Python 下载文件、获取网络资源、调用外部 API**。Python 仅限 UE 编辑器操作(资产管理、蓝图编辑等)。
