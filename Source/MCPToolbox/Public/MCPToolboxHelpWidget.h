@@ -46,6 +46,9 @@ private:
 	/** Build the Quick Start guide section */
 	TSharedRef<SWidget> CreateQuickStartSection();
 
+	/** Build the Image Generation section */
+	TSharedRef<SWidget> CreateImageGenerationSection();
+
 	/** Build the FAQ section with 12+ entries */
 	TSharedRef<SWidget> CreateFAQSection();
 

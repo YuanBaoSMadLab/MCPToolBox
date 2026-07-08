@@ -48,15 +48,23 @@ void SMCPToolboxHelpWidget::Construct(const FArguments& InArgs)
 			.Padding(0.0f, 0.0f, 4.0f, 0.0f)
 			[
 				SNew(SButton)
-				.Text(LOCTEXT("MCPToolboxHelp_TabFAQ", "常见问题"))
+				.Text(LOCTEXT("MCPToolboxHelp_TabImageGen", "图片生成"))
 				.OnClicked(this, &SMCPToolboxHelpWidget::OnTabClicked, 1)
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(0.0f, 0.0f, 4.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("MCPToolboxHelp_TabFAQ", "常见问题"))
+				.OnClicked(this, &SMCPToolboxHelpWidget::OnTabClicked, 2)
 			]
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			[
 				SNew(SButton)
 				.Text(LOCTEXT("MCPToolboxHelp_TabCommands", "命令参考"))
-				.OnClicked(this, &SMCPToolboxHelpWidget::OnTabClicked, 2)
+				.OnClicked(this, &SMCPToolboxHelpWidget::OnTabClicked, 3)
 			]
 		]
 
@@ -136,9 +144,12 @@ void SMCPToolboxHelpWidget::SetHelpContent(int32 TabIndex)
 		ContentContainer->AddSlot().AutoHeight().Padding(16.0f)[ CreateQuickStartSection() ];
 		break;
 	case 1:
-		ContentContainer->AddSlot().AutoHeight().Padding(16.0f)[ CreateFAQSection() ];
+		ContentContainer->AddSlot().AutoHeight().Padding(16.0f)[ CreateImageGenerationSection() ];
 		break;
 	case 2:
+		ContentContainer->AddSlot().AutoHeight().Padding(16.0f)[ CreateFAQSection() ];
+		break;
+	case 3:
 		ContentContainer->AddSlot().AutoHeight().Padding(16.0f)[ CreateCommandReferenceSection() ];
 		break;
 	}
@@ -403,6 +414,44 @@ TSharedRef<SWidget> SMCPToolboxHelpWidget::CreateQuickStartSection()
 		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_Tip3", "使用设置标签页配置主题、语言和默认参数。")) ];
 }
 
+TSharedRef<SWidget> SMCPToolboxHelpWidget::CreateImageGenerationSection()
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight()[ CreateSectionHeader(LOCTEXT("MCPToolboxHelp_ImageGenHeader", "图片生成功能")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenIntro", "MCP Toolbox 支持三种图片生成方式，您可以根据环境和需求选择合适的方案。")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 16.0f, 0.0f, 0.0f)[ CreateSubSectionHeader(LOCTEXT("MCPToolboxHelp_ImageGenModes", "三种生图模式")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateBoldText(LOCTEXT("MCPToolboxHelp_ImageGenWebUI", "模式一：SD WebUI（本地）")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenWebUIDesc", "使用本地部署的 Stable Diffusion WebUI 服务。适用于已有 SD WebUI 环境的用户。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateCodeBlock(TEXT("服务商: SD WebUI (本地)\n地址: http://127.0.0.1:7860\n模型: sd-1.5, sdxl, flux, 或手动输入")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenWebUITips", "提示：服务端需要在设置中启用 API 支持（--api 参数）。")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 8.0f, 0.0f, 0.0f)[ CreateBoldText(LOCTEXT("MCPToolboxHelp_ImageGenComfyUI", "模式二：ComfyUI（本地）")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenComfyUIDesc", "使用本地部署的 ComfyUI 服务。支持复杂工作流，推荐高级用户使用。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateCodeBlock(TEXT("服务商: ComfyUI (本地)\n地址: http://127.0.0.1:8200\n模型: sdxl, flux, sd-1.5, 或工作流文件名")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenComfyUITips", "提示：可将 ComfyUI 导出的工作流 JSON 文件放入 Saved/ComfyUIWorkflows/ 目录。")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 8.0f, 0.0f, 0.0f)[ CreateBoldText(LOCTEXT("MCPToolboxHelp_ImageGenCloud", "模式三：云端多模态模型")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_ImageGenCloudDesc", "使用云端 API 服务。无需本地部署，配置简单。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateCodeBlock(TEXT("OpenAI DALL-E: https://api.openai.com/v1\nReplicate: https://api.replicate.com/v1\nPollinations AI: https://api.pollinations.ai")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 16.0f, 0.0f, 0.0f)[ CreateSubSectionHeader(LOCTEXT("MCPToolboxHelp_ImageGenUsage", "使用方法")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateStep(1, LOCTEXT("MCPToolboxHelp_ImageGenStep1", "在 API 管理标签页添加生图模型配置。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateStep(2, LOCTEXT("MCPToolboxHelp_ImageGenStep2", "在对话中直接要求 AI 生成图片，如：\"帮我画一只可爱的小猫\"。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateStep(3, LOCTEXT("MCPToolboxHelp_ImageGenStep3", "AI 会自动调用 generate_image 工具，生成图片后显示在对话中。")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateStep(4, LOCTEXT("MCPToolboxHelp_ImageGenStep4", "也可以使用 /test_image 命令手动测试生图功能。")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 16.0f, 0.0f, 0.0f)[ CreateSubSectionHeader(LOCTEXT("MCPToolboxHelp_ImageGenParams", "参数说明")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamPrompt", "prompt"), LOCTEXT("MCPToolboxHelp_ParamPromptDesc", "图片描述提示词"), LOCTEXT("MCPToolboxHelp_ParamRequired", "必填")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamNegPrompt", "negative_prompt"), LOCTEXT("MCPToolboxHelp_ParamNegPromptDesc", "负面提示词（排除内容）"), LOCTEXT("MCPToolboxHelp_ParamOptional", "可选")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamWidth", "width"), LOCTEXT("MCPToolboxHelp_ParamWidthDesc", "图片宽度（默认1024）"), LOCTEXT("MCPToolboxHelp_ParamOptional", "可选")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamHeight", "height"), LOCTEXT("MCPToolboxHelp_ParamHeightDesc", "图片高度（默认1024）"), LOCTEXT("MCPToolboxHelp_ParamOptional", "可选")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamSteps", "steps"), LOCTEXT("MCPToolboxHelp_ParamStepsDesc", "生成步数（默认20）"), LOCTEXT("MCPToolboxHelp_ParamOptional", "可选")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateTableRow(LOCTEXT("MCPToolboxHelp_ParamCfg", "cfg_scale"), LOCTEXT("MCPToolboxHelp_ParamCfgDesc", "CFG比例（默认7.0）"), LOCTEXT("MCPToolboxHelp_ParamOptional", "可选")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 16.0f, 0.0f, 0.0f)[ CreateWarningBox(LOCTEXT("MCPToolboxHelp_ImageGenWarning", "注意：生图功能需要在 API 设置中正确配置生图模型。本地模型需要先启动对应服务（SD WebUI 或 ComfyUI）。")) ];
+}
+
 TSharedRef<SWidget> SMCPToolboxHelpWidget::CreateFAQSection()
 {
 	return SNew(SVerticalBox)
@@ -427,7 +476,10 @@ TSharedRef<SWidget> SMCPToolboxHelpWidget::CreateFAQSection()
 		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_A6", "A: 是的。API 密钥存储在 Unreal Engine 配置系统中，仅用于经过身份验证的 API 请求。它们绝不会被传输给第三方。")) ]
 
 		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 8.0f, 0.0f, 0.0f)[ CreateBoldText(LOCTEXT("MCPToolboxHelp_Q7", "Q: 如何更新插件？")) ]
-		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_A7", "A: 从市场或仓库下载最新版本。关闭编辑器，替换插件文件夹，然后重新启动。更新后您的设置将保留。")) ];
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_A7", "A: 从市场或仓库下载最新版本。关闭编辑器，替换插件文件夹，然后重新启动。更新后您的设置将保留。")) ]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 8.0f, 0.0f, 0.0f)[ CreateBoldText(LOCTEXT("MCPToolboxHelp_Q8", "Q: 生图时 UE 编辑器卡死怎么办？")) ]
+		+ SVerticalBox::Slot().AutoHeight()[ CreateParagraph(LOCTEXT("MCPToolboxHelp_A8", "A: 生图功能已改为异步执行，不会再阻塞主线程。如果仍出现卡死，请检查：1）本地 SD WebUI/ComfyUI 服务是否正常运行；2）API 地址端口是否正确（WebUI 默认 7860，ComfyUI 默认 8200）；3）网络连接是否正常。")) ];
 }
 
 TSharedRef<SWidget> SMCPToolboxHelpWidget::CreateCommandReferenceSection()

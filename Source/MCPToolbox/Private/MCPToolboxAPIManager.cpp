@@ -47,6 +47,13 @@ const TArray<FMCPToolboxProviderPreset>& FMCPToolboxProviderPreset::GetAll()
 		{TEXT("llamacpp"),     TEXT("llama.cpp (本地)"), TEXT("http://127.0.0.1:8088/v1"),   {}, false},
 		{TEXT("lmstudio"),     TEXT("LM Studio (本地)"), TEXT("http://127.0.0.1:1234/v1"),   {}, false},
 		{TEXT("custom"),       TEXT("自定义 (OpenAI 兼容)"), TEXT(""),                         {}, false},
+
+		// ======== 生图模型 ========
+		{TEXT("openai-image"), TEXT("OpenAI DALL-E"), TEXT("https://api.openai.com/v1"), {TEXT("dall-e-3"), TEXT("dall-e-2")}, false, true, EMCPToolboxImageGenType::MultimodalLLM},
+		{TEXT("sd-local"),     TEXT("SD WebUI (本地)"), TEXT("http://127.0.0.1:7860"), {TEXT("sd-1.5"), TEXT("sdxl"), TEXT("flux")}, false, true, EMCPToolboxImageGenType::WebUI},
+		{TEXT("comfyui"),      TEXT("ComfyUI (本地)"), TEXT("http://127.0.0.1:8200"), {TEXT("sdxl"), TEXT("flux"), TEXT("sd-1.5")}, false, true, EMCPToolboxImageGenType::ComfyUI},
+		{TEXT("replicate-img"),TEXT("Replicate (生图)"), TEXT("https://api.replicate.com/v1"), {TEXT("sdxl"), TEXT("flux"), TEXT("stable-diffusion")}, false, true, EMCPToolboxImageGenType::MultimodalLLM},
+		{TEXT("pollinations"), TEXT("Pollinations AI"), TEXT("https://api.pollinations.ai"), {TEXT("pollinations"), TEXT("pollinations-3d"), TEXT("pollinations-anime")}, false, true, EMCPToolboxImageGenType::MultimodalLLM},
 	};
 
 	return Presets;
@@ -247,6 +254,11 @@ void FMCPToolboxAPIManager::LoadEntries()
 		(*Obj)->TryGetStringField(TEXT("model_id"), Entry.ModelId);
 		(*Obj)->TryGetStringField(TEXT("encrypted_key"), Entry.EncryptedKey);
 		(*Obj)->TryGetBoolField(TEXT("is_custom"), Entry.bIsCustom);
+		(*Obj)->TryGetBoolField(TEXT("is_image_generation"), Entry.bIsImageGeneration);
+		
+		int32 ImageGenTypeInt = 0;
+		if ((*Obj)->TryGetNumberField(TEXT("image_gen_type"), ImageGenTypeInt))
+			Entry.ImageGenType = static_cast<EMCPToolboxImageGenType>(ImageGenTypeInt);
 
 		FString TimeStr;
 		if ((*Obj)->TryGetStringField(TEXT("created_at"), TimeStr))
@@ -274,6 +286,8 @@ void FMCPToolboxAPIManager::SaveEntries()
 		Obj->SetStringField(TEXT("model_id"), Entry.ModelId);
 		Obj->SetStringField(TEXT("encrypted_key"), Entry.EncryptedKey);
 		Obj->SetBoolField(TEXT("is_custom"), Entry.bIsCustom);
+		Obj->SetBoolField(TEXT("is_image_generation"), Entry.bIsImageGeneration);
+		Obj->SetNumberField(TEXT("image_gen_type"), static_cast<int32>(Entry.ImageGenType));
 		Obj->SetStringField(TEXT("created_at"), Entry.CreatedAt.ToIso8601());
 		Arr.Add(MakeShareable(new FJsonValueObject(Obj)));
 	}
@@ -308,6 +322,8 @@ void FMCPToolboxAPIManager::AddEntry(const FString& ProviderId, const FString& M
 	                (Preset ? Preset->BaseURL : TEXT(""));
 	Entry.ModelId = ModelId;
 	Entry.bIsCustom = (Preset == nullptr);
+	Entry.bIsImageGeneration = Preset && Preset->IsImageGeneration();
+	Entry.ImageGenType = Preset ? Preset->ImageGenType : EMCPToolboxImageGenType::None;
 	Entry.CreatedAt = FDateTime::Now();
 
 	// 本地Base64编码存储密钥（无需强加密，仅防窥视）
@@ -368,6 +384,148 @@ void FMCPToolboxAPIManager::SetActiveEntry(const FString& EntryId)
 	ActiveEntryId = EntryId;
 	SaveEntries();
 	OnEntriesChanged.Broadcast();
+}
+
+TArray<const FMCPToolboxAPIKeyEntry*> FMCPToolboxAPIManager::GetImageGenerationEntries() const
+{
+	TArray<const FMCPToolboxAPIKeyEntry*> Result;
+	for (const auto& Entry : Entries)
+	{
+		if (Entry.bIsImageGeneration)
+			Result.Add(&Entry);
+	}
+	return Result;
+}
+
+TArray<FString> FMCPToolboxAPIManager::GetAvailableSDModels(const FString& BaseURL) const
+{
+	TArray<FString> Models;
+	FString URL = BaseURL + TEXT("/sdapi/v1/sd-models");
+
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(URL);
+	Request->SetVerb(TEXT("GET"));
+	Request->SetTimeout(10.0f);
+
+	bool bDone = false;
+	FHttpResponsePtr Response;
+	bool bSuccess = false;
+
+	Request->OnProcessRequestComplete().BindLambda(
+		[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+		{
+			bDone = true;
+			bSuccess = bSuc;
+			Response = Resp;
+		});
+
+	Request->ProcessRequest();
+	while (!bDone)
+		FPlatformProcess::Sleep(0.01f);
+
+	if (!bSuccess || !Response.IsValid() || Response->GetResponseCode() != 200)
+		return Models;
+
+	FString RespBody = Response->GetContentAsString();
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+		return Models;
+
+	const TArray<TSharedPtr<FJsonValue>>* ModelsArray;
+	if (Result->TryGetArrayField(TEXT(""), ModelsArray))
+	{
+		for (const auto& ModelValue : *ModelsArray)
+		{
+			TSharedPtr<FJsonObject> ModelObj = ModelValue->AsObject();
+			if (ModelObj.IsValid())
+			{
+				FString ModelName;
+				ModelObj->TryGetStringField(TEXT("model_name"), ModelName);
+				if (!ModelName.IsEmpty())
+					Models.Add(ModelName);
+			}
+		}
+	}
+
+	return Models;
+}
+
+TArray<FString> FMCPToolboxAPIManager::GetAvailableComfyUIWorkflows(const FString& BaseURL) const
+{
+	TArray<FString> Workflows;
+
+	FString URL = BaseURL + TEXT("/object_info");
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(URL);
+	Request->SetVerb(TEXT("GET"));
+	Request->SetTimeout(10.0f);
+
+	bool bDone = false;
+	FHttpResponsePtr Response;
+	bool bSuccess = false;
+
+	Request->OnProcessRequestComplete().BindLambda(
+		[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+		{
+			bDone = true;
+			bSuccess = bSuc;
+			Response = Resp;
+		});
+
+	Request->ProcessRequest();
+	while (!bDone)
+		FPlatformProcess::Sleep(0.01f);
+
+	if (!bSuccess || !Response.IsValid() || Response->GetResponseCode() != 200)
+		return Workflows;
+
+	FString RespBody = Response->GetContentAsString();
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+		return Workflows;
+
+	for (const auto& Pair : Result->Values)
+	{
+		FString NodeName(Pair.Key);
+		if (NodeName.Contains(TEXT("CheckpointLoader")))
+		{
+			TSharedPtr<FJsonObject> NodeInfo = Pair.Value->AsObject();
+			if (NodeInfo.IsValid())
+			{
+				const TSharedPtr<FJsonObject>* Inputs;
+				if (NodeInfo->TryGetObjectField(TEXT("input"), Inputs) && Inputs && (*Inputs).IsValid())
+				{
+					const TArray<TSharedPtr<FJsonValue>>* CkptOptions;
+					if ((*Inputs)->TryGetArrayField(TEXT("ckpt_name"), CkptOptions))
+					{
+						for (const auto& Option : *CkptOptions)
+						{
+							FString CkptName = Option->AsString();
+							if (!CkptName.IsEmpty() && !Workflows.Contains(CkptName))
+								Workflows.Add(CkptName);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	FString WorkflowDir = FPaths::ProjectSavedDir() / TEXT("ComfyUIWorkflows");
+	if (FPaths::DirectoryExists(WorkflowDir))
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFilesRecursive(Files, *WorkflowDir, TEXT("*.json"), true, false);
+		for (const FString& File : Files)
+		{
+			FString Filename = FPaths::GetBaseFilename(File);
+			if (!Filename.IsEmpty() && !Workflows.Contains(Filename))
+				Workflows.Add(Filename);
+		}
+	}
+
+	return Workflows;
 }
 
 // ---- 视觉支持检测 ----

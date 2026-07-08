@@ -452,6 +452,27 @@ private:
 	/** Whether the "more actions" secondary toolbar row is expanded */
 	bool bMoreExpanded = false;
 
+	// ---- Image Generation ----
+
+	/** Whether image generation mode is enabled */
+	bool bImageGenerationMode = false;
+
+	/** Send an image generation request (async, for direct user mode) */
+	void SendImageGenerationRequest(const FString& Prompt);
+
+	/** Handle image generation response (async) */
+	void HandleImageGenerationResponse(FHttpResponsePtr Resp, const FString& Prompt, const FString& ProviderId);
+
+	FString GenerateImage_WebUI(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath = TEXT(""));
+	FString GenerateImage_ComfyUI(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath = TEXT(""));
+	FString GenerateImage_MultimodalLLM(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath = TEXT(""));
+
+	/** Synchronous image generation (for tool call). Returns JSON result or error message. */
+	FString GenerateImageSync(const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath = TEXT(""));
+
+	/** Handle streaming text completion - detect user intent and auto-trigger tools if needed */
+	void HandleStreamingTextCompletion(const FString& Content);
+
 	// ---- Conversation Summary State ----
 
 	/** True if user previously declined the first-time summary dialog (persisted) */

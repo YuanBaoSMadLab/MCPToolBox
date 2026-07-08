@@ -251,6 +251,50 @@ TSharedRef<SWidget> SMCPToolboxWidget::CreateAPIManagementTab()
 				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 13))
 			]
 
+			// ---- 生图模型说明 ----
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+			[
+				SNew(SBorder)
+				.Padding(FMargin(8.0f))
+				.BorderBackgroundColor(FLinearColor(0.1f, 0.2f, 0.4f, 0.3f))
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ImageGenTitle", "图片生成模型配置"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 11))
+					]
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ImageGenDesc", "支持三种生图方式，请根据环境选择："))
+						.Font(FCoreStyle::GetDefaultFontStyle("", 10))
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(4, 2, 0, 0)
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ImageGenWebUI", "1. SD WebUI (本地) - http://127.0.0.1:7860/"))
+						.Font(FCoreStyle::GetDefaultFontStyle("", 10))
+						.ColorAndOpacity(FLinearColor(0.6f, 0.8f, 1.0f))
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(4, 2, 0, 0)
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ImageGenComfyUI", "2. ComfyUI (本地) - http://127.0.0.1:8200/"))
+						.Font(FCoreStyle::GetDefaultFontStyle("", 10))
+						.ColorAndOpacity(FLinearColor(0.6f, 1.0f, 0.8f))
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(4, 2, 0, 0)
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ImageGenCloud", "3. 云端多模态模型 (DALL-E / Replicate / Pollinations)"))
+						.Font(FCoreStyle::GetDefaultFontStyle("", 10))
+						.ColorAndOpacity(FLinearColor(1.0f, 0.8f, 0.6f))
+					]
+				]
+			]
+
 			// ---- 步骤1：选择服务商 ----
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
 			[

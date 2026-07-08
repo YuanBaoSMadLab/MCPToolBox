@@ -7,6 +7,15 @@
 DECLARE_MULTICAST_DELEGATE(FOnMCPToolboxEntriesChanged);
 DECLARE_DELEGATE_TwoParams(FOnMCPToolboxVisionCheckResult, const FString& /*ProviderId*/, bool /*bSupportsVision*/);
 
+UENUM(BlueprintType)
+enum class EMCPToolboxImageGenType : uint8
+{
+	None = 0,
+	WebUI = 1,
+	ComfyUI = 2,
+	MultimodalLLM = 3,
+};
+
 // ============================================================================
 // API密钥条目 —— 用户添加的每个密钥对应一条记录
 // ============================================================================
@@ -43,6 +52,14 @@ struct MCPTOOLBOX_API FMCPToolboxAPIKeyEntry
 	UPROPERTY()
 	bool bIsCustom = false;
 
+	/** 是否为生图模型 */
+	UPROPERTY()
+	bool bIsImageGeneration = false;
+
+	/** 生图类型 */
+	UPROPERTY()
+	EMCPToolboxImageGenType ImageGenType = EMCPToolboxImageGenType::None;
+
 	/** 创建时间 */
 	UPROPERTY()
 	FDateTime CreatedAt;
@@ -61,10 +78,13 @@ struct MCPTOOLBOX_API FMCPToolboxProviderPreset
 	FString BaseURL;
 	TArray<FString> Models;
 	bool bSupportsVision = false;
+	bool bIsImageGeneration = false;
+	EMCPToolboxImageGenType ImageGenType = EMCPToolboxImageGenType::None;
 
 	static const TArray<FMCPToolboxProviderPreset>& GetAll();
 	static const FMCPToolboxProviderPreset* Find(const FString& ProviderId);
 	static TArray<FString> GetAllProviderIds();
+	bool IsImageGeneration() const { return bIsImageGeneration; }
 };
 
 // ============================================================================
@@ -124,6 +144,13 @@ public:
 	// ---- 获取当前活动条目（最后添加的或用户选择的） ----
 	const FMCPToolboxAPIKeyEntry* GetActiveEntry() const;
 	void SetActiveEntry(const FString& EntryId);
+
+	// ---- 获取生图模型条目 ----
+	TArray<const FMCPToolboxAPIKeyEntry*> GetImageGenerationEntries() const;
+
+	// ---- 获取可用生图模型列表 ----
+	TArray<FString> GetAvailableSDModels(const FString& BaseURL) const;
+	TArray<FString> GetAvailableComfyUIWorkflows(const FString& BaseURL) const;
 
 	// ---- 视觉支持检测 ----
 	void CheckVisionSupport(const FString& ProviderId);

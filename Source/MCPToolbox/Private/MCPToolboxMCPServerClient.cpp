@@ -723,6 +723,9 @@ void FMCPToolboxMCPServerClient::RebuildToolNameSet()
 	{
 		FString N;
 		if (T->TryGetStringField(TEXT("name"), N))
-			McpToolNameSet.Add(N);
+		{
+			if (N != TEXT("call_tool"))
+				McpToolNameSet.Add(N);
+		}
 	}
 }

@@ -5,25 +5,57 @@
 ## 功能特性
 
 - **AI 辅助**: 将 LLM 直接集成到 Unreal Engine 编辑器中
-- **工具调用**: 支持截图、文件操作等自定义工具
-- **视觉模式**: 切换图像输入/输出的视觉功能
+- **工具调用**: 支持截图、文件操作、命令执行等自定义工具
+- **视觉模式**: 切换图像输入/输出的视觉功能，支持本地 VL 预处理
 - **会话管理**: 按项目组织对话，支持持久化存储
 - **技能系统**: 可扩展的插件架构，支持自定义技能
 - **记忆系统**: 从记忆文件自动注入上下文
 - **DAG 多工具编排**: 依赖解析的并行工具执行 (LLMCompiler 风格)
 - **辅助模型系统**: 本地轻量模型用于加速和优化
+- **图片生成**: 支持 SD WebUI、ComfyUI、云端多模态模型等多种生图方式
+
+## 图片生成功能
+
+### 生图模式
+
+支持三种生图模式：
+
+| 模式 | 说明 | 支持服务商 |
+|------|------|-----------|
+| **WebUI** | SD WebUI API 调用 | Stable Diffusion WebUI (本地/远程) |
+| **ComfyUI** | 工作流驱动生图 | ComfyUI 本地服务 (http://127.0.0.1:8200) |
+| **MultimodalLLM** | 云端多模态模型 | OpenAI DALL-E、Replicate、Pollinations AI |
+
+### 使用方式
+
+1. **AI 自动调用** (推荐): 在对话中提及"画"、"生成图片"、"生图"等关键词，AI 将自动调用 `generate_image` 工具
+2. **用户直接模式**: 选择生图模型后直接输入提示词生成
+3. **测试命令**: 使用 `/test_image [提示词]` 绕过 AI 直接测试生图工具
+
+### 生图参数
+
+- `prompt`: 正向提示词
+- `negative_prompt`: 负向提示词
+- `width`/`height`: 图片尺寸
+- `steps`: 采样步数
+- `cfg_scale`: CFG 缩放系数
+- `save_path`: 保存路径 (`project:/` 项目目录, `saved:/` Saved目录, 或绝对路径)
+
+### ComfyUI 工作流
+
+将 ComfyUI 导出的工作流 JSON 文件放置于 `Saved/ComfyUIWorkflows/{ModelId}.json`，系统会自动替换提示词和分辨率。
+
+---
 
 ## 辅助模型系统（可选）
 
 插件可利用本地轻量模型 (Qwen3VL-2B via llama.cpp) 通过两项核心技术加速主 AI 工作流：
 
 ### IdleSpec — 推测执行
-*受 [SpecEyes](https://github.com/MAC-AutoML/SpecEyes) 启发*
 
 当工具正在执行（等待 I/O）时，辅助模型预测下一个工具调用。工具返回后，若预测正确则立即派发下一工具 — **跳过一次完整 LLM 往返**（节省 2-5 秒）。
 
 ### SWE-Pruner — 上下文剪枝
-*受 [SWE-Pruner](https://github.com/Ayanami1314/swe-pruner) 启发*
 
 每轮 LLM 请求前，轻量模型判断各条历史消息与当前任务的相关性，移除无关消息以减少上下文长度并加速 decode。
 
@@ -101,6 +133,7 @@ AuxiliaryModule/
 2. 在设置面板中配置 API 参数
 3. 开始与 AI 助手对话
 4. 切换视觉模式以上传图片（云端或本地 VL 处理）
+5. 提及生图相关关键词，AI 将自动调用生图工具
 
 ## 性能优化 (v2.0)
 
@@ -113,6 +146,7 @@ AuxiliaryModule/
 | 消息构建 | 每条消息 JSON 缓存（不再每轮重建） |
 | 截图 JSON | 直接字符串拼接（消除 2MB base64 Printf 拷贝） |
 | llama-server | 10240 上下文，KV 缓存 q8_0 量化（省 75% 显存） |
+| HTTP 连接 | keep-alive 连接复用（消除 TCP+TLS 握手开销） |
 
 ## 参考项目
 

@@ -13,7 +13,13 @@
 // Assistant library — only FunctionBuilder/FunctionTable (no HTTP layer)
 #include "assistant/function.hpp"
 
-#include "SlateCore.h"
+#include "Layout/Margin.h"
+#include "Layout/Geometry.h"
+#include "Input/Reply.h"
+#include "Input/Events.h"
+#include "Types/SlateEnums.h"
+#include "Brushes/SlateDynamicImageBrush.h"
+#include "Styling/SlateBrush.h"
 #include "Styling/CoreStyle.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/Input/SEditableTextBox.h"
@@ -35,6 +41,8 @@
 #include "HAL/PlatformFileManager.h"
 #include "EngineUtils.h"
 #include "Engine/Selection.h"
+#include "Engine/Texture2D.h"
+#include "Engine/Texture2DDynamic.h"
 #include "HttpModule.h"
 #include "Containers/Ticker.h"
 #include "Async/Async.h"
@@ -402,26 +410,113 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::CreateMessageBubble(const FMCPToolbox
 						.ColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f))
 					]
 				]
-				// Image attachment indicator
+				// Image attachments preview
 			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 4, 0, 0))
 			[
-				SNew(STextBlock)
+				SNew(SVerticalBox)
 				.Visibility_Lambda([MsgCopy = Message]() -> EVisibility {
-					return (MsgCopy.bHasImageAttachment && MsgCopy.ImageFileNames.Num() > 0)
+					return (MsgCopy.bHasImageAttachment && MsgCopy.ImageDataURIs.Num() > 0)
 						? EVisibility::Visible : EVisibility::Collapsed;
 				})
-				.Text_Lambda([MsgCopy = Message]() -> FText
-				{
-					FString Names;
-					for (int32 i = 0; i < MsgCopy.ImageFileNames.Num(); ++i)
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(SBox)
+					.WidthOverride(300.0f)
+					[
+						SNew(SImage)
+						.Image_Lambda([MsgCopy = Message]() -> const FSlateBrush*
+						{
+							static TMap<FString, TSharedPtr<FSlateDynamicImageBrush>> ImageBrushCache;
+							if (MsgCopy.ImageDataURIs.Num() > 0)
+							{
+								FString ImageURI = MsgCopy.ImageDataURIs[0];
+								FString CacheKey = ImageURI;
+								FString Base64Data;
+
+								if (ImageURI.StartsWith(TEXT("data:image/")))
+								{
+									int32 CommaIdx = ImageURI.Find(TEXT(","));
+									if (CommaIdx != INDEX_NONE)
+										Base64Data = ImageURI.RightChop(CommaIdx + 1);
+								}
+								else if (ImageURI.Len() > 100 && ImageURI.MatchesWildcard(TEXT("*[A-Za-z0-9+/=]*")) && !ImageURI.Contains(TEXT("://")))
+								{
+									bool bIsBase64 = true;
+									for (TCHAR C : ImageURI)
+									{
+										if (!FCString::Strchr(TEXT("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="), C))
+										{
+											bIsBase64 = false;
+											break;
+										}
+									}
+									if (bIsBase64)
+									{
+										Base64Data = ImageURI;
+									}
+								}
+
+								if (!Base64Data.IsEmpty())
+								{
+									if (!ImageBrushCache.Contains(CacheKey))
+									{
+										TArray<uint8> RawData;
+										if (FBase64::Decode(Base64Data, RawData))
+										{
+											FString TempPath = FPaths::ProjectSavedDir() / TEXT("MCPToolbox") / TEXT("TempImages");
+											IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+											PlatformFile.CreateDirectoryTree(*TempPath);
+											FString TempFileName = FString::Printf(TEXT("img_%d.png"), FDateTime::Now().GetTicks());
+											FString TempFilePath = TempPath / TempFileName;
+											if (FFileHelper::SaveArrayToFile(RawData, *TempFilePath))
+											{
+												FString FullPath = FPaths::ConvertRelativePathToFull(TempFilePath);
+												TSharedPtr<FSlateDynamicImageBrush> Brush = MakeShareable(new FSlateDynamicImageBrush(
+													FName(*FullPath),
+													FVector2D(400, 400)));
+												ImageBrushCache.Add(CacheKey, Brush);
+											}
+										}
+									}
+									return ImageBrushCache[CacheKey].Get();
+								}
+								else if (ImageURI.StartsWith(TEXT("file://")))
+								{
+									FString FilePath = ImageURI.RightChop(7);
+									if (!ImageBrushCache.Contains(CacheKey))
+									{
+										TSharedPtr<FSlateDynamicImageBrush> Brush = MakeShareable(new FSlateDynamicImageBrush(
+											FName(*FilePath),
+											FVector2D(400, 400)));
+										ImageBrushCache.Add(CacheKey, Brush);
+									}
+									return ImageBrushCache[CacheKey].Get();
+								}
+							}
+							return nullptr;
+						})
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(STextBlock)
+					.Visibility_Lambda([MsgCopy = Message]() -> EVisibility {
+						return (MsgCopy.ImageFileNames.Num() > 0)
+							? EVisibility::Visible : EVisibility::Collapsed;
+					})
+					.Text_Lambda([MsgCopy = Message]() -> FText
 					{
-						if (i > 0) Names += TEXT(", ");
-						Names += MsgCopy.ImageFileNames[i];
-					}
-					return FText::FromString(FString::Printf(TEXT("[图片: %s]"), *Names));
-				})
-				.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
-				.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f))
+						FString Names;
+						for (int32 i = 0; i < MsgCopy.ImageFileNames.Num(); ++i)
+						{
+							if (i > 0) Names += TEXT(", ");
+							Names += MsgCopy.ImageFileNames[i];
+						}
+						return FText::FromString(FString::Printf(TEXT("[图片: %s]"), *Names));
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
+					.ColorAndOpacity(FLinearColor(0.5f, 0.7f, 1.0f))
+				]
 			]
 				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0, 6, 0, 0))
 				[
@@ -558,6 +653,70 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		return FReply::Handled();
 	}
 
+	if (UserText.StartsWith(TEXT("/test_image")))
+	{
+		FString TestPrompt = UserText.Mid(11).TrimStartAndEnd();
+		if (TestPrompt.IsEmpty())
+			TestPrompt = TEXT("A cute little girl, about 5-6 years old, wearing a pretty floral dress, smiling while standing in a sunny flower field with butterflies around, soft warm lighting, high quality digital art style");
+
+		FMCPToolboxChatMessage UserMsg;
+		UserMsg.Role = EMCPToolboxMessageRole::User;
+		UserMsg.Content = TEXT("[测试生图工具] " + TestPrompt);
+		AddMessage(UserMsg);
+		InputTextBox->SetText(FText::GetEmpty());
+
+		bIsWaiting = true;
+
+		FMCPToolboxChatMessage ToolMsg;
+		ToolMsg.Role = EMCPToolboxMessageRole::Thinking;
+		ToolMsg.Content = TEXT("调用工具: generate_image (异步执行)");
+		AddMessage(ToolMsg);
+
+		Async(EAsyncExecution::Thread,
+			[this, TestPrompt]()
+		{
+			FString Result = GenerateImageSync(TestPrompt, TEXT(""), 512, 512, 20, 7.0f, TEXT("saved:/GeneratedImages/"));
+
+			AsyncTask(ENamedThreads::GameThread,
+				[this, Result]()
+			{
+				FMCPToolboxChatMessage ResultMsg;
+				ResultMsg.Role = EMCPToolboxMessageRole::System;
+				ResultMsg.Content = FString::Printf(TEXT("**generate_image** 结果:\n```\n%s\n```"), *Result.Left(2000));
+				AddMessage(ResultMsg);
+
+				if (Result.Contains(TEXT("\"status\":\"ok\"")))
+				{
+					TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+					TSharedPtr<FJsonObject> ResultObj;
+					if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+					{
+						FString ImageURL, ImageData, Status;
+						ResultObj->TryGetStringField(TEXT("status"), Status);
+						ResultObj->TryGetStringField(TEXT("image_url"), ImageURL);
+						ResultObj->TryGetStringField(TEXT("image_data"), ImageData);
+
+						FString DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
+						if (!DisplayURL.IsEmpty() && Status == TEXT("ok"))
+						{
+							FMCPToolboxChatMessage ImageMsg;
+							ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+							ImageMsg.Content = TEXT("**生图成功！**");
+							ImageMsg.bHasImageAttachment = true;
+							ImageMsg.ImageDataURIs.Add(DisplayURL);
+							ImageMsg.ImageFileNames.Add(TEXT("generated.png"));
+							AddMessage(ImageMsg);
+						}
+					}
+				}
+
+				bIsWaiting = false;
+			});
+		});
+
+		return FReply::Handled();
+	}
+
 	FString ApiKey;
 	FBase64::Decode(ActiveEntry->EncryptedKey, ApiKey);
 
@@ -579,9 +738,17 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 
 	bIsWaiting = true;
 	bInterrupted = false;
-	ToolCallIteration = 0; // Reset iteration counter for new message
+	ToolCallIteration = 0;
 	ToolCallHistory.Empty();
 	ConsecutiveSameToolCount = 0;
+
+	// Image generation mode: route to dedicated image generation endpoint
+	// Route when: (1) user explicitly enabled image generation mode, OR (2) active entry is an image generation model
+	if (bImageGenerationMode || ActiveEntry->bIsImageGeneration)
+	{
+		SendImageGenerationRequest(UserText);
+		return FReply::Handled();
+	}
 
 	// Build messages array for API — PRESERVE conversation history!
 	// NOTE: UserMsg has already been pushed into Messages via AddMessage() above,
@@ -610,6 +777,12 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 		// Skip the welcome message — it's UI-only, not for LLM context
 		if (Msg.Role == EMCPToolboxMessageRole::Assistant &&
 			Msg.Content.StartsWith(TEXT("**欢迎使用 MCP Toolbox")))
+			continue;
+
+		// Skip assistant messages with image attachments — these are generated images
+		// that have been displayed in UI. Non-vision models like DeepSeek don't support
+		// image_url content type, and AI should describe the image in text instead.
+		if (Msg.Role == EMCPToolboxMessageRole::Assistant && Msg.bHasImageAttachment)
 			continue;
 
 		TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject());
@@ -709,13 +882,1168 @@ FReply SMCPToolboxChatWidget::OnSendMessage()
 }
 
 // ============================================================================
+// Image Generation Request
+// ============================================================================
+void SMCPToolboxChatWidget::SendImageGenerationRequest(const FString& Prompt)
+{
+	if (bInterrupted) { bIsWaiting = false; return; }
+
+	const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+	if (!ActiveEntry) { bIsWaiting = false; return; }
+
+	FString ApiKey;
+	FBase64::Decode(ActiveEntry->EncryptedKey, ApiKey);
+
+	FString ApiUrl = ActiveEntry->BaseURL;
+	FString ModelId = ActiveEntry->ModelId;
+
+	// Provider-specific URL construction
+	FString Endpoint = TEXT("");
+	if (ActiveEntry->ProviderId == TEXT("openai-image"))
+	{
+		Endpoint = ApiUrl + TEXT("/images/generations");
+	}
+	else if (ActiveEntry->ProviderId == TEXT("sd-local"))
+	{
+		Endpoint = ApiUrl + TEXT("/sdapi/v1/txt2img");
+	}
+	else if (ActiveEntry->ProviderId == TEXT("comfyui"))
+	{
+		Endpoint = ApiUrl + TEXT("/prompt");
+	}
+	else if (ActiveEntry->ProviderId == TEXT("replicate-img"))
+	{
+		Endpoint = ApiUrl + TEXT("/predictions");
+	}
+	else if (ActiveEntry->ProviderId == TEXT("pollinations"))
+	{
+		Endpoint = ApiUrl + TEXT("/api/text2image");
+	}
+	else
+	{
+		bIsWaiting = false;
+		FMCPToolboxChatMessage Err;
+		Err.Role = EMCPToolboxMessageRole::System;
+		Err.Content = FString::Printf(TEXT("不支持的生图服务商: %s"), *ActiveEntry->ProviderName);
+		AddMessage(Err);
+		return;
+	}
+
+	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
+
+	if (ActiveEntry->ProviderId == TEXT("openai-image"))
+	{
+		Body->SetStringField(TEXT("model"), ModelId);
+		Body->SetStringField(TEXT("prompt"), Prompt);
+		Body->SetStringField(TEXT("n"), TEXT("1"));
+		Body->SetStringField(TEXT("size"), TEXT("1024x1024"));
+	}
+	else if (ActiveEntry->ProviderId == TEXT("sd-local"))
+	{
+		Body->SetStringField(TEXT("prompt"), Prompt);
+		Body->SetStringField(TEXT("negative_prompt"), TEXT(""));
+		Body->SetNumberField(TEXT("steps"), 20);
+		Body->SetNumberField(TEXT("width"), 1024);
+		Body->SetNumberField(TEXT("height"), 1024);
+		Body->SetNumberField(TEXT("cfg_scale"), 7.0);
+	}
+	else if (ActiveEntry->ProviderId == TEXT("comfyui"))
+	{
+		FString PromptId = FGuid::NewGuid().ToString();
+		Body->SetStringField(TEXT("prompt_id"), PromptId);
+		
+		TSharedPtr<FJsonObject> Workflow = MakeShareable(new FJsonObject());
+		
+		TSharedPtr<FJsonObject> CheckpointLoader = MakeShareable(new FJsonObject());
+		FString CkptName = ModelId.Contains(TEXT("flux")) ? TEXT("flux-schnell.safetensors") : (ModelId.Contains(TEXT("sdxl")) ? TEXT("sd_xl_base_1.0.safetensors") : TEXT("v1-5-pruned-emaonly.safetensors"));
+		FString CheckpointInputs = FString::Printf(TEXT("{\"ckpt_name\":\"%s\"}"), *CkptName);
+		CheckpointLoader->SetStringField(TEXT("inputs"), CheckpointInputs);
+		CheckpointLoader->SetStringField(TEXT("class_type"), TEXT("CheckpointLoaderSimple"));
+		Workflow->SetObjectField(TEXT("1"), CheckpointLoader);
+		
+		TSharedPtr<FJsonObject> CLIPTextEncode = MakeShareable(new FJsonObject());
+		FString CLIPInputs = FString::Printf(TEXT("{\"text\":\"%s\",\"clip\":[\"1\",0]}"), *Prompt);
+		CLIPTextEncode->SetStringField(TEXT("inputs"), CLIPInputs);
+		CLIPTextEncode->SetStringField(TEXT("class_type"), TEXT("CLIPTextEncode"));
+		Workflow->SetObjectField(TEXT("2"), CLIPTextEncode);
+		
+		TSharedPtr<FJsonObject> CLIPTextEncodeNeg = MakeShareable(new FJsonObject());
+		CLIPTextEncodeNeg->SetStringField(TEXT("inputs"), TEXT("{\"text\":\"\",\"clip\":[\"1\",0]}"));
+		CLIPTextEncodeNeg->SetStringField(TEXT("class_type"), TEXT("CLIPTextEncode"));
+		Workflow->SetObjectField(TEXT("3"), CLIPTextEncodeNeg);
+		
+		TSharedPtr<FJsonObject> KSampler = MakeShareable(new FJsonObject());
+		KSampler->SetStringField(TEXT("inputs"), TEXT("{\"seed\":-1,\"steps\":20,\"cfg\":7.0,\"sampler_name\":\"euler\",\"scheduler\":\"normal\",\"denoise\":1.0,\"model\":[\"1\",0],\"positive\":[\"2\",0],\"negative\":[\"3\",0],\"latent_image\":[\"5\",0]}"));
+		KSampler->SetStringField(TEXT("class_type"), TEXT("KSampler"));
+		Workflow->SetObjectField(TEXT("4"), KSampler);
+		
+		TSharedPtr<FJsonObject> EmptyLatentImage = MakeShareable(new FJsonObject());
+		EmptyLatentImage->SetStringField(TEXT("inputs"), TEXT("{\"width\":1024,\"height\":1024,\"batch_size\":1}"));
+		EmptyLatentImage->SetStringField(TEXT("class_type"), TEXT("EmptyLatentImage"));
+		Workflow->SetObjectField(TEXT("5"), EmptyLatentImage);
+		
+		TSharedPtr<FJsonObject> VAEDecode = MakeShareable(new FJsonObject());
+		VAEDecode->SetStringField(TEXT("inputs"), TEXT("{\"samples\":[\"4\",0],\"vae\":[\"1\",0]}"));
+		VAEDecode->SetStringField(TEXT("class_type"), TEXT("VAEDecode"));
+		Workflow->SetObjectField(TEXT("6"), VAEDecode);
+		
+		TSharedPtr<FJsonObject> SaveImage = MakeShareable(new FJsonObject());
+		SaveImage->SetStringField(TEXT("inputs"), TEXT("{\"filename_prefix\":\"mcp_gen\",\"images\":[\"6\",0]}"));
+		SaveImage->SetStringField(TEXT("class_type"), TEXT("SaveImage"));
+		Workflow->SetObjectField(TEXT("7"), SaveImage);
+		
+		Body->SetObjectField(TEXT("prompt"), Workflow);
+	}
+	else if (ActiveEntry->ProviderId == TEXT("replicate-img"))
+	{
+		FString Version;
+		if (ModelId.Contains(TEXT("sdxl")))
+			Version = TEXT("stability-ai/stable-diffusion-xl:7bf3a1b0cf148149d5270340caf046486809454464c6ab31258e875874c72071");
+		else if (ModelId.Contains(TEXT("flux")))
+			Version = TEXT("black-forest-labs/flux-schnell:5955196189e4c2e6b8e1c062977892415f132619925d2e658b7f997b60a92005");
+		else
+			Version = TEXT("stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21affe81863cbe77e4");
+
+		Body->SetStringField(TEXT("version"), Version);
+
+		TSharedPtr<FJsonObject> Input = MakeShareable(new FJsonObject());
+		Input->SetStringField(TEXT("prompt"), Prompt);
+		Body->SetObjectField(TEXT("input"), Input);
+	}
+	else if (ActiveEntry->ProviderId == TEXT("pollinations"))
+	{
+		Body->SetStringField(TEXT("prompt"), Prompt);
+	}
+
+	FString BodyStr;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+	FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 生图请求: url=%s, model=%s, prompt=%s"), *Endpoint, *ModelId, *Prompt.Left(100));
+
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Endpoint);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	if (!ApiKey.IsEmpty())
+	{
+		if (ActiveEntry->ProviderId == TEXT("replicate-img"))
+		{
+			Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Token %s"), *ApiKey));
+		}
+		else
+		{
+			Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ApiKey));
+		}
+	}
+	Request->SetContentAsString(BodyStr);
+	Request->SetTimeout(120.0f);
+
+	FString PromptCopy = Prompt;
+	FString ProviderIdCopy = ActiveEntry->ProviderId;
+	Request->OnProcessRequestComplete().BindLambda(
+		[this, PromptCopy, ProviderIdCopy](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bSuccess)
+		{
+			if (bInterrupted || !bIsWaiting) return;
+			if (bSuccess && Resp.IsValid())
+				HandleImageGenerationResponse(Resp, PromptCopy, ProviderIdCopy);
+			else
+			{
+				bIsWaiting = false;
+				FMCPToolboxChatMessage Err;
+				Err.Role = EMCPToolboxMessageRole::System;
+				Err.Content = TEXT("生图请求失败。请检查网络连接和API配置。");
+				AddMessage(Err);
+			}
+			ActiveHttpRequest.Reset();
+		});
+
+	ActiveHttpRequest = Request;
+	Request->ProcessRequest();
+}
+
+// ============================================================================
+FString SMCPToolboxChatWidget::GenerateImage_WebUI(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath)
+{
+	FString ApiKey;
+	FBase64::Decode(Entry->EncryptedKey, ApiKey);
+
+	FString Endpoint = Entry->BaseURL + TEXT("/sdapi/v1/txt2img");
+	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
+	Body->SetStringField(TEXT("prompt"), Prompt);
+	Body->SetStringField(TEXT("negative_prompt"), NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt);
+	Body->SetNumberField(TEXT("steps"), Steps);
+	Body->SetNumberField(TEXT("width"), Width);
+	Body->SetNumberField(TEXT("height"), Height);
+	Body->SetNumberField(TEXT("cfg_scale"), CfgScale);
+
+	if (!Entry->ModelId.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> OverrideSettings = MakeShareable(new FJsonObject());
+		OverrideSettings->SetStringField(TEXT("sd_model_checkpoint"), Entry->ModelId);
+		Body->SetObjectField(TEXT("override_settings"), OverrideSettings);
+	}
+
+	FString BodyStr;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+	FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
+
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Endpoint);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetContentAsString(BodyStr);
+	Request->SetTimeout(120.0f);
+
+	bool bDone = false;
+	FHttpResponsePtr Response;
+	bool bSuccess = false;
+
+	Request->OnProcessRequestComplete().BindLambda(
+		[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+		{
+			bDone = true;
+			bSuccess = bSuc;
+			Response = Resp;
+		});
+
+	Request->ProcessRequest();
+	while (!bDone)
+		FPlatformProcess::Sleep(0.01f);
+
+	if (!bSuccess || !Response.IsValid())
+		return TEXT("{\"error\":\"SD WebUI request failed.\"}");
+
+	int32 Code = Response->GetResponseCode();
+	FString RespBody = Response->GetContentAsString();
+
+	if (Code != 200)
+		return FString::Printf(TEXT("{\"error\":\"SD WebUI error (HTTP %d): %s\"}"), Code, *RespBody.Left(500));
+
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+		return TEXT("{\"error\":\"Failed to parse SD WebUI response.\"}");
+
+	const TArray<TSharedPtr<FJsonValue>>* Images;
+	if (Result->TryGetArrayField(TEXT("images"), Images) && Images->Num() > 0)
+	{
+		FString ImageData;
+		(*Images)[0]->TryGetString(ImageData);
+
+		FString SavedPath;
+		if (!SavePath.IsEmpty())
+		{
+			FString FinalPath = SavePath;
+			if (FinalPath.StartsWith(TEXT("project:/")))
+				FinalPath = FPaths::ProjectContentDir() / FinalPath.RightChop(9);
+			else if (FinalPath.StartsWith(TEXT("saved:/")))
+				FinalPath = FPaths::ProjectSavedDir() / FinalPath.RightChop(8);
+
+			IPlatformFile& FileManager = FPlatformFileManager::Get().GetPlatformFile();
+			FString Folder = FPaths::GetPath(FinalPath);
+			if (!FileManager.DirectoryExists(*Folder))
+				FileManager.CreateDirectoryTree(*Folder);
+
+			FString Filename = FPaths::GetCleanFilename(FinalPath);
+			if (Filename.IsEmpty() || FPaths::GetExtension(Filename).IsEmpty())
+				Filename = FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp());
+
+			FString FullPath = FPaths::Combine(Folder, Filename);
+
+			TArray<uint8> RawData;
+			if (FBase64::Decode(ImageData, RawData))
+			{
+				FFileHelper::SaveArrayToFile(RawData, *FullPath);
+				SavedPath = FullPath;
+			}
+		}
+
+		if (!SavedPath.IsEmpty())
+			return FString::Printf(TEXT("{\"status\":\"ok\",\"image_data\":\"data:image/png;base64,%s\",\"saved_path\":\"%s\"}"), *ImageData, *SavedPath);
+		return FString::Printf(TEXT("{\"status\":\"ok\",\"image_data\":\"data:image/png;base64,%s\"}"), *ImageData);
+	}
+
+	return TEXT("{\"error\":\"SD WebUI returned no images.\"}");
+}
+
+FString SMCPToolboxChatWidget::GenerateImage_ComfyUI(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath)
+{
+	// ponytail: auto-detect SD WebUI vs ComfyUI on the same port
+	// Many users run AUTOMATIC1111 WebUI on the same port they intended for ComfyUI.
+	// Probe /sdapi/v1/sd-models — if it responds, this is SD WebUI, not ComfyUI.
+	{
+		auto ProbeReq = FHttpModule::Get().CreateRequest();
+		ProbeReq->SetURL(Entry->BaseURL + TEXT("/sdapi/v1/sd-models"));
+		ProbeReq->SetVerb(TEXT("GET"));
+		ProbeReq->SetTimeout(2.0f);
+		bool bProbeDone = false; bool bProbeOk = false;
+		ProbeReq->OnProcessRequestComplete().BindLambda([&](FHttpRequestPtr, FHttpResponsePtr R, bool b) { bProbeDone = true; bProbeOk = b && R.IsValid() && R->GetResponseCode() == 200; });
+		ProbeReq->ProcessRequest();
+		while (!bProbeDone) FPlatformProcess::Sleep(0.01f);
+		if (bProbeOk)
+		{
+			UE_LOG(LogMCPToolbox, Log, TEXT("[ComfyUI] Auto-detected SD WebUI at %s — redirecting to WebUI path"), *Entry->BaseURL);
+			return GenerateImage_WebUI(Entry, Prompt, NegativePrompt, Width, Height, Steps, CfgScale, SavePath);
+		}
+	}
+
+	FString ApiKey;
+	FBase64::Decode(Entry->EncryptedKey, ApiKey);
+
+	FString Endpoint = Entry->BaseURL + TEXT("/prompt");
+	FString PromptId = FGuid::NewGuid().ToString();
+
+	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
+	Body->SetStringField(TEXT("prompt_id"), PromptId);
+
+	TSharedPtr<FJsonObject> Workflow;
+	FString WorkflowPath = FPaths::ProjectSavedDir() / TEXT("ComfyUIWorkflows") / (Entry->ModelId + TEXT(".json"));
+	if (FPaths::FileExists(WorkflowPath))
+	{
+		FString WorkflowContent;
+		if (FFileHelper::LoadFileToString(WorkflowContent, *WorkflowPath))
+		{
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(WorkflowContent);
+			if (FJsonSerializer::Deserialize(Reader, Workflow) && Workflow.IsValid())
+			{
+				int32 ClipEncodeCount = 0;
+				for (auto& Pair : Workflow->Values)
+				{
+					TSharedPtr<FJsonObject> Node = Pair.Value->AsObject();
+					if (Node.IsValid())
+					{
+						FString ClassType;
+						Node->TryGetStringField(TEXT("class_type"), ClassType);
+						// Match any CLIP text encode variant: CLIPTextEncode, CLIPTextEncodeFlux, CLIPTextEncodeSDXL, etc.
+						if (ClassType.Contains(TEXT("CLIPTextEncode")))
+						{
+							const TSharedPtr<FJsonObject>* InputsPtr;
+							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
+							{
+								TSharedPtr<FJsonObject> NewInputs = MakeShareable(new FJsonObject());
+								*NewInputs = *(*InputsPtr);
+								// First CLIPTextEncode = positive prompt, second = negative prompt
+								if (ClipEncodeCount == 0)
+									NewInputs->SetStringField(TEXT("text"), Prompt);
+								else
+									NewInputs->SetStringField(TEXT("text"), NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt);
+								Node->SetObjectField(TEXT("inputs"), NewInputs);
+								ClipEncodeCount++;
+							}
+						}
+						else if (ClassType == TEXT("EmptyLatentImage"))
+						{
+							const TSharedPtr<FJsonObject>* InputsPtr;
+							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
+							{
+								TSharedPtr<FJsonObject> Inputs = *InputsPtr;
+								Inputs->SetNumberField(TEXT("width"), Width);
+								Inputs->SetNumberField(TEXT("height"), Height);
+							}
+						}
+						else if (ClassType == TEXT("KSampler") || ClassType == TEXT("KSamplerAdvanced"))
+						{
+							const TSharedPtr<FJsonObject>* InputsPtr;
+							if (Node->TryGetObjectField(TEXT("inputs"), InputsPtr) && InputsPtr && (*InputsPtr).IsValid())
+							{
+								TSharedPtr<FJsonObject> Inputs = *InputsPtr;
+								Inputs->SetNumberField(TEXT("steps"), Steps);
+								Inputs->SetNumberField(TEXT("cfg"), CfgScale);
+							}
+						}
+					}
+				}
+				UE_LOG(LogMCPToolbox, Log, TEXT("[ComfyUI] Workflow loaded: %s, CLIPTextEncode nodes: %d, prompt=%s, size=%dx%d"),
+					*WorkflowPath, ClipEncodeCount, *Prompt.Left(50), Width, Height);
+				if (ClipEncodeCount == 0)
+					UE_LOG(LogMCPToolbox, Warning, TEXT("[ComfyUI] No CLIPTextEncode nodes found in workflow! Prompt may not be injected. Check workflow JSON for correct class_type."));
+			}
+		}
+	}
+
+	if (!Workflow.IsValid())
+	{
+		Workflow = MakeShareable(new FJsonObject());
+
+		TSharedPtr<FJsonObject> CheckpointLoader = MakeShareable(new FJsonObject());
+		FString CkptName = Entry->ModelId.Contains(TEXT("flux")) ? TEXT("flux-schnell.safetensors") : (Entry->ModelId.Contains(TEXT("sdxl")) ? TEXT("sd_xl_base_1.0.safetensors") : TEXT("v1-5-pruned-emaonly.safetensors"));
+		TSharedPtr<FJsonObject> CheckpointInputs = MakeShareable(new FJsonObject());
+		CheckpointInputs->SetStringField(TEXT("ckpt_name"), CkptName);
+		CheckpointLoader->SetObjectField(TEXT("inputs"), CheckpointInputs);
+		CheckpointLoader->SetStringField(TEXT("class_type"), TEXT("CheckpointLoaderSimple"));
+		Workflow->SetObjectField(TEXT("1"), CheckpointLoader);
+
+		TSharedPtr<FJsonObject> CLIPTextEncode = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> CLIPInputs = MakeShareable(new FJsonObject());
+		CLIPInputs->SetStringField(TEXT("text"), Prompt);
+		TArray<TSharedPtr<FJsonValue>> ClipLink;
+		ClipLink.Add(MakeShareable(new FJsonValueString(TEXT("1"))));
+		ClipLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		CLIPInputs->SetArrayField(TEXT("clip"), ClipLink);
+		CLIPTextEncode->SetObjectField(TEXT("inputs"), CLIPInputs);
+		CLIPTextEncode->SetStringField(TEXT("class_type"), TEXT("CLIPTextEncode"));
+		Workflow->SetObjectField(TEXT("2"), CLIPTextEncode);
+
+		TSharedPtr<FJsonObject> CLIPTextEncodeNeg = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> CLIPNegInputs = MakeShareable(new FJsonObject());
+		CLIPNegInputs->SetStringField(TEXT("text"), NegativePrompt.IsEmpty() ? TEXT("") : NegativePrompt);
+		TArray<TSharedPtr<FJsonValue>> ClipNegLink;
+		ClipNegLink.Add(MakeShareable(new FJsonValueString(TEXT("1"))));
+		ClipNegLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		CLIPNegInputs->SetArrayField(TEXT("clip"), ClipNegLink);
+		CLIPTextEncodeNeg->SetObjectField(TEXT("inputs"), CLIPNegInputs);
+		CLIPTextEncodeNeg->SetStringField(TEXT("class_type"), TEXT("CLIPTextEncode"));
+		Workflow->SetObjectField(TEXT("3"), CLIPTextEncodeNeg);
+
+		TSharedPtr<FJsonObject> KSampler = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> KSamplerInputs = MakeShareable(new FJsonObject());
+		KSamplerInputs->SetNumberField(TEXT("seed"), -1);
+		KSamplerInputs->SetNumberField(TEXT("steps"), Steps);
+		KSamplerInputs->SetNumberField(TEXT("cfg"), CfgScale);
+		KSamplerInputs->SetStringField(TEXT("sampler_name"), TEXT("euler"));
+		KSamplerInputs->SetStringField(TEXT("scheduler"), TEXT("normal"));
+		KSamplerInputs->SetNumberField(TEXT("denoise"), 1.0);
+		TArray<TSharedPtr<FJsonValue>> ModelLink, PositiveLink, NegativeLink, LatentLink;
+		ModelLink.Add(MakeShareable(new FJsonValueString(TEXT("1"))));
+		ModelLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		PositiveLink.Add(MakeShareable(new FJsonValueString(TEXT("2"))));
+		PositiveLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		NegativeLink.Add(MakeShareable(new FJsonValueString(TEXT("3"))));
+		NegativeLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		LatentLink.Add(MakeShareable(new FJsonValueString(TEXT("5"))));
+		LatentLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		KSamplerInputs->SetArrayField(TEXT("model"), ModelLink);
+		KSamplerInputs->SetArrayField(TEXT("positive"), PositiveLink);
+		KSamplerInputs->SetArrayField(TEXT("negative"), NegativeLink);
+		KSamplerInputs->SetArrayField(TEXT("latent_image"), LatentLink);
+		KSampler->SetObjectField(TEXT("inputs"), KSamplerInputs);
+		KSampler->SetStringField(TEXT("class_type"), TEXT("KSampler"));
+		Workflow->SetObjectField(TEXT("4"), KSampler);
+
+		TSharedPtr<FJsonObject> EmptyLatentImage = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> LatentInputs = MakeShareable(new FJsonObject());
+		LatentInputs->SetNumberField(TEXT("width"), Width);
+		LatentInputs->SetNumberField(TEXT("height"), Height);
+		LatentInputs->SetNumberField(TEXT("batch_size"), 1);
+		EmptyLatentImage->SetObjectField(TEXT("inputs"), LatentInputs);
+		EmptyLatentImage->SetStringField(TEXT("class_type"), TEXT("EmptyLatentImage"));
+		Workflow->SetObjectField(TEXT("5"), EmptyLatentImage);
+
+		TSharedPtr<FJsonObject> VAEDecode = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> VAEDecodeInputs = MakeShareable(new FJsonObject());
+		TArray<TSharedPtr<FJsonValue>> SamplesLink, VAELink;
+		SamplesLink.Add(MakeShareable(new FJsonValueString(TEXT("4"))));
+		SamplesLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		VAELink.Add(MakeShareable(new FJsonValueString(TEXT("1"))));
+		VAELink.Add(MakeShareable(new FJsonValueNumber(0)));
+		VAEDecodeInputs->SetArrayField(TEXT("samples"), SamplesLink);
+		VAEDecodeInputs->SetArrayField(TEXT("vae"), VAELink);
+		VAEDecode->SetObjectField(TEXT("inputs"), VAEDecodeInputs);
+		VAEDecode->SetStringField(TEXT("class_type"), TEXT("VAEDecode"));
+		Workflow->SetObjectField(TEXT("6"), VAEDecode);
+
+		TSharedPtr<FJsonObject> SaveImage = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> SaveImageInputs = MakeShareable(new FJsonObject());
+		SaveImageInputs->SetStringField(TEXT("filename_prefix"), TEXT("mcp_gen"));
+		TArray<TSharedPtr<FJsonValue>> ImagesLink;
+		ImagesLink.Add(MakeShareable(new FJsonValueString(TEXT("6"))));
+		ImagesLink.Add(MakeShareable(new FJsonValueNumber(0)));
+		SaveImageInputs->SetArrayField(TEXT("images"), ImagesLink);
+		SaveImage->SetObjectField(TEXT("inputs"), SaveImageInputs);
+		SaveImage->SetStringField(TEXT("class_type"), TEXT("SaveImage"));
+		Workflow->SetObjectField(TEXT("7"), SaveImage);
+	}
+
+	Body->SetObjectField(TEXT("prompt"), Workflow);
+
+	FString BodyStr;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+	FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
+
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Endpoint);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetContentAsString(BodyStr);
+	Request->SetTimeout(120.0f);
+
+	bool bDone = false;
+	FHttpResponsePtr Response;
+	bool bSuccess = false;
+
+	Request->OnProcessRequestComplete().BindLambda(
+		[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+		{
+			bDone = true;
+			bSuccess = bSuc;
+			Response = Resp;
+		});
+
+	Request->ProcessRequest();
+	while (!bDone)
+		FPlatformProcess::Sleep(0.01f);
+
+	if (!bSuccess || !Response.IsValid())
+		return TEXT("{\"error\":\"ComfyUI request failed.\"}");
+
+	int32 Code = Response->GetResponseCode();
+	FString RespBody = Response->GetContentAsString();
+
+	if (Code != 200)
+		return FString::Printf(TEXT("{\"error\":\"ComfyUI error (HTTP %d): %s\"}"), Code, *RespBody.Left(500));
+
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+		return TEXT("{\"error\":\"Failed to parse ComfyUI response.\"}");
+
+	FString RespPromptId;
+	if (!Result->TryGetStringField(TEXT("prompt_id"), RespPromptId) || RespPromptId.IsEmpty())
+		return TEXT("{\"error\":\"ComfyUI did not return a prompt_id.\"}");
+
+	FString HistoryUrl = Entry->BaseURL + TEXT("/history/") + RespPromptId;
+	float PollTime = 0.0f;
+	const float MaxPollTime = 120.0f;
+
+	while (PollTime < MaxPollTime)
+	{
+		FPlatformProcess::Sleep(1.0f);
+		PollTime += 1.0f;
+
+		auto PollReq = FHttpModule::Get().CreateRequest();
+		PollReq->SetURL(HistoryUrl);
+		PollReq->SetVerb(TEXT("GET"));
+		PollReq->SetTimeout(30.0f);
+
+		bool bPollDone = false;
+		FHttpResponsePtr PollResp;
+		bool bPollSuccess = false;
+
+		PollReq->OnProcessRequestComplete().BindLambda(
+			[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+			{
+				bPollDone = true;
+				bPollSuccess = bSuc;
+				PollResp = Resp;
+			});
+
+		PollReq->ProcessRequest();
+		while (!bPollDone)
+			FPlatformProcess::Sleep(0.01f);
+
+		if (!bPollSuccess || !PollResp.IsValid() || PollResp->GetResponseCode() != 200)
+			continue;
+
+		FString HistoryBody = PollResp->GetContentAsString();
+		TSharedPtr<FJsonObject> HistoryResult;
+		TSharedRef<TJsonReader<>> HistoryReader = TJsonReaderFactory<>::Create(HistoryBody);
+		if (!FJsonSerializer::Deserialize(HistoryReader, HistoryResult) || !HistoryResult.IsValid())
+			continue;
+
+		const TSharedPtr<FJsonObject>* Outputs;
+		if (HistoryResult->TryGetObjectField(RespPromptId, Outputs) && Outputs && (*Outputs).IsValid())
+		{
+			const TSharedPtr<FJsonObject>* OutputNode;
+			if ((*Outputs)->TryGetObjectField(TEXT("outputs"), OutputNode) && OutputNode && (*OutputNode).IsValid())
+			{
+				for (const auto& OutputPair : (*OutputNode)->Values)
+				{
+					TSharedPtr<FJsonObject> NodeObj = OutputPair.Value->AsObject();
+					if (NodeObj.IsValid())
+					{
+						const TArray<TSharedPtr<FJsonValue>>* Images;
+						if (NodeObj->TryGetArrayField(TEXT("images"), Images) && Images->Num() > 0)
+						{
+							TSharedPtr<FJsonObject> ImageObj = (*Images)[0]->AsObject();
+							if (ImageObj.IsValid())
+							{
+								FString Filename;
+								ImageObj->TryGetStringField(TEXT("filename"), Filename);
+								if (!Filename.IsEmpty())
+								{
+									FString ImageURL = Entry->BaseURL + TEXT("/output/") + Filename;
+
+									FString SavedPath;
+									if (!SavePath.IsEmpty())
+									{
+										FString FinalPath = SavePath;
+										if (FinalPath.StartsWith(TEXT("project:/")))
+											FinalPath = FPaths::ProjectContentDir() / FinalPath.RightChop(9);
+										else if (FinalPath.StartsWith(TEXT("saved:/")))
+											FinalPath = FPaths::ProjectSavedDir() / FinalPath.RightChop(8);
+
+										IPlatformFile& FileManager = FPlatformFileManager::Get().GetPlatformFile();
+										FString Folder = FPaths::GetPath(FinalPath);
+										if (!FileManager.DirectoryExists(*Folder))
+											FileManager.CreateDirectoryTree(*Folder);
+
+										FString DestFilename = FPaths::GetCleanFilename(FinalPath);
+										if (DestFilename.IsEmpty() || FPaths::GetExtension(DestFilename).IsEmpty())
+											DestFilename = Filename.IsEmpty()
+												? FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp())
+												: Filename;
+
+										FString FullPath = FPaths::Combine(Folder, DestFilename);
+
+										auto DownloadReq = FHttpModule::Get().CreateRequest();
+										DownloadReq->SetURL(ImageURL);
+										DownloadReq->SetVerb(TEXT("GET"));
+										DownloadReq->SetTimeout(30.0f);
+
+										bool bDownloadDone = false;
+										FHttpResponsePtr DownloadResp;
+										bool bDownloadSuccess = false;
+
+										DownloadReq->OnProcessRequestComplete().BindLambda(
+											[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+											{
+												bDownloadDone = true;
+												bDownloadSuccess = bSuc;
+												DownloadResp = Resp;
+											});
+
+										DownloadReq->ProcessRequest();
+										while (!bDownloadDone)
+											FPlatformProcess::Sleep(0.01f);
+
+										if (bDownloadSuccess && DownloadResp.IsValid() && DownloadResp->GetResponseCode() == 200)
+										{
+											FFileHelper::SaveArrayToFile(DownloadResp->GetContent(), *FullPath);
+											SavedPath = FullPath;
+										}
+									}
+
+									if (!SavedPath.IsEmpty())
+										return FString::Printf(TEXT("{\"status\":\"ok\",\"image_url\":\"%s\",\"saved_path\":\"%s\"}"), *ImageURL, *SavedPath);
+									return FString::Printf(TEXT("{\"status\":\"ok\",\"image_url\":\"%s\"}"), *ImageURL);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return TEXT("{\"error\":\"ComfyUI generation timed out or no image was produced.\"}");
+}
+
+FString SMCPToolboxChatWidget::GenerateImage_MultimodalLLM(const FMCPToolboxAPIKeyEntry* Entry, const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath)
+{
+	FString ApiKey;
+	FBase64::Decode(Entry->EncryptedKey, ApiKey);
+
+	FString Endpoint;
+	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
+
+	if (Entry->ProviderId == TEXT("openai-image"))
+	{
+		Endpoint = Entry->BaseURL + TEXT("/images/generations");
+		Body->SetStringField(TEXT("model"), Entry->ModelId);
+		Body->SetStringField(TEXT("prompt"), Prompt);
+		Body->SetStringField(TEXT("n"), TEXT("1"));
+		FString Size = FString::Printf(TEXT("%dx%d"), Width, Height);
+		Body->SetStringField(TEXT("size"), Size);
+	}
+	else if (Entry->ProviderId == TEXT("replicate-img"))
+	{
+		Endpoint = Entry->BaseURL + TEXT("/predictions");
+		FString Version;
+		if (Entry->ModelId.Contains(TEXT("sdxl")))
+			Version = TEXT("stability-ai/stable-diffusion-xl:7bf3a1b0cf148149d5270340caf046486809454464c6ab31258e875874c72071");
+		else if (Entry->ModelId.Contains(TEXT("flux")))
+			Version = TEXT("black-forest-labs/flux-schnell:5955196189e4c2e6b8e1c062977892415f132619925d2e658b7f997b60a92005");
+		else
+			Version = TEXT("stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21affe81863cbe77e4");
+		Body->SetStringField(TEXT("version"), Version);
+		TSharedPtr<FJsonObject> Input = MakeShareable(new FJsonObject());
+		Input->SetStringField(TEXT("prompt"), Prompt);
+		Body->SetObjectField(TEXT("input"), Input);
+	}
+	else if (Entry->ProviderId == TEXT("pollinations"))
+	{
+		Endpoint = Entry->BaseURL + TEXT("/api/text2image");
+		Body->SetStringField(TEXT("prompt"), Prompt);
+	}
+	else
+	{
+		return FString::Printf(TEXT("{\"error\":\"Unsupported multimodal provider: %s\"}"), *Entry->ProviderName);
+	}
+
+	FString BodyStr;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+	FJsonSerializer::Serialize(Body.ToSharedRef(), Writer);
+
+	auto Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Endpoint);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	if (!ApiKey.IsEmpty())
+	{
+		if (Entry->ProviderId == TEXT("replicate-img"))
+			Request->SetHeader(TEXT("Authorization"), TEXT("Token ") + ApiKey);
+		else
+			Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + ApiKey);
+	}
+	Request->SetContentAsString(BodyStr);
+	Request->SetTimeout(120.0f);
+
+	bool bDone = false;
+	FHttpResponsePtr Response;
+	bool bSuccess = false;
+
+	Request->OnProcessRequestComplete().BindLambda(
+		[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+		{
+			bDone = true;
+			bSuccess = bSuc;
+			Response = Resp;
+		});
+
+	Request->ProcessRequest();
+	while (!bDone)
+		FPlatformProcess::Sleep(0.01f);
+
+	if (!bSuccess || !Response.IsValid())
+		return TEXT("{\"error\":\"Multimodal LLM request failed.\"}");
+
+	int32 Code = Response->GetResponseCode();
+	FString RespBody = Response->GetContentAsString();
+
+	if (Code != 200)
+		return FString::Printf(TEXT("{\"error\":\"Multimodal LLM error (HTTP %d): %s\"}"), Code, *RespBody.Left(500));
+
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+		return TEXT("{\"error\":\"Failed to parse multimodal LLM response.\"}");
+
+	FString ImageURL;
+
+	if (Entry->ProviderId == TEXT("openai-image"))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Data;
+		if (Result->TryGetArrayField(TEXT("data"), Data) && Data->Num() > 0)
+		{
+			TSharedPtr<FJsonObject> ImageObj = (*Data)[0]->AsObject();
+			if (ImageObj.IsValid())
+				ImageObj->TryGetStringField(TEXT("url"), ImageURL);
+		}
+	}
+	else if (Entry->ProviderId == TEXT("replicate-img"))
+	{
+		const TSharedPtr<FJsonObject>* OutputPtr;
+		if (Result->TryGetObjectField(TEXT("output"), OutputPtr) && OutputPtr && (*OutputPtr).IsValid())
+		{
+			TSharedPtr<FJsonObject> Output = *OutputPtr;
+			const TArray<TSharedPtr<FJsonValue>>* Images;
+			if (Output->TryGetArrayField(TEXT(""), Images) && Images->Num() > 0)
+				(*Images)[0]->TryGetString(ImageURL);
+		}
+	}
+	else if (Entry->ProviderId == TEXT("pollinations"))
+	{
+		Result->TryGetStringField(TEXT("url"), ImageURL);
+	}
+
+	if (!ImageURL.IsEmpty())
+	{
+		FString SavedPath;
+		if (!SavePath.IsEmpty())
+		{
+			FString FinalPath = SavePath;
+			if (FinalPath.StartsWith(TEXT("project:/")))
+				FinalPath = FPaths::ProjectContentDir() / FinalPath.RightChop(9);
+			else if (FinalPath.StartsWith(TEXT("saved:/")))
+				FinalPath = FPaths::ProjectSavedDir() / FinalPath.RightChop(8);
+
+			IPlatformFile& FileManager = FPlatformFileManager::Get().GetPlatformFile();
+			FString Folder = FPaths::GetPath(FinalPath);
+			if (!FileManager.DirectoryExists(*Folder))
+				FileManager.CreateDirectoryTree(*Folder);
+
+			FString DestFilename = FPaths::GetCleanFilename(FinalPath);
+			if (DestFilename.IsEmpty() || FPaths::GetExtension(DestFilename).IsEmpty())
+				DestFilename = FString::Printf(TEXT("gen_%lld.png"), FDateTime::Now().ToUnixTimestamp());
+
+			FString FullPath = FPaths::Combine(Folder, DestFilename);
+
+			if (ImageURL.StartsWith(TEXT("data:")))
+			{
+				FString Base64Data = ImageURL.RightChop(ImageURL.Find(TEXT(",") + 1));
+				TArray<uint8> RawData;
+				if (FBase64::Decode(Base64Data, RawData))
+				{
+					FFileHelper::SaveArrayToFile(RawData, *FullPath);
+					SavedPath = FullPath;
+				}
+			}
+			else
+			{
+				auto DownloadReq = FHttpModule::Get().CreateRequest();
+				DownloadReq->SetURL(ImageURL);
+				DownloadReq->SetVerb(TEXT("GET"));
+				DownloadReq->SetTimeout(30.0f);
+
+				bool bDownloadDone = false;
+				FHttpResponsePtr DownloadResp;
+				bool bDownloadSuccess = false;
+
+				DownloadReq->OnProcessRequestComplete().BindLambda(
+					[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+					{
+						bDownloadDone = true;
+						bDownloadSuccess = bSuc;
+						DownloadResp = Resp;
+					});
+
+				DownloadReq->ProcessRequest();
+				while (!bDownloadDone)
+					FPlatformProcess::Sleep(0.01f);
+
+				if (bDownloadSuccess && DownloadResp.IsValid() && DownloadResp->GetResponseCode() == 200)
+				{
+					FFileHelper::SaveArrayToFile(DownloadResp->GetContent(), *FullPath);
+					SavedPath = FullPath;
+				}
+			}
+		}
+
+		if (!SavedPath.IsEmpty())
+		{
+			if (ImageURL.StartsWith(TEXT("data:")))
+				return FString::Printf(TEXT("{\"status\":\"ok\",\"image_data\":\"%s\",\"saved_path\":\"%s\"}"), *ImageURL, *SavedPath);
+			return FString::Printf(TEXT("{\"status\":\"ok\",\"image_url\":\"%s\",\"saved_path\":\"%s\"}"), *ImageURL, *SavedPath);
+		}
+		if (ImageURL.StartsWith(TEXT("data:")))
+			return FString::Printf(TEXT("{\"status\":\"ok\",\"image_data\":\"%s\"}"), *ImageURL);
+		return FString::Printf(TEXT("{\"status\":\"ok\",\"image_url\":\"%s\"}"), *ImageURL);
+	}
+
+	return TEXT("{\"error\":\"Multimodal LLM returned no image URL.\"}");
+}
+
+// GenerateImageSync - Synchronous image generation for tool call
+// ============================================================================
+FString SMCPToolboxChatWidget::GenerateImageSync(const FString& Prompt, const FString& NegativePrompt, int32 Width, int32 Height, int32 Steps, float CfgScale, const FString& SavePath)
+{
+	TArray<const FMCPToolboxAPIKeyEntry*> ImgEntries = FMCPToolboxAPIManager::Get().GetImageGenerationEntries();
+	if (ImgEntries.Num() == 0)
+	{
+		return TEXT("{\"error\":\"No image generation models configured. Please add image generation providers (DALL-E, SD WebUI, etc.) in API settings.\"}");
+	}
+
+	const FMCPToolboxAPIKeyEntry* Entry = ImgEntries[0];
+
+	FString Result;
+	switch (Entry->ImageGenType)
+	{
+	case EMCPToolboxImageGenType::WebUI:
+		Result = GenerateImage_WebUI(Entry, Prompt, NegativePrompt, Width, Height, Steps, CfgScale, SavePath);
+		break;
+	case EMCPToolboxImageGenType::ComfyUI:
+		Result = GenerateImage_ComfyUI(Entry, Prompt, NegativePrompt, Width, Height, Steps, CfgScale, SavePath);
+		break;
+	case EMCPToolboxImageGenType::MultimodalLLM:
+		Result = GenerateImage_MultimodalLLM(Entry, Prompt, NegativePrompt, Width, Height, Steps, CfgScale, SavePath);
+		break;
+	default:
+		return TEXT("{\"error\":\"Unsupported image generation type.\"}");
+	}
+
+	if (Result.Contains(TEXT("\"status\":\"ok\"")) && !SavePath.IsEmpty())
+	{
+		TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+		TSharedPtr<FJsonObject> ResultObj;
+		if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+		{
+			FString ImageData;
+			ResultObj->TryGetStringField(TEXT("image_data"), ImageData);
+			if (ImageData.StartsWith(TEXT("data:image/")))
+			{
+				FString Base64Data = ImageData.RightChop(ImageData.Find(TEXT(",") + 1));
+				TArray<uint8> RawData;
+				if (FBase64::Decode(Base64Data, RawData))
+				{
+					FString FinalPath = SavePath;
+					if (FinalPath.StartsWith(TEXT("project:/")))
+					{
+						FinalPath = FPaths::ProjectContentDir() / FinalPath.RightChop(9);
+					}
+					else if (FinalPath.StartsWith(TEXT("saved:/")))
+					{
+						FinalPath = FPaths::ProjectSavedDir() / FinalPath.RightChop(8);
+					}
+
+					if (!FinalPath.EndsWith(TEXT("/")))
+						FinalPath += TEXT("/");
+
+					FString FileName = FString::Printf(TEXT("generated_%d.png"), FDateTime::Now().GetTicks());
+					FString FullPath = FinalPath + FileName;
+
+					IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+					FString Directory = FPaths::GetPath(FullPath);
+					PlatformFile.CreateDirectoryTree(*Directory);
+
+					if (FFileHelper::SaveArrayToFile(RawData, *FullPath))
+					{
+						ResultObj->SetStringField(TEXT("saved_path"), FullPath);
+						FString UpdatedResult;
+						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&UpdatedResult);
+						FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Writer);
+						return UpdatedResult;
+					}
+				}
+			}
+		}
+	}
+
+	return Result;
+}
+
+// ============================================================================
+// Handle Image Generation Response
+// ============================================================================
+void SMCPToolboxChatWidget::HandleImageGenerationResponse(FHttpResponsePtr Resp, const FString& Prompt, const FString& ProviderId)
+{
+	if (bInterrupted) { bIsWaiting = false; return; }
+
+	int32 Code = Resp->GetResponseCode();
+	FString RespBody = Resp->GetContentAsString();
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 生图响应: HTTP %d, BodyLen=%d"), Code, RespBody.Len());
+
+	if (Code != 200)
+	{
+		bIsWaiting = false;
+		FMCPToolboxChatMessage Err;
+		Err.Role = EMCPToolboxMessageRole::System;
+		Err.Content = FString::Printf(TEXT("生图服务错误 (HTTP %d):\n\n```\n%s\n```"), Code, *RespBody.Left(500));
+		AddMessage(Err);
+		return;
+	}
+
+	TSharedPtr<FJsonObject> Result;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RespBody);
+	if (!FJsonSerializer::Deserialize(Reader, Result) || !Result.IsValid())
+	{
+		bIsWaiting = false;
+		FMCPToolboxChatMessage Err;
+		Err.Role = EMCPToolboxMessageRole::System;
+		Err.Content = TEXT("无法解析生图响应。");
+		AddMessage(Err);
+		return;
+	}
+
+	FString ImageURL;
+
+	if (ProviderId == TEXT("openai-image"))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Data;
+		if (Result->TryGetArrayField(TEXT("data"), Data) && Data->Num() > 0)
+		{
+			TSharedPtr<FJsonObject> ImageObj = (*Data)[0]->AsObject();
+			if (ImageObj.IsValid())
+			{
+				ImageObj->TryGetStringField(TEXT("url"), ImageURL);
+			}
+		}
+	}
+	else if (ProviderId == TEXT("sd-local"))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Images;
+		if (Result->TryGetArrayField(TEXT("images"), Images) && Images->Num() > 0)
+		{
+			(*Images)[0]->TryGetString(ImageURL);
+		}
+	}
+	else if (ProviderId == TEXT("comfyui"))
+	{
+		FString PromptId;
+		if (Result->TryGetStringField(TEXT("prompt_id"), PromptId) && !PromptId.IsEmpty())
+		{
+			const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+			if (ActiveEntry)
+			{
+				FString HistoryUrl = ActiveEntry->BaseURL + TEXT("/history/") + PromptId;
+				FString BaseURL = ActiveEntry->BaseURL;
+				FString PromptCopy = Prompt;
+				
+				FPlatformProcess::Sleep(2.0f);
+				
+				float PollTime = 0.0f;
+				const float MaxPollTime = 120.0f;
+				while (PollTime < MaxPollTime)
+				{
+					FPlatformProcess::Sleep(2.0f);
+					PollTime += 2.0f;
+					
+					auto PollReq = FHttpModule::Get().CreateRequest();
+					PollReq->SetURL(HistoryUrl);
+					PollReq->SetVerb(TEXT("GET"));
+					PollReq->SetTimeout(30.0f);
+					
+					bool bPollDone = false;
+					FHttpResponsePtr PollResp;
+					bool bPollSuccess = false;
+					
+					PollReq->OnProcessRequestComplete().BindLambda(
+						[&](FHttpRequestPtr, FHttpResponsePtr Resp, bool bSuc)
+						{
+							bPollDone = true;
+							bPollSuccess = bSuc;
+							PollResp = Resp;
+						});
+					
+					PollReq->ProcessRequest();
+					while (!bPollDone)
+						FPlatformProcess::Sleep(0.01f);
+					
+					if (!bPollSuccess || !PollResp.IsValid() || PollResp->GetResponseCode() != 200)
+						continue;
+					
+					FString HistoryBody = PollResp->GetContentAsString();
+					TSharedPtr<FJsonObject> HistoryResult;
+					TSharedRef<TJsonReader<>> HistoryReader = TJsonReaderFactory<>::Create(HistoryBody);
+					if (!FJsonSerializer::Deserialize(HistoryReader, HistoryResult) || !HistoryResult.IsValid())
+						continue;
+					
+					for (const auto& Pair : HistoryResult->Values)
+					{
+						TSharedPtr<FJsonObject> EntryObj = Pair.Value->AsObject();
+						if (!EntryObj.IsValid()) continue;
+						
+						const TSharedPtr<FJsonObject>* Outputs;
+						if (!EntryObj->TryGetObjectField(TEXT("outputs"), Outputs) || !Outputs || !(*Outputs).IsValid())
+							continue;
+						
+						const TSharedPtr<FJsonObject>* SaveImageNode;
+						if (!(*Outputs)->TryGetObjectField(TEXT("7"), SaveImageNode) || !SaveImageNode || !(*SaveImageNode).IsValid())
+							continue;
+						
+						const TArray<TSharedPtr<FJsonValue>>* Images;
+						if (!(*SaveImageNode)->TryGetArrayField(TEXT("images"), Images) || Images->Num() == 0)
+							continue;
+						
+						TSharedPtr<FJsonObject> ImageObj = (*Images)[0]->AsObject();
+						if (!ImageObj.IsValid()) continue;
+						
+						FString Filename;
+						if (!ImageObj->TryGetStringField(TEXT("filename"), Filename) || Filename.IsEmpty())
+							continue;
+						
+						FString GeneratedImageURL = BaseURL + TEXT("/output/") + Filename;
+						
+						FMCPToolboxChatMessage ImageMsg;
+						ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+						ImageMsg.Content = TEXT("**生图成功！**");
+						ImageMsg.bHasImageAttachment = true;
+						ImageMsg.ImageDataURIs.Add(GeneratedImageURL);
+						ImageMsg.ImageFileNames.Add(Filename);
+						AddMessage(ImageMsg);
+						bIsWaiting = false;
+						return;
+					}
+				}
+				
+				bIsWaiting = false;
+				FMCPToolboxChatMessage Err;
+				Err.Role = EMCPToolboxMessageRole::System;
+				Err.Content = TEXT("ComfyUI 生图超时，未生成图片。");
+				AddMessage(Err);
+				return;
+			}
+		}
+	}
+	else if (ProviderId == TEXT("replicate-img"))
+	{
+		const TSharedPtr<FJsonObject>* OutputPtr;
+		if (Result->TryGetObjectField(TEXT("output"), OutputPtr) && OutputPtr && (*OutputPtr).IsValid())
+		{
+			TSharedPtr<FJsonObject> Output = *OutputPtr;
+			const TArray<TSharedPtr<FJsonValue>>* Images;
+			if (Output->TryGetArrayField(TEXT(""), Images) && Images->Num() > 0)
+			{
+				(*Images)[0]->TryGetString(ImageURL);
+			}
+		}
+	}
+	else if (ProviderId == TEXT("pollinations"))
+	{
+		Result->TryGetStringField(TEXT("url"), ImageURL);
+	}
+
+	if (!ImageURL.IsEmpty())
+	{
+		FMCPToolboxChatMessage ImageMsg;
+		ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+		
+		if (ImageURL.StartsWith(TEXT("data:image/")) || ImageURL.Len() > 1000)
+		{
+			TArray<uint8> RawData;
+			FString Base64Data = ImageURL;
+			if (Base64Data.StartsWith(TEXT("data:image/")))
+			{
+				int32 CommaIdx = Base64Data.Find(TEXT(","));
+				if (CommaIdx != INDEX_NONE)
+					Base64Data = Base64Data.RightChop(CommaIdx + 1);
+			}
+
+			if (FBase64::Decode(Base64Data, RawData))
+			{
+				FString TempDir = FPaths::ProjectSavedDir() / TEXT("MCPToolbox/GeneratedImages");
+				IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+				PlatformFile.CreateDirectoryTree(*TempDir);
+
+				FString FileName = FString::Printf(TEXT("generated_%d.png"), FDateTime::Now().GetTicks());
+				FString FullPath = TempDir / FileName;
+
+				if (FFileHelper::SaveArrayToFile(RawData, *FullPath))
+				{
+					ImageMsg.Content = TEXT("**生图成功！**");
+					ImageMsg.bHasImageAttachment = true;
+					ImageMsg.ImageDataURIs.Add(TEXT("file://") + FullPath);
+					ImageMsg.ImageFileNames.Add(FileName);
+				}
+				else
+				{
+					ImageMsg.Content = TEXT("**生图成功，但保存图片失败。**");
+				}
+			}
+			else
+			{
+				ImageMsg.Content = TEXT("**生图成功，但无法解析图片数据。**");
+			}
+		}
+		else
+		{
+			ImageMsg.Content = TEXT("**生图成功！**");
+			ImageMsg.bHasImageAttachment = true;
+			ImageMsg.ImageDataURIs.Add(ImageURL);
+			ImageMsg.ImageFileNames.Add(TEXT("generated_image.png"));
+		}
+
+		AddMessage(ImageMsg);
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 生图成功"));
+	}
+	else
+	{
+		FMCPToolboxChatMessage Err;
+		Err.Role = EMCPToolboxMessageRole::System;
+		Err.Content = TEXT("生图失败，未返回图片URL。");
+		AddMessage(Err);
+	}
+
+	bIsWaiting = false;
+}
+
+// ============================================================================
 // Send AI Request — reusable, called from OnSendMessage and tool loops
 // ============================================================================
 void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& ApiMessages)
 {
 	if (bInterrupted) { bIsWaiting = false; return; }
-
-	FMCPToolboxAuxModelManager& AuxMgr = FMCPToolboxAuxModelManager::Get();
 
 	// ── Determine if current model supports vision ──
 	// Previously this was hardcoded to only openai/google/anthropic providers,
@@ -755,38 +2083,82 @@ void SMCPToolboxChatWidget::SendAIRequest(const TArray<TSharedPtr<FJsonValue>>& 
 		}
 	}
 
-	// Auto-fallback: vision ON but model doesn't support images → preprocess locally
-	bool bNeedLocalVL = (bVisionModeEnabled && !bModelSupportsVision) || (!bVisionModeEnabled && AuxMgr.IsReady());
-	bool bHasImages = false;
-
-	for (const auto& V : ApiMessages)
+	// ponytail: when model doesn't support vision, strip ALL content arrays to text-only
+	// and remove base64 image_data from tool results — prevents HTTP 400 and huge payloads.
+	if (!bModelSupportsVision)
 	{
-		TSharedPtr<FJsonObject> Obj = V->AsObject();
-		if (!Obj.IsValid()) continue;
-		const TArray<TSharedPtr<FJsonValue>>* Content;
-		if (Obj->TryGetArrayField(TEXT("content"), Content))
+		TArray<TSharedPtr<FJsonValue>> StrippedMsgs;
+		for (int32 Vi = 0; Vi < ApiMessages.Num(); ++Vi)
 		{
-			for (const auto& C : *Content)
+			const auto& V = ApiMessages[Vi];
+			TSharedPtr<FJsonObject> Obj = V->AsObject();
+			if (!Obj.IsValid()) { StrippedMsgs.Add(V); continue; }
+
+			// Handle array-type content: keep only text parts, produce plain text string
+			const TArray<TSharedPtr<FJsonValue>>* Content;
+			if (Obj->TryGetArrayField(TEXT("content"), Content))
 			{
-				TSharedPtr<FJsonObject> CObj = C->AsObject();
-				if (CObj.IsValid())
+				TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject());
+				for (const auto& Pair : Obj->Values)
 				{
-					FString Type;
-					if (CObj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("image_url"))
-						{ bHasImages = true; break; }
+					if (Pair.Key != TEXT("content"))
+						NewObj->SetField(Pair.Key, Pair.Value);
+				}
+				FString PlainText;
+				for (int32 Ci = 0; Ci < Content->Num(); ++Ci)
+				{
+					const auto& C = (*Content)[Ci];
+					TSharedPtr<FJsonObject> CObj = C->AsObject();
+					FString CType;
+					if (CObj.IsValid() && CObj->TryGetStringField(TEXT("type"), CType) && CType == TEXT("text"))
+					{
+						FString Txt;
+						if (CObj->TryGetStringField(TEXT("text"), Txt) && !Txt.IsEmpty())
+						{
+							if (!PlainText.IsEmpty()) PlainText += TEXT("\n");
+							PlainText += Txt;
+						}
+					}
+				}
+				NewObj->SetStringField(TEXT("content"), PlainText.IsEmpty() ? TEXT("[非文本内容已移除]") : PlainText);
+				StrippedMsgs.Add(MakeShareable(new FJsonValueObject(NewObj)));
+			}
+			else
+			{
+				// Handle string-type content: strip base64 image_data from tool results
+				FString StrContent;
+				if (Obj->TryGetStringField(TEXT("content"), StrContent) && StrContent.Contains(TEXT("\"image_data\":\"")))
+				{
+					// Parse result JSON, remove image_data, re-serialize
+					TSharedPtr<FJsonObject> NewObj = MakeShareable(new FJsonObject());
+					for (const auto& Pair : Obj->Values)
+					{
+						if (Pair.Key != TEXT("content"))
+							NewObj->SetField(Pair.Key, Pair.Value);
+					}
+					TSharedRef<TJsonReader<>> Rdr = TJsonReaderFactory<>::Create(StrContent);
+					TSharedPtr<FJsonObject> ResultObj;
+					if (FJsonSerializer::Deserialize(Rdr, ResultObj) && ResultObj.IsValid())
+					{
+						ResultObj->SetStringField(TEXT("image_data"), TEXT("[base64 removed, see chat for image]"));
+						FString CleanJson;
+						TSharedRef<TJsonWriter<>> Wr = TJsonWriterFactory<>::Create(&CleanJson);
+						FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Wr);
+						NewObj->SetStringField(TEXT("content"), CleanJson);
+					}
+					else
+					{
+						NewObj->SetStringField(TEXT("content"), TEXT("{\"status\":\"ok\",\"note\":\"image generated successfully\"}"));
+					}
+					StrippedMsgs.Add(MakeShareable(new FJsonValueObject(NewObj)));
+				}
+				else
+				{
+					StrippedMsgs.Add(V);
 				}
 			}
 		}
-		if (bHasImages) break;
-	}
-
-	if (bNeedLocalVL && bHasImages)
-	{
-		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Auto-preprocessing images: vision=%s, model_supports_vision=%s"),
-			bVisionModeEnabled ? TEXT("ON") : TEXT("OFF"),
-			bModelSupportsVision ? TEXT("yes") : TEXT("no"));
-		PreprocessImagesLocally(ApiMessages,
-			[this](const TArray<TSharedPtr<FJsonValue>>& Processed) { SendAIRequestInternal(Processed); });
+		SendAIRequestInternal(StrippedMsgs);
 		return;
 	}
 
@@ -889,6 +2261,23 @@ void SMCPToolboxChatWidget::SendAIRequestInternal(const TArray<TSharedPtr<FJsonV
 	if (CachedToolsArray.Num() > 0)
 	{
 		Body->SetArrayField(TEXT("tools"), CachedToolsArray);
+		FString ToolsLog;
+		for (int32 Ti = 0; Ti < CachedToolsArray.Num(); ++Ti)
+		{
+			const auto& ToolVal = CachedToolsArray[Ti];
+			if (ToolVal.IsValid())
+			{
+				TSharedPtr<FJsonObject> ToolObj = ToolVal->AsObject();
+				if (ToolObj.IsValid())
+				{
+					FString ToolName;
+					ToolObj->TryGetStringField(TEXT("name"), ToolName);
+					if (!ToolsLog.IsEmpty()) ToolsLog += TEXT(", ");
+					ToolsLog += ToolName;
+				}
+			}
+		}
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] tools array contains: %s"), *ToolsLog);
 	}
 
 	// Add tool_choice to encourage tool use
@@ -1131,13 +2520,20 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 					StreamingMessageBox.Reset();
 					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Stream done, %d chars"), DisplayBuffer->Len());
 
-					// Auto-archive opportunity: defer to next game-thread tick to avoid
-					// nesting HTTP startup inside the ticker callback. Use weak pointer
-					// because the widget may be destroyed between ticks.
+					FString FinalContent = *DisplayBuffer;
 					TWeakPtr<SMCPToolboxChatWidget> WeakSelf = SharedThis(this);
-					AsyncTask(ENamedThreads::GameThread, [WeakSelf]()
+					AsyncTask(ENamedThreads::GameThread, [WeakSelf, FinalContent]()
 					{
 						if (TSharedPtr<SMCPToolboxChatWidget> Self = WeakSelf.Pin())
+						{
+							Self->HandleStreamingTextCompletion(FinalContent);
+						}
+					});
+
+					TWeakPtr<SMCPToolboxChatWidget> ArchiveWeakSelf = SharedThis(this);
+					AsyncTask(ENamedThreads::GameThread, [ArchiveWeakSelf]()
+					{
+						if (TSharedPtr<SMCPToolboxChatWidget> Self = ArchiveWeakSelf.Pin())
 						{
 							Self->TryAutoArchiveWhenIdle();
 						}
@@ -1256,14 +2652,18 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			TSharedPtr<FJsonObject> TCObj = TC->AsObject();
 			if (TCObj.IsValid())
 			{
+				FString Name;
 				const TSharedPtr<FJsonObject>* Func;
 				if (TCObj->TryGetObjectField(TEXT("function"), Func) && Func->IsValid())
 				{
-					FString Name;
 					(*Func)->TryGetStringField(TEXT("name"), Name);
-					if (!CurrentToolNames.IsEmpty()) CurrentToolNames += TEXT(",");
-					CurrentToolNames += Name;
 				}
+				else
+				{
+					TCObj->TryGetStringField(TEXT("name"), Name);
+				}
+				if (!CurrentToolNames.IsEmpty()) CurrentToolNames += TEXT(",");
+				CurrentToolNames += Name;
 			}
 		}
 		if (ToolCallHistory.Num() > 0 && ToolCallHistory.Last() == CurrentToolNames)
@@ -1305,16 +2705,28 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			TSharedPtr<FJsonObject> TCObj = TC->AsObject();
 			if (TCObj.IsValid())
 			{
+				FString Name, Args;
 				const TSharedPtr<FJsonObject>* Func;
 				if (TCObj->TryGetObjectField(TEXT("function"), Func) && Func->IsValid())
 				{
-					FString Name, Args;
 					(*Func)->TryGetStringField(TEXT("name"), Name);
 					(*Func)->TryGetStringField(TEXT("arguments"), Args);
-					if (!ToolNames.IsEmpty()) ToolNames += TEXT(", ");
-					ToolNames += Name;
-					ToolArgsList.Add(Args);
 				}
+				else
+				{
+					TCObj->TryGetStringField(TEXT("name"), Name);
+					const TSharedPtr<FJsonObject>* ArgsObj;
+					if (TCObj->TryGetObjectField(TEXT("arguments"), ArgsObj) && ArgsObj && (*ArgsObj).IsValid())
+					{
+						FString OutputJson;
+						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+						FJsonSerializer::Serialize((*ArgsObj).ToSharedRef(), Writer);
+						Args = OutputJson;
+					}
+				}
+				if (!ToolNames.IsEmpty()) ToolNames += TEXT(", ");
+				ToolNames += Name;
+				ToolArgsList.Add(Args);
 			}
 		}
 
@@ -1352,14 +2764,125 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			if (!TCObj.IsValid()) continue;
 			FString TCId;
 			TCObj->TryGetStringField(TEXT("id"), TCId);
-			const TSharedPtr<FJsonObject>* Func;
-			if (!TCObj->TryGetObjectField(TEXT("function"), Func) || !Func->IsValid()) continue;
+			
 			FString FuncName, FuncArgs;
-			(*Func)->TryGetStringField(TEXT("name"), FuncName);
-			(*Func)->TryGetStringField(TEXT("arguments"), FuncArgs);
+			const TSharedPtr<FJsonObject>* Func;
+			if (TCObj->TryGetObjectField(TEXT("function"), Func) && Func->IsValid())
+			{
+				(*Func)->TryGetStringField(TEXT("name"), FuncName);
+				(*Func)->TryGetStringField(TEXT("arguments"), FuncArgs);
+			}
+			else
+			{
+				TCObj->TryGetStringField(TEXT("name"), FuncName);
+				const TSharedPtr<FJsonObject>* ArgsObj;
+				if (TCObj->TryGetObjectField(TEXT("arguments"), ArgsObj) && ArgsObj && (*ArgsObj).IsValid())
+				{
+					FString OutputJson;
+					TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+					FJsonSerializer::Serialize((*ArgsObj).ToSharedRef(), Writer);
+					FuncArgs = OutputJson;
+				}
+			}
+			
+			if (FuncName.IsEmpty()) continue;
+
+			// ── call_tool 特殊处理 ──
+			// call_tool 是本地注册的元工具，用于调用 MCP server 上的真实工具
+			// 需要解析 toolset_name 和 tool_name，然后通过 MCP server 调用真实工具
+			if (FuncName == TEXT("call_tool"))
+			{
+				if (!MCPServerClient.IsConnected())
+				{
+					FMCPToolboxChatMessage ErrorMsg;
+					ErrorMsg.Role = EMCPToolboxMessageRole::System;
+					ErrorMsg.Content = TEXT("⚠ MCP 服务器未连接，无法调用 call_tool。请检查 MCP 服务器是否正常运行。");
+					AddMessage(ErrorMsg);
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> ArgsObj;
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FuncArgs);
+				if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
+				{
+					FString ToolsetName, ToolName, ArgumentsJson;
+					ArgsObj->TryGetStringField(TEXT("toolset_name"), ToolsetName);
+					ArgsObj->TryGetStringField(TEXT("tool_name"), ToolName);
+					
+					const TSharedPtr<FJsonObject>* ArgsPtr;
+					if (ArgsObj->TryGetObjectField(TEXT("arguments"), ArgsPtr) && ArgsPtr->IsValid())
+					{
+						FString OutputJson;
+						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+						FJsonSerializer::Serialize((*ArgsPtr).ToSharedRef(), Writer);
+						ArgumentsJson = OutputJson;
+					}
+
+					if (!ToolsetName.IsEmpty() && !ToolName.IsEmpty())
+					{
+						(*PendingMCP)++;
+						FString NameCap = ToolName;
+						FString IdCap = TCId;
+						FString FullToolName = ToolsetName + TEXT(".") + ToolName;
+
+						UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] call_tool -> MCP tool: %s"), *FullToolName);
+
+						MCPServerClient.ExecuteTool(FullToolName, ArgumentsJson,
+							[this, PendingMCP, PendingMsgs, NameCap, IdCap](bool bOk, const FString& R)
+							{
+								AsyncTask(ENamedThreads::GameThread,
+									[this, PendingMCP, PendingMsgs, NameCap, IdCap, R]()
+								{
+									TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+									ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+									ToolResultMsg->SetStringField(TEXT("tool_call_id"), IdCap);
+									ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+									ToolResultMsg->SetStringField(TEXT("content"), R);
+									PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+									FMCPToolboxChatMessage ResultMsg;
+									ResultMsg.Role = EMCPToolboxMessageRole::System;
+									ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(2000));
+									AddMessage(ResultMsg);
+
+									(*PendingMCP)--;
+									if (*PendingMCP <= 0)
+									{
+										if (bSpeculationPending && LastSpeculation.IsValid() == false)
+										{
+											bPendingToolCompletion = true;
+										}
+										else
+										{
+											TrySpeculativeOrContinue(PendingMsgs);
+										}
+									}
+								});
+							});
+						continue;
+					}
+					else
+					{
+						FMCPToolboxChatMessage ErrorMsg;
+						ErrorMsg.Role = EMCPToolboxMessageRole::System;
+						ErrorMsg.Content = TEXT("⚠ call_tool 参数错误：缺少 toolset_name 或 tool_name");
+						AddMessage(ErrorMsg);
+					}
+				}
+				else
+				{
+					FMCPToolboxChatMessage ErrorMsg;
+					ErrorMsg.Role = EMCPToolboxMessageRole::System;
+					ErrorMsg.Content = TEXT("⚠ call_tool 参数解析失败");
+					AddMessage(ErrorMsg);
+				}
+				continue;
+			}
 
 			// Check if this is an MCP tool that needs async execution
 			bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(FuncName);
+			UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Tool routing: FuncName=%s, IsMCP=%d, MCPConnected=%d"), 
+				*FuncName, bIsMCP ? 1 : 0, MCPServerClient.IsConnected() ? 1 : 0);
 
 			if (bIsMCP)
 			{
@@ -1417,61 +2940,141 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			}
 			else
 			{
-				// Local tool: execute synchronously
-				FString Result = ExecuteToolCall(FuncName, FuncArgs);
-
-				FMCPToolboxChatMessage ResultMsg;
-				ResultMsg.Role = EMCPToolboxMessageRole::System;
-				ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *FuncName, *Result.Left(500));
-				AddMessage(ResultMsg);
-
-				TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
-				ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
-				ToolResultMsg->SetStringField(TEXT("tool_call_id"), TCId);
-				ToolResultMsg->SetStringField(TEXT("name"), FuncName);
-				ToolResultMsg->SetStringField(TEXT("content"), Result);
-				PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
-
-				// If this is a screenshot tool result with image data, add a user message with the image
-				if (FuncName == TEXT("screenshot"))
+				if (FuncName == TEXT("generate_image"))
 				{
-					TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
-					TSharedPtr<FJsonObject> ResultObj;
-					if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+					(*PendingMCP)++;
+					FString NameCap = FuncName;
+					FString IdCap = TCId;
+					FString ArgsCap = FuncArgs;
+
+					Async(EAsyncExecution::Thread,
+						[this, PendingMCP, PendingMsgs, NameCap, IdCap, ArgsCap]()
 					{
-						FString DataURI;
-						if (ResultObj->TryGetStringField(TEXT("data_uri"), DataURI) && !DataURI.IsEmpty())
+						FString Result = ExecuteToolCall(NameCap, ArgsCap);
+
+						AsyncTask(ENamedThreads::GameThread,
+							[this, PendingMCP, PendingMsgs, NameCap, IdCap, Result]()
 						{
-							// Build content array with text + image
-							TArray<TSharedPtr<FJsonValue>> ContentArray;
+							FMCPToolboxChatMessage ResultMsg;
+							ResultMsg.Role = EMCPToolboxMessageRole::System;
+							ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *Result.Left(500));
+							AddMessage(ResultMsg);
 
-							TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
-							TextPart->SetStringField(TEXT("type"), TEXT("text"));
-							TextPart->SetStringField(TEXT("text"), TEXT("Here is the screenshot you requested. Please analyze it."));
-							ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+							TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+							TSharedPtr<FJsonObject> ResultObj;
+							FString CleanedResult = Result;
 
-							TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
-							ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+							if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+							{
+								FString ImageData;
+								if (ResultObj->TryGetStringField(TEXT("image_data"), ImageData) && !ImageData.IsEmpty())
+								{
+									ResultObj->SetStringField(TEXT("image_data"), TEXT("[图片数据已省略，图片已在UI中显示]"));
+									TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&CleanedResult);
+									FJsonSerializer::Serialize(ResultObj.ToSharedRef(), Writer);
+								}
+							}
 
-							TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
-							ImageUrlObj->SetStringField(TEXT("url"), DataURI);
-							ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+							TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+							ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+							ToolResultMsg->SetStringField(TEXT("tool_call_id"), IdCap);
+							ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+							ToolResultMsg->SetStringField(TEXT("content"), CleanedResult);
+							PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
 
-							ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+							TSharedRef<TJsonReader<>> ResultReader2 = TJsonReaderFactory<>::Create(Result);
+							TSharedPtr<FJsonObject> ResultObj2;
+							if (FJsonSerializer::Deserialize(ResultReader2, ResultObj2) && ResultObj2.IsValid())
+							{
+								FString ImageURL;
+								FString ImageData;
+								FString Status;
+								ResultObj2->TryGetStringField(TEXT("status"), Status);
+								ResultObj2->TryGetStringField(TEXT("image_url"), ImageURL);
+								ResultObj2->TryGetStringField(TEXT("image_data"), ImageData);
 
-							TSharedPtr<FJsonObject> ScreenshotUserMsg = MakeShareable(new FJsonObject());
-							ScreenshotUserMsg->SetStringField(TEXT("role"), TEXT("user"));
-							ScreenshotUserMsg->SetArrayField(TEXT("content"), ContentArray);
-							PendingMsgs->Add(MakeShareable(new FJsonValueObject(ScreenshotUserMsg)));
+								FString DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
+								if (!DisplayURL.IsEmpty() && Status == TEXT("ok"))
+								{
+									FMCPToolboxChatMessage ImageMsg;
+									ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+									ImageMsg.Content = TEXT("**生图成功！**");
+									ImageMsg.bHasImageAttachment = true;
+									ImageMsg.ImageDataURIs.Add(DisplayURL);
+									ImageMsg.ImageFileNames.Add(TEXT("generated.png"));
+									AddMessage(ImageMsg);
+								}
+							}
 
-							// Also add a visible message to the chat
-							FMCPToolboxChatMessage ScreenshotMsg;
-							ScreenshotMsg.Role = EMCPToolboxMessageRole::User;
-							ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
-							ScreenshotMsg.bHasImageAttachment = true;
-						ScreenshotMsg.ImageDataURIs.Add(DataURI);
-						ScreenshotMsg.ImageFileNames.Add(TEXT("screenshot.png"));
-							AddMessage(ScreenshotMsg);
+							(*PendingMCP)--;
+							if (*PendingMCP <= 0)
+							{
+								if (bSpeculationPending && LastSpeculation.IsValid() == false)
+								{
+									bPendingToolCompletion = true;
+								}
+								else
+								{
+									TrySpeculativeOrContinue(PendingMsgs);
+								}
+							}
+						});
+					});
+				}
+				else
+				{
+					FString Result = ExecuteToolCall(FuncName, FuncArgs);
+
+					FMCPToolboxChatMessage ResultMsg;
+					ResultMsg.Role = EMCPToolboxMessageRole::System;
+					ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *FuncName, *Result.Left(500));
+					AddMessage(ResultMsg);
+
+					TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+					ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+					ToolResultMsg->SetStringField(TEXT("tool_call_id"), TCId);
+					ToolResultMsg->SetStringField(TEXT("name"), FuncName);
+					ToolResultMsg->SetStringField(TEXT("content"), Result);
+					PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+					if (FuncName == TEXT("screenshot"))
+					{
+						TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+						TSharedPtr<FJsonObject> ResultObj;
+						if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+						{
+							FString DataURI;
+							if (ResultObj->TryGetStringField(TEXT("data_uri"), DataURI) && !DataURI.IsEmpty())
+							{
+								TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+								TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+								TextPart->SetStringField(TEXT("type"), TEXT("text"));
+								TextPart->SetStringField(TEXT("text"), TEXT("Here is the screenshot you requested. Please analyze it."));
+								ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+								TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+								ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+								TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+								ImageUrlObj->SetStringField(TEXT("url"), DataURI);
+								ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+								ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+
+								TSharedPtr<FJsonObject> ScreenshotUserMsg = MakeShareable(new FJsonObject());
+								ScreenshotUserMsg->SetStringField(TEXT("role"), TEXT("user"));
+								ScreenshotUserMsg->SetArrayField(TEXT("content"), ContentArray);
+								PendingMsgs->Add(MakeShareable(new FJsonValueObject(ScreenshotUserMsg)));
+
+								FMCPToolboxChatMessage ScreenshotMsg;
+								ScreenshotMsg.Role = EMCPToolboxMessageRole::User;
+								ScreenshotMsg.Content = TEXT("（截图已捕获，正在分析...）");
+								ScreenshotMsg.bHasImageAttachment = true;
+								ScreenshotMsg.ImageDataURIs.Add(DataURI);
+								ScreenshotMsg.ImageFileNames.Add(TEXT("screenshot.png"));
+								AddMessage(ScreenshotMsg);
+							}
 						}
 					}
 				}
@@ -1509,28 +3112,303 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			                  Content.Contains(TEXT("先读取")) ||
 			                  Content.Contains(TEXT("先调用")) ||
 			                  Content.Contains(TEXT("接下来调用")) ||
-			                  Content.Contains(TEXT("接下来查看"));
+			                  Content.Contains(TEXT("接下来查看")) ||
+			                  Content.Contains(TEXT("生图工具")) ||
+			                  Content.Contains(TEXT("generate_image")) ||
+			                  Content.Contains(TEXT("生成图片")) ||
+			                  Content.Contains(TEXT("画一张")) ||
+			                  Content.Contains(TEXT("画个")) ||
+			                  Content.Contains(TEXT("正在调用生图")) ||
+			                  Content.Contains(TEXT("正在调用绘图")) ||
+			                  Content.Contains(TEXT("让我为你生成")) ||
+			                  Content.Contains(TEXT("让我来生成")) ||
+			                  Content.Contains(TEXT("正在生成图片")) ||
+			                  Content.Contains(TEXT("即将调用")) ||
+			                  Content.Contains(TEXT("准备调用"));
 			bool bHasPast = Content.Contains(TEXT("已调用")) ||
 			                Content.Contains(TEXT("调用了")) ||
-			                Content.Contains(TEXT("已完成"));
-			if (bHasIntent && !bHasPast && Content.Len() < 600)
+			                Content.Contains(TEXT("已完成")) ||
+			                Content.Contains(TEXT("已生成")) ||
+			                Content.Contains(TEXT("已画"));
+			if (bHasIntent && !bHasPast)
 			{
 				bPseudoToolCall = true;
 			}
 
+			if (!bPseudoToolCall)
+			{
+				FString UserMessage;
+				for (int32 i = SentMessages.Num() - 1; i >= 0; i--)
+				{
+					TSharedPtr<FJsonObject> MsgObj = SentMessages[i]->AsObject();
+					if (MsgObj.IsValid())
+					{
+						FString Role;
+						MsgObj->TryGetStringField(TEXT("role"), Role);
+						if (Role == TEXT("user"))
+						{
+							MsgObj->TryGetStringField(TEXT("content"), UserMessage);
+							break;
+						}
+					}
+				}
+
+				if (!UserMessage.IsEmpty())
+				{
+					bool bUserWantsImage = UserMessage.Contains(TEXT("画")) ||
+					                       UserMessage.Contains(TEXT("生成图片")) ||
+					                       UserMessage.Contains(TEXT("生图")) ||
+					                       UserMessage.Contains(TEXT("绘图")) ||
+					                       UserMessage.Contains(TEXT("image")) ||
+					                       UserMessage.Contains(TEXT("picture")) ||
+					                       UserMessage.Contains(TEXT("photo")) ||
+					                       UserMessage.Contains(TEXT("生成图片")) ||
+					                       UserMessage.Contains(TEXT("帮我画")) ||
+					                       UserMessage.Contains(TEXT("画一个")) ||
+					                       UserMessage.Contains(TEXT("画一张")) ||
+					                       UserMessage.Contains(TEXT("给我画"));
+
+					if (bUserWantsImage)
+					{
+						bPseudoToolCall = true;
+						UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] User intent detected: wants image generation, auto-triggering generate_image"));
+					}
+				}
+			}
+
 			if (bPseudoToolCall)
 			{
-				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Pseudo tool-call detected: LLM said it would call a tool but tool_calls=0. Auto-retrying (attempt %d)."), PseudoToolCallRetries + 1);
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Pseudo tool-call detected: LLM said it would call a tool but tool_calls=0."));
 
+				// ── 尝试从 AI 的文字描述中提取工具调用信息 ──
+				FString DetectedToolName;
+				if (Content.Contains(TEXT("generate_image")))
+					DetectedToolName = TEXT("generate_image");
+				else if (Content.Contains(TEXT("screenshot")))
+					DetectedToolName = TEXT("screenshot");
+				else if (Content.Contains(TEXT("call_tool")))
+					DetectedToolName = TEXT("call_tool");
+				else if (Content.Contains(TEXT("list_directory")))
+					DetectedToolName = TEXT("list_directory");
+				else if (Content.Contains(TEXT("search_codebase")))
+					DetectedToolName = TEXT("search_codebase");
+				else if (Content.Contains(TEXT("batch_read_files")))
+					DetectedToolName = TEXT("batch_read_files");
+				else if (Content.Contains(TEXT("glob_search")))
+					DetectedToolName = TEXT("glob_search");
+				else if (Content.Contains(TEXT("command")))
+					DetectedToolName = TEXT("command");
+
+				if (DetectedToolName.IsEmpty())
+				{
+					FString UserMessage;
+					for (int32 i = SentMessages.Num() - 1; i >= 0; i--)
+					{
+						TSharedPtr<FJsonObject> MsgObj = SentMessages[i]->AsObject();
+						if (MsgObj.IsValid())
+						{
+							FString Role;
+							MsgObj->TryGetStringField(TEXT("role"), Role);
+							if (Role == TEXT("user"))
+							{
+								MsgObj->TryGetStringField(TEXT("content"), UserMessage);
+								break;
+							}
+						}
+					}
+
+					bool bUserWantsImage = UserMessage.Contains(TEXT("画")) ||
+					                       UserMessage.Contains(TEXT("生成图片")) ||
+					                       UserMessage.Contains(TEXT("生图")) ||
+					                       UserMessage.Contains(TEXT("绘图")) ||
+					                       UserMessage.Contains(TEXT("image")) ||
+					                       UserMessage.Contains(TEXT("picture")) ||
+					                       UserMessage.Contains(TEXT("photo")) ||
+					                       UserMessage.Contains(TEXT("帮我画")) ||
+					                       UserMessage.Contains(TEXT("画一个")) ||
+					                       UserMessage.Contains(TEXT("画一张")) ||
+					                       UserMessage.Contains(TEXT("给我画"));
+
+					if (bUserWantsImage)
+					{
+						DetectedToolName = TEXT("generate_image");
+						UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] User wants image, auto-setting tool: generate_image"));
+					}
+				}
+
+				if (!DetectedToolName.IsEmpty())
+				{
+					UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Extracted tool from content: %s"), *DetectedToolName);
+
+					// Show the LLM's text reply
+					FMCPToolboxChatMessage Reply;
+					Reply.Role = EMCPToolboxMessageRole::Assistant;
+					Reply.Content = Content;
+					AddMessage(Reply);
+
+					// ── 构造工具调用参数 ──
+					FString FuncArgs;
+					
+					if (DetectedToolName == TEXT("generate_image"))
+					{
+						// 从用户最近的消息中提取提示词
+						FString UserPrompt;
+						if (SentMessages.Num() > 0)
+						{
+							TSharedPtr<FJsonObject> LastMsg = SentMessages.Last()->AsObject();
+							if (LastMsg.IsValid())
+							{
+								FString Role;
+								LastMsg->TryGetStringField(TEXT("role"), Role);
+								if (Role == TEXT("user"))
+								{
+									LastMsg->TryGetStringField(TEXT("content"), UserPrompt);
+								}
+							}
+						}
+
+						// 如果没有提取到用户消息，使用 AI 回复中的描述
+						if (UserPrompt.IsEmpty())
+						{
+							UserPrompt = Content;
+						}
+
+						// 构造 generate_image 的参数
+						TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
+						ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
+						FString OutputJson;
+						TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+						FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
+						FuncArgs = OutputJson;
+					}
+					else
+					{
+						// 其他工具暂时用空参数，或尝试从内容中提取
+						FuncArgs = TEXT("{}");
+					}
+
+					// ── 执行工具调用 ──
+					TSharedPtr<int32> PendingMCP = MakeShared<int32>(0);
+					TSharedPtr<TArray<TSharedPtr<FJsonValue>>> PendingMsgs = MakeShared<TArray<TSharedPtr<FJsonValue>>>(SentMessages);
+
+					bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(DetectedToolName);
+
+					if (bIsMCP)
+					{
+						(*PendingMCP)++;
+						FString NameCap = DetectedToolName;
+						FString TCId = FGuid::NewGuid().ToString();
+						LaunchIdleSpec(DetectedToolName);
+
+						MCPServerClient.ExecuteTool(DetectedToolName, FuncArgs,
+							[this, PendingMCP, PendingMsgs, NameCap, TCId](bool bOk, const FString& R)
+							{
+								AsyncTask(ENamedThreads::GameThread,
+									[this, PendingMCP, PendingMsgs, NameCap, TCId, R]()
+								{
+									TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+									ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+									ToolResultMsg->SetStringField(TEXT("tool_call_id"), TCId);
+									ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+									ToolResultMsg->SetStringField(TEXT("content"), R);
+									PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+									FMCPToolboxChatMessage ResultMsg;
+									ResultMsg.Role = EMCPToolboxMessageRole::System;
+									ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(2000));
+									AddMessage(ResultMsg);
+
+									(*PendingMCP)--;
+									if (*PendingMCP <= 0)
+									{
+										if (bSpeculationPending && LastSpeculation.IsValid() == false)
+										{
+											bPendingToolCompletion = true;
+										}
+										else
+										{
+											TrySpeculativeOrContinue(PendingMsgs);
+										}
+									}
+								});
+							});
+					}
+					else
+					{
+						FString Result = ExecuteToolCall(DetectedToolName, FuncArgs);
+
+						FMCPToolboxChatMessage ResultMsg;
+						ResultMsg.Role = EMCPToolboxMessageRole::System;
+						ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *DetectedToolName, *Result.Left(500));
+						AddMessage(ResultMsg);
+
+						TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+						ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+						ToolResultMsg->SetStringField(TEXT("tool_call_id"), TEXT(""));
+						ToolResultMsg->SetStringField(TEXT("name"), DetectedToolName);
+						ToolResultMsg->SetStringField(TEXT("content"), Result);
+						PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+						if (DetectedToolName == TEXT("generate_image"))
+						{
+							TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+							TSharedPtr<FJsonObject> ResultObj;
+							if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+							{
+								FString ImageURL, ImageData, Status;
+								ResultObj->TryGetStringField(TEXT("status"), Status);
+								ResultObj->TryGetStringField(TEXT("image_url"), ImageURL);
+								ResultObj->TryGetStringField(TEXT("image_data"), ImageData);
+
+								if (Status == TEXT("ok") && (!ImageURL.IsEmpty() || !ImageData.IsEmpty()))
+								{
+									FString DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
+
+									TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+									TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+									TextPart->SetStringField(TEXT("type"), TEXT("text"));
+									TextPart->SetStringField(TEXT("text"), TEXT("图片已生成，请分析。"));
+									ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+									TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+									ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+									TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+									ImageUrlObj->SetStringField(TEXT("url"), DisplayURL);
+									ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+									ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+
+									TSharedPtr<FJsonObject> ImageUserMsg = MakeShareable(new FJsonObject());
+									ImageUserMsg->SetStringField(TEXT("role"), TEXT("user"));
+									ImageUserMsg->SetArrayField(TEXT("content"), ContentArray);
+									PendingMsgs->Add(MakeShareable(new FJsonValueObject(ImageUserMsg)));
+
+									FMCPToolboxChatMessage ImageMsg;
+									ImageMsg.Role = EMCPToolboxMessageRole::User;
+									ImageMsg.Content = TEXT("（图片已生成）");
+									ImageMsg.bHasImageAttachment = true;
+									ImageMsg.ImageDataURIs.Add(DisplayURL);
+									ImageMsg.ImageFileNames.Add(TEXT("generated.png"));
+									AddMessage(ImageMsg);
+								}
+							}
+						}
+
+						SendAIRequest(*PendingMsgs);
+					}
+					return;
+				}
+
+				// 如果没有提取到工具名称，回退到重试模式
 				PseudoToolCallRetries++;
 
-				// Show the LLM's text reply (so user sees what it said)
 				FMCPToolboxChatMessage Reply;
 				Reply.Role = EMCPToolboxMessageRole::Assistant;
 				Reply.Content = Content;
 				AddMessage(Reply);
 
-				// Append assistant message + user nudge, re-send
 				TArray<TSharedPtr<FJsonValue>> RetryMsgs = SentMessages;
 				TSharedPtr<FJsonObject> AsstMsg = MakeShareable(new FJsonObject());
 				AsstMsg->SetStringField(TEXT("role"), TEXT("assistant"));
@@ -1550,6 +3428,209 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 				SendAIRequest(RetryMsgs);
 				return;
 			}
+
+			// ── JSON tool-call extraction from content ──
+			// Some LLMs output tool_calls as JSON text in content field instead of structured tool_calls.
+			// Try to extract and parse them.
+			// Support formats:
+			// 1. {"tool_calls": [...]} - standard format
+			// 2. [json][{...}] - AI wrapped format
+			// 3. [{...}] - direct array format
+			if (Content.Contains(TEXT("tool_calls")) && Content.Contains(TEXT("[")) && Content.Contains(TEXT("]")))
+			{
+				TArray<TSharedPtr<FJsonValue>> ExtractedToolCalls;
+				FString TextPart = Content;
+
+				// Try to find the JSON array
+				int32 ArrayStart = Content.Find(TEXT("["));
+				int32 ArrayEnd = Content.Find(TEXT("]"), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+
+				if (ArrayStart != INDEX_NONE && ArrayEnd != INDEX_NONE && ArrayStart < ArrayEnd)
+				{
+					FString JsonStr = Content.Mid(ArrayStart, ArrayEnd - ArrayStart + 1);
+					
+					// First try to parse as array directly
+					TArray<TSharedPtr<FJsonValue>> JsonArray;
+					TSharedRef<TJsonReader<>> ArrayReader = TJsonReaderFactory<>::Create(JsonStr);
+					
+					if (FJsonSerializer::Deserialize(ArrayReader, JsonArray) && JsonArray.Num() > 0)
+					{
+						// Success! Found a direct array format
+						ExtractedToolCalls = JsonArray;
+						TextPart = Content.Left(ArrayStart).TrimEnd();
+						UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Extracted tool_calls from content (array format): %d calls"), ExtractedToolCalls.Num());
+					}
+					else
+					{
+						// Try to parse as object with tool_calls field
+						TSharedPtr<FJsonObject> JsonObj;
+						TSharedRef<TJsonReader<>> ObjReader = TJsonReaderFactory<>::Create(JsonStr);
+						if (FJsonSerializer::Deserialize(ObjReader, JsonObj) && JsonObj.IsValid())
+						{
+							const TArray<TSharedPtr<FJsonValue>>* ToolCallsPtr;
+							if (JsonObj->TryGetArrayField(TEXT("tool_calls"), ToolCallsPtr) && ToolCallsPtr->Num() > 0)
+							{
+								ExtractedToolCalls = *ToolCallsPtr;
+								TextPart = Content.Left(ArrayStart).TrimEnd();
+								UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Extracted tool_calls from content (object format): %d calls"), ExtractedToolCalls.Num());
+							}
+						}
+					}
+				}
+
+				if (ExtractedToolCalls.Num() > 0)
+				{
+					UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Extracted tool_calls from content: %d calls"), ExtractedToolCalls.Num());
+
+					// Show the LLM's text reply first
+					if (!TextPart.IsEmpty())
+					{
+						FMCPToolboxChatMessage Reply;
+						Reply.Role = EMCPToolboxMessageRole::Assistant;
+						Reply.Content = TextPart;
+						AddMessage(Reply);
+					}
+
+					// Build new messages: old messages + assistant(extracted tool_calls)
+					TArray<TSharedPtr<FJsonValue>> NewMsgs = SentMessages;
+
+					TSharedPtr<FJsonObject> AsstMsg = MakeShareable(new FJsonObject());
+					AsstMsg->SetStringField(TEXT("role"), TEXT("assistant"));
+					AsstMsg->SetStringField(TEXT("content"), TEXT(""));
+					AsstMsg->SetArrayField(TEXT("tool_calls"), ExtractedToolCalls);
+					NewMsgs.Add(MakeShareable(new FJsonValueObject(AsstMsg)));
+
+					// Execute the extracted tool calls
+					TSharedPtr<int32> PendingMCP = MakeShared<int32>(0);
+					TSharedPtr<TArray<TSharedPtr<FJsonValue>>> PendingMsgs = MakeShared<TArray<TSharedPtr<FJsonValue>>>(MoveTemp(NewMsgs));
+					TSharedPtr<TArray<TSharedPtr<FJsonObject>>> PendingToolCallObjs = MakeShared<TArray<TSharedPtr<FJsonObject>>>();
+
+					for (int32 TIdx = 0; TIdx < ExtractedToolCalls.Num(); ++TIdx)
+					{
+						TSharedPtr<FJsonObject> TCObj = ExtractedToolCalls[TIdx]->AsObject();
+						if (TCObj.IsValid()) PendingToolCallObjs->Add(TCObj);
+					}
+
+					for (const auto& TCObj : *PendingToolCallObjs)
+					{
+						if (!TCObj.IsValid()) continue;
+						FString TCId;
+						TCObj->TryGetStringField(TEXT("id"), TCId);
+
+						FString FuncName, FuncArgs;
+						const TSharedPtr<FJsonObject>* Func;
+						if (TCObj->TryGetObjectField(TEXT("function"), Func) && Func->IsValid())
+						{
+							(*Func)->TryGetStringField(TEXT("name"), FuncName);
+							(*Func)->TryGetStringField(TEXT("arguments"), FuncArgs);
+						}
+						else
+						{
+							TCObj->TryGetStringField(TEXT("name"), FuncName);
+							const TSharedPtr<FJsonObject>* ArgsObj;
+							if (TCObj->TryGetObjectField(TEXT("arguments"), ArgsObj) && ArgsObj && (*ArgsObj).IsValid())
+							{
+								FString OutputJson;
+								TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputJson);
+								FJsonSerializer::Serialize((*ArgsObj).ToSharedRef(), Writer);
+								FuncArgs = OutputJson;
+							}
+						}
+
+						if (FuncName.IsEmpty()) continue;
+
+						bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(FuncName);
+
+						if (bIsMCP)
+						{
+							(*PendingMCP)++;
+							FString NameCap = FuncName;
+							FString IdCap = TCId;
+							LaunchIdleSpec(FuncName);
+
+							MCPServerClient.ExecuteTool(FuncName, FuncArgs,
+								[this, PendingMCP, PendingMsgs, NameCap, IdCap](bool bOk, const FString& R)
+								{
+									AsyncTask(ENamedThreads::GameThread,
+										[this, PendingMCP, PendingMsgs, NameCap, IdCap, R]()
+									{
+										TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+										ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+										ToolResultMsg->SetStringField(TEXT("tool_call_id"), IdCap);
+										ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+										ToolResultMsg->SetStringField(TEXT("content"), R);
+										PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+										FMCPToolboxChatMessage ResultMsg;
+										ResultMsg.Role = EMCPToolboxMessageRole::System;
+										ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *R.Left(2000));
+										AddMessage(ResultMsg);
+
+										(*PendingMCP)--;
+										if (*PendingMCP <= 0)
+										{
+											if (bSpeculationPending && LastSpeculation.IsValid() == false)
+											{
+												bPendingToolCompletion = true;
+											}
+											else
+											{
+												TrySpeculativeOrContinue(PendingMsgs);
+											}
+										}
+									});
+								});
+						}
+						else
+						{
+							FString Result = ExecuteToolCall(FuncName, FuncArgs);
+
+							FMCPToolboxChatMessage ResultMsg;
+							ResultMsg.Role = EMCPToolboxMessageRole::System;
+							ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *FuncName, *Result.Left(500));
+							AddMessage(ResultMsg);
+
+							TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+							ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+							ToolResultMsg->SetStringField(TEXT("tool_call_id"), TCId);
+							ToolResultMsg->SetStringField(TEXT("name"), FuncName);
+							ToolResultMsg->SetStringField(TEXT("content"), Result);
+							PendingMsgs->Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+							if (FuncName == TEXT("generate_image"))
+							{
+								TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+								TSharedPtr<FJsonObject> ResultObj;
+								if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+								{
+									FString ImageURL, ImageData, Status;
+									ResultObj->TryGetStringField(TEXT("status"), Status);
+									ResultObj->TryGetStringField(TEXT("image_url"), ImageURL);
+									ResultObj->TryGetStringField(TEXT("image_data"), ImageData);
+
+									FString DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
+									if (!DisplayURL.IsEmpty() && Status == TEXT("ok"))
+									{
+										FMCPToolboxChatMessage ImageMsg;
+										ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+										ImageMsg.Content = TEXT("**生图成功！**");
+										ImageMsg.bHasImageAttachment = true;
+										ImageMsg.ImageDataURIs.Add(DisplayURL);
+										ImageMsg.ImageFileNames.Add(TEXT("generated.png"));
+										AddMessage(ImageMsg);
+									}
+								}
+							}
+						}
+					}
+
+					if (*PendingMCP <= 0)
+					{
+						SendAIRequest(*PendingMsgs);
+					}
+					return;
+				}
+			}
 		}
 
 		FMCPToolboxChatMessage Reply;
@@ -1557,7 +3638,7 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 		Reply.Content = Content;
 		AddMessage(Reply);
 		FMCPToolboxMemoryManager::Get().ExtractMemoriesFromResponse(Content);
-	bSystemPromptDirty = true;  // memory changed
+		bSystemPromptDirty = true;  // memory changed
 		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] 响应完成, %d chars, finish=%s"), Content.Len(), *FinishReason);
 
 		// If finish_reason is "length", AI was cut off — ask it to continue
@@ -1580,14 +3661,6 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 			return;
 		}
 
-		bIsWaiting = false;
-	}
-	else if (FinishReason == TEXT("stop"))
-	{
-		FMCPToolboxChatMessage Info;
-		Info.Role = EMCPToolboxMessageRole::System;
-		Info.Content = TEXT("(AI已完成回复)");
-		AddMessage(Info);
 		bIsWaiting = false;
 	}
 	else
@@ -1908,6 +3981,20 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += FString::Printf(TEXT("- Content目录: %s\n"), *ContentPath);
 	Prompt += FString::Printf(TEXT("- 资源路径前缀: /Game/ (对应Content目录)\n\n"));
 
+	// ── 生图模式说明 ──
+	Prompt += TEXT("## 生图模式\n");
+	Prompt += TEXT("### 方式一: AI自动调用(推荐)\n");
+	Prompt += TEXT("当用户要求生成图片时，**你必须调用 `generate_image` 工具**来生成图片，而不是自己生成或描述。\n");
+	Prompt += TEXT("参数: `prompt` (必需,详细描述图片内容), `negative_prompt` (可选,排除内容), `width`/`height` (可选,默认1024), `steps`/`cfg_scale` (可选,SD专用)\n");
+	Prompt += TEXT("### 方式二: 用户直接模式\n");
+	Prompt += TEXT("当用户手动开启\"生图\"模式按钮时，输入的提示词会直接发送到生图模型生成图片。\n");
+	Prompt += TEXT("### 支持的生图服务商\n");
+	Prompt += TEXT("- OpenAI DALL-E\n");
+	Prompt += TEXT("- SD WebUI (本地,如 http://127.0.0.1:7860)\n");
+	Prompt += TEXT("- Replicate (支持 SDXL、Flux 等模型)\n");
+	Prompt += TEXT("- Pollinations AI (免费,无需API Key)\n");
+	Prompt += TEXT("- ComfyUI (自动探测,如 http://127.0.0.1:8200)\n\n");
+
 	// ── 工具列表(精简) ──
 	// 本地工具的简短描述,不展开 schema(用户问时再说)
 	Prompt += TEXT("## 工具列表\n");
@@ -1925,6 +4012,17 @@ FString SMCPToolboxChatWidget::BuildSystemPrompt(const FString& MemoryContext)
 	Prompt += TEXT("- **screenshot** — 截取屏幕图片,你可以直接看到图片内容进行分析。**仅当视觉模式开启时可用**。返回 data:image/jpeg;base64 格式的图片数据\n");
 	Prompt += TEXT("- **select** — 选择 Actor。参数: `name` (string)\n");
 	Prompt += TEXT("- **inspect** — 检查选中 Actor 属性\n");
+	Prompt += TEXT("- **generate_image** — 调用生图模型生成图片。**当用户要求生成/创建/绘制图片时必须调用此工具**。\n");
+	Prompt += TEXT("  参数: `prompt` (必需,详细描述), `negative_prompt` (可选), `width`/`height` (可选), `steps`/`cfg_scale` (SD专用), `save_path` (必需,保存路径)\n");
+	Prompt += TEXT("  返回: `status` (ok/error), `image_url` (图片URL), `image_data` (base64图片数据), `saved_path` (保存路径)\n");
+	Prompt += TEXT("  save_path 支持: `project:/Textures/` (项目Content目录), `saved:/Images/` (项目Saved目录), 或绝对路径如 `C:/Project/Textures/`\n");
+	Prompt += TEXT("  默认保存到 `saved:/GeneratedImages/`（项目Saved目录下），无需每次都指定。\n");
+	Prompt += TEXT("  **重要**: 调用时必须指定 `save_path`，否则图片将保存在临时目录并可能被清理。\n");
+	Prompt += TEXT("  重要: 工具返回后，**不要用 Markdown 图片语法显示图片**，图片会自动显示在对话中。你只需用自然语言描述图片内容即可。\n");
+	Prompt += TEXT("  ✅ 正确调用示例:\n");
+	Prompt += TEXT("  content: \"正在生成图片...\"\n");
+	Prompt += TEXT("  tool_calls: [{ \"name\": \"generate_image\", \"arguments\": { \"prompt\": \"一只可爱的小猫咪，写实风格\", \"save_path\": \"project:/Textures/\" } }]\n");
+	Prompt += TEXT("  ❌ 错误: 在 content 中描述生图意图但不生成 tool_calls，系统会检测并要求重试。\n");
 	Prompt += TEXT("### 控制台工具\n");
 	Prompt += TEXT("- **command** — 纯控制台命令(HighResShot, stat, stat fps 等)\n\n");
 
@@ -2039,6 +4137,41 @@ void SMCPToolboxChatWidget::RegisterMCPTools()
 			ResultJson += TEXT("\"}");
 
 			return {.isError = false, .text = TCHAR_TO_UTF8(*ResultJson)};
+		}).Build());
+
+	// Generate image tool
+	ToolFunctionTable->Add(assistant::FunctionBuilder("generate_image")
+		.SetDescription("Generate images using configured image generation models (DALL-E, SD WebUI, Replicate, Pollinations). "
+			"Call this when the user asks to create, draw, or generate images. Returns the generated image URL, base64 data, and saved file path.")
+		.AddRequiredParam("prompt", "Detailed description of the image to generate", "string")
+		.AddOptionalParam("negative_prompt", "What to exclude from the image (default: empty)", "string")
+		.AddOptionalParam("width", "Image width in pixels (default: 512 for local, 1024 for cloud)", "number")
+		.AddOptionalParam("height", "Image height in pixels (default: 512 for local, 1024 for cloud)", "number")
+		.AddOptionalParam("steps", "Number of generation steps (default: 20, SD WebUI only)", "number")
+		.AddOptionalParam("cfg_scale", "CFG scale for guidance (default: 7.0, SD WebUI only)", "number")
+		.AddOptionalParam("save_path", "Path to save the generated image. Use \"project:/Textures/\" for project Content directory, \"saved:/Images/\" for project Saved directory, or an absolute path. Must be specified; if omitted, image may be lost after session.", "string")
+		.SetCallback([this](const assistant::json& args) -> assistant::FunctionResult {
+			std::string Prompt = args.value("prompt", "");
+			if (Prompt.empty())
+				return {.isError = true, .text = R"({"error":"Missing prompt parameter"})"};
+
+			std::string NegativePrompt = args.value("negative_prompt", "");
+			std::string SavePath = args.value("save_path", "saved:/GeneratedImages/");
+			int32 Width = args.value("width", 512);
+			int32 Height = args.value("height", 512);
+			int32 Steps = args.value("steps", 20);
+			float CfgScale = args.value("cfg_scale", 7.0f);
+
+			FString Result = GenerateImageSync(
+				UTF8_TO_TCHAR(Prompt.c_str()),
+				UTF8_TO_TCHAR(NegativePrompt.c_str()),
+				Width, Height, Steps, CfgScale,
+				UTF8_TO_TCHAR(SavePath.c_str()));
+
+			if (Result.Contains(TEXT("\"error\"")))
+				return {.isError = true, .text = TCHAR_TO_UTF8(*Result)};
+
+			return {.isError = false, .text = TCHAR_TO_UTF8(*Result)};
 		}).Build());
 
 	// Command tool
@@ -3614,8 +5747,42 @@ TSharedRef<SWidget> SMCPToolboxChatWidget::BuildToolbar()
 					.ColorAndOpacity(FLinearColor(0.85f, 0.95f, 0.95f))
 				]
 			]
+			// 生图模式(展开时显示)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(2, 0, 0, 0))
+			[
+				SNew(SButton)
+				.Visibility_Lambda([this]() -> EVisibility
+				{
+					return bMoreExpanded ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor
+				{
+					return bImageGenerationMode ? FLinearColor(0.5f, 0.2f, 0.6f, 1.0f) : FLinearColor(0.13f, 0.13f, 0.15f, 1.0f);
+				})
+				.ContentPadding(FMargin(6, 2))
+				.OnClicked_Lambda([this]() -> FReply
+				{
+					bImageGenerationMode = !bImageGenerationMode;
+					SaveWidgetState();
+					return FReply::Handled();
+				})
+				.ToolTipText(LOCTEXT("ImageGenTooltip", "切换生图模式(使用生图模型生成图片)"))
+				.Content()
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this]() -> FText
+					{
+						return bImageGenerationMode ? LOCTEXT("ImageGenEnabled", "生图开") : LOCTEXT("ImageGenDisabled", "生图");
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity_Lambda([this]() -> FLinearColor
+					{
+						return bImageGenerationMode ? FLinearColor(0.95f, 0.85f, 1.0f) : FLinearColor(0.7f, 0.7f, 0.7f);
+					})
+				]
+			]
 		];
-}
+	}
 
 // ============================================================================
 // Entry Selection
@@ -3833,12 +6000,14 @@ TSharedPtr<FJsonValue> SMCPToolboxChatWidget::ResolveDAGFieldPath(const FString&
 {
 	// 无字段路径 → 返回整个结果解析为 FJsonValue
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResultJsonStr);
-	TSharedPtr<FJsonValue> Root;
-	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	TSharedPtr<FJsonObject> RootObj;
+	if (!FJsonSerializer::Deserialize(Reader, RootObj) || !RootObj.IsValid())
 	{
-		// 结果不是合法 JSON — 作为字符串值返回
+		// 结果不是合法 JSON 对象 — 作为字符串值返回
 		return MakeShared<FJsonValueString>(ResultJsonStr);
 	}
+
+	TSharedPtr<FJsonValue> Root = MakeShared<FJsonValueObject>(RootObj);
 
 	// FieldPath 为空 → 返回整个根值
 	if (FieldPath.IsEmpty())
@@ -4239,6 +6408,78 @@ void SMCPToolboxChatWidget::ExecuteToolCallsDAG(
 
 			double StartTime = FDateTime::Now().ToUnixTimestamp() * 1000.0;
 
+			// ── call_tool 特殊处理 (DAG 模式) ──
+			if (ToolId == TEXT("call_tool"))
+			{
+				if (!MCPServerClient.IsConnected())
+				{
+					FTaskExecutionResult Res;
+					Res.TaskId = TaskId;
+					Res.bSuccess = false;
+					Res.ResultJson = TEXT("{\"error\":\"MCP server not connected\"}");
+					Res.LatencyMs = 0;
+					Res.Attempts = 1;
+					AllResults->Add(TaskId, Res);
+					(*Pending)--;
+					if (*Pending <= 0) (*ExecuteNextBatch)();
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> ArgsObj;
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ArgsJson);
+				if (FJsonSerializer::Deserialize(Reader, ArgsObj) && ArgsObj.IsValid())
+				{
+					FString ToolsetName, RealToolName, RealArgsJson;
+					ArgsObj->TryGetStringField(TEXT("toolset_name"), ToolsetName);
+					ArgsObj->TryGetStringField(TEXT("tool_name"), RealToolName);
+
+					const TSharedPtr<FJsonObject>* ArgsPtr;
+					if (ArgsObj->TryGetObjectField(TEXT("arguments"), ArgsPtr) && ArgsPtr->IsValid())
+					{
+						FString OutputJson;
+						TSharedRef<TJsonWriter<>> RealArgsWriter = TJsonWriterFactory<>::Create(&OutputJson);
+						FJsonSerializer::Serialize((*ArgsPtr).ToSharedRef(), RealArgsWriter);
+						RealArgsJson = OutputJson;
+					}
+
+					if (!ToolsetName.IsEmpty() && !RealToolName.IsEmpty())
+					{
+						FString FullToolName = ToolsetName + TEXT(".") + RealToolName;
+						UE_LOG(LogMCPToolbox, Log, TEXT("[DAG] call_tool -> MCP tool: %s"), *FullToolName);
+
+						MCPServerClient.ExecuteTool(FullToolName, RealArgsJson,
+							[this, TaskId, Pending, StartTime, AllResults, ExecuteNextBatch](bool bOk, const FString& Result)
+							{
+								FTaskExecutionResult Res;
+								Res.TaskId = TaskId;
+								Res.bSuccess = bOk;
+								Res.ResultJson = Result;
+								Res.LatencyMs = FDateTime::Now().ToUnixTimestamp() * 1000.0 - StartTime;
+								Res.Attempts = 1;
+								AllResults->Add(TaskId, Res);
+
+								(*Pending)--;
+								if (*Pending <= 0)
+								{
+									(*ExecuteNextBatch)();
+								}
+							});
+						continue;
+					}
+				}
+
+				FTaskExecutionResult Res;
+				Res.TaskId = TaskId;
+				Res.bSuccess = false;
+				Res.ResultJson = TEXT("{\"error\":\"Invalid call_tool parameters\"}");
+				Res.LatencyMs = 0;
+				Res.Attempts = 1;
+				AllResults->Add(TaskId, Res);
+				(*Pending)--;
+				if (*Pending <= 0) (*ExecuteNextBatch)();
+				continue;
+			}
+
 			// 判断工具类型
 			bool bIsMCP = MCPServerClient.IsConnected() && MCPServerClient.IsMCPTool(ToolId);
 
@@ -4562,6 +6803,7 @@ void SMCPToolboxChatWidget::LoadWidgetState()
 	Json->TryGetBoolField(TEXT("more_expanded"), bMoreExpanded);
 	Json->TryGetBoolField(TEXT("summary_declined"), bSummaryDeclined);
 	Json->TryGetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
+	Json->TryGetBoolField(TEXT("image_generation_enabled"), bImageGenerationMode);
 
 	// Stage 6.3 + 阶段 A1: 读取 disabled_skills 数组,委托给 SkillService
 	{
@@ -4590,6 +6832,7 @@ void SMCPToolboxChatWidget::SaveWidgetState() const
 	Json->SetBoolField(TEXT("more_expanded"), bMoreExpanded);
 	Json->SetBoolField(TEXT("summary_declined"), bSummaryDeclined);
 	Json->SetBoolField(TEXT("auto_archive_enabled"), bAutoArchiveEnabled);
+	Json->SetBoolField(TEXT("image_generation_enabled"), bImageGenerationMode);
 
 	// Stage 6.3 + 阶段 A1: 持久化 disabled_skills(从 SkillService 读取)
 	TArray<TSharedPtr<FJsonValue>> DisabledArr;
@@ -6070,6 +8313,354 @@ void SMCPToolboxChatWidget::ApplyPruningBeforeSend(
 
 		if (OnPruned) OnPruned(PrunedMessages);
 	});
+}
+
+void SMCPToolboxChatWidget::HandleStreamingTextCompletion(const FString& Content)
+{
+	if (bInterrupted) return;
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] HandleStreamingTextCompletion: %d chars"), Content.Len());
+
+	FString DetectedToolName;
+
+	bool bHasIntent = Content.Contains(TEXT("调用工具")) ||
+	                  Content.Contains(TEXT("call_tool")) ||
+	                  Content.Contains(TEXT("先查看")) ||
+	                  Content.Contains(TEXT("先读取")) ||
+	                  Content.Contains(TEXT("先调用")) ||
+	                  Content.Contains(TEXT("接下来调用")) ||
+	                  Content.Contains(TEXT("接下来查看")) ||
+	                  Content.Contains(TEXT("生图工具")) ||
+	                  Content.Contains(TEXT("generate_image")) ||
+	                  Content.Contains(TEXT("生成图片")) ||
+	                  Content.Contains(TEXT("画一张")) ||
+	                  Content.Contains(TEXT("画个")) ||
+	                  Content.Contains(TEXT("正在调用生图")) ||
+	                  Content.Contains(TEXT("正在调用绘图")) ||
+	                  Content.Contains(TEXT("让我为你生成")) ||
+	                  Content.Contains(TEXT("让我来生成")) ||
+	                  Content.Contains(TEXT("正在生成图片")) ||
+	                  Content.Contains(TEXT("即将调用")) ||
+	                  Content.Contains(TEXT("准备调用"));
+	bool bHasPast = Content.Contains(TEXT("已调用")) ||
+	                Content.Contains(TEXT("调用了")) ||
+	                Content.Contains(TEXT("已完成")) ||
+	                Content.Contains(TEXT("已生成")) ||
+	                Content.Contains(TEXT("已画"));
+
+	if (bHasIntent && !bHasPast)
+	{
+		if (Content.Contains(TEXT("generate_image")))
+			DetectedToolName = TEXT("generate_image");
+		else if (Content.Contains(TEXT("screenshot")))
+			DetectedToolName = TEXT("screenshot");
+		else if (Content.Contains(TEXT("call_tool")))
+			DetectedToolName = TEXT("call_tool");
+		else if (Content.Contains(TEXT("list_directory")))
+			DetectedToolName = TEXT("list_directory");
+		else if (Content.Contains(TEXT("search_codebase")))
+			DetectedToolName = TEXT("search_codebase");
+		else if (Content.Contains(TEXT("batch_read_files")))
+			DetectedToolName = TEXT("batch_read_files");
+		else if (Content.Contains(TEXT("glob_search")))
+			DetectedToolName = TEXT("glob_search");
+		else if (Content.Contains(TEXT("command")))
+			DetectedToolName = TEXT("command");
+	}
+
+	if (DetectedToolName.IsEmpty())
+	{
+		FString UserMessage;
+		for (int32 i = Messages.Num() - 1; i >= 0; i--)
+		{
+			if (Messages[i].Role == EMCPToolboxMessageRole::User)
+			{
+				UserMessage = Messages[i].Content;
+				break;
+			}
+		}
+
+		if (!UserMessage.IsEmpty())
+		{
+			bool bUserWantsImage = UserMessage.Contains(TEXT("画")) ||
+			                       UserMessage.Contains(TEXT("生成图片")) ||
+			                       UserMessage.Contains(TEXT("生图")) ||
+			                       UserMessage.Contains(TEXT("绘图")) ||
+			                       UserMessage.Contains(TEXT("image")) ||
+			                       UserMessage.Contains(TEXT("picture")) ||
+			                       UserMessage.Contains(TEXT("photo")) ||
+			                       UserMessage.Contains(TEXT("帮我画")) ||
+			                       UserMessage.Contains(TEXT("画一个")) ||
+			                       UserMessage.Contains(TEXT("画一张")) ||
+			                       UserMessage.Contains(TEXT("给我画"));
+
+			if (bUserWantsImage)
+			{
+				DetectedToolName = TEXT("generate_image");
+				UE_LOG(LogMCPToolbox, Warning, TEXT("[Chat] Streaming text completion: detected user image intent, auto-triggering generate_image"));
+			}
+		}
+	}
+
+	if (!DetectedToolName.IsEmpty())
+	{
+		UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Streaming text completion: extracted tool from content: %s"), *DetectedToolName);
+
+		FString UserPrompt;
+		for (int32 i = Messages.Num() - 1; i >= 0; i--)
+		{
+			if (Messages[i].Role == EMCPToolboxMessageRole::User)
+			{
+				UserPrompt = Messages[i].Content;
+				break;
+			}
+		}
+
+		FString FuncArgs;
+		if (DetectedToolName == TEXT("generate_image"))
+		{
+			TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
+			ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
+			ArgsObj->SetStringField(TEXT("save_path"), TEXT("saved:/GeneratedImages/"));
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&FuncArgs);
+			FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
+		}
+		else
+		{
+			FuncArgs = TEXT("{}");
+		}
+
+		FMCPToolboxChatMessage ToolCallMsg;
+		ToolCallMsg.Role = EMCPToolboxMessageRole::System;
+		ToolCallMsg.Content = FString::Printf(TEXT("**调用工具: %s**"), *DetectedToolName);
+		AddMessage(ToolCallMsg);
+
+		if (DetectedToolName == TEXT("generate_image"))
+		{
+			FString NameCap = DetectedToolName;
+			FString ContentCap = Content;
+			FString FuncArgsCap = FuncArgs;
+
+			TArray<TSharedPtr<FJsonValue>> HistoryMsgs;
+			for (const auto& Msg : Messages)
+			{
+				TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject());
+				FString RoleStr;
+				switch (Msg.Role)
+				{
+				case EMCPToolboxMessageRole::User: RoleStr = TEXT("user"); break;
+				case EMCPToolboxMessageRole::Assistant: RoleStr = TEXT("assistant"); break;
+				case EMCPToolboxMessageRole::System: RoleStr = TEXT("system"); break;
+				case EMCPToolboxMessageRole::Thinking: RoleStr = TEXT("assistant"); break;
+				default: continue;
+				}
+				MsgObj->SetStringField(TEXT("role"), RoleStr);
+
+				if (Msg.bHasImageAttachment && !Msg.ImageDataURIs.IsEmpty())
+				{
+					const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+					bool bVisionOK = ActiveEntry && (
+						ActiveEntry->ModelId.Contains(TEXT("gpt-4o")) ||
+						ActiveEntry->ModelId.Contains(TEXT("claude-3")) || ActiveEntry->ModelId.Contains(TEXT("claude-4")) ||
+						ActiveEntry->ModelId.Contains(TEXT("gemini")) ||
+						ActiveEntry->ModelId.Contains(TEXT("vl")) || ActiveEntry->ModelId.Contains(TEXT("vision")));
+
+					if (bVisionOK)
+					{
+						TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+						TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+						TextPart->SetStringField(TEXT("type"), TEXT("text"));
+						TextPart->SetStringField(TEXT("text"), Msg.Content);
+						ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+						for (const FString& ImageURI : Msg.ImageDataURIs)
+						{
+							TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+							ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+							TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+							ImageUrlObj->SetStringField(TEXT("url"), ImageURI);
+							ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+							ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+						}
+
+						MsgObj->SetArrayField(TEXT("content"), ContentArray);
+					}
+					else
+					{
+						MsgObj->SetStringField(TEXT("content"), Msg.Content.IsEmpty() ? TEXT("图片已生成。") : Msg.Content);
+					}
+				}
+				else
+				{
+					MsgObj->SetStringField(TEXT("content"), Msg.Content);
+				}
+
+				if (Msg.Role == EMCPToolboxMessageRole::Assistant && !Msg.ReasoningContent.IsEmpty())
+				{
+					MsgObj->SetStringField(TEXT("reasoning_content"), Msg.ReasoningContent);
+				}
+
+				HistoryMsgs.Add(MakeShareable(new FJsonValueObject(MsgObj)));
+			}
+
+			TWeakPtr<SMCPToolboxChatWidget> WeakSelf = SharedThis(this);
+
+			Async(EAsyncExecution::Thread,
+				[this, WeakSelf, NameCap, ContentCap, FuncArgsCap, HistoryMsgs]()
+			{
+				FString Result = ExecuteToolCall(NameCap, FuncArgsCap);
+
+				AsyncTask(ENamedThreads::GameThread,
+					[WeakSelf, NameCap, ContentCap, FuncArgsCap, Result, HistoryMsgs]()
+					{
+					TSharedPtr<SMCPToolboxChatWidget> Self = WeakSelf.Pin();
+					if (!Self.IsValid()) return;
+
+					FMCPToolboxChatMessage ResultMsg;
+					ResultMsg.Role = EMCPToolboxMessageRole::System;
+					ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *NameCap, *Result.Left(500));
+					Self->AddMessage(ResultMsg);
+
+					TArray<TSharedPtr<FJsonValue>> NewMsgs = HistoryMsgs;
+
+					TSharedPtr<FJsonObject> AsstMsgWithToolCalls = MakeShareable(new FJsonObject());
+					AsstMsgWithToolCalls->SetStringField(TEXT("role"), TEXT("assistant"));
+					AsstMsgWithToolCalls->SetStringField(TEXT("content"), TEXT(""));
+
+					TArray<TSharedPtr<FJsonValue>> ToolCallsArray;
+					TSharedPtr<FJsonObject> ToolCallObj = MakeShareable(new FJsonObject());
+					ToolCallObj->SetStringField(TEXT("id"), TEXT("call_0"));
+
+					TSharedPtr<FJsonObject> FuncObj = MakeShareable(new FJsonObject());
+					FuncObj->SetStringField(TEXT("name"), NameCap);
+					FuncObj->SetStringField(TEXT("arguments"), FuncArgsCap);
+					ToolCallObj->SetObjectField(TEXT("function"), FuncObj);
+
+					ToolCallsArray.Add(MakeShareable(new FJsonValueObject(ToolCallObj)));
+					AsstMsgWithToolCalls->SetArrayField(TEXT("tool_calls"), ToolCallsArray);
+					NewMsgs.Add(MakeShareable(new FJsonValueObject(AsstMsgWithToolCalls)));
+
+					TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+					ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+					ToolResultMsg->SetStringField(TEXT("tool_call_id"), TEXT("call_0"));
+					ToolResultMsg->SetStringField(TEXT("name"), NameCap);
+					ToolResultMsg->SetStringField(TEXT("content"), Result);
+					NewMsgs.Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+					FString DisplayURL;
+					FString ImageAnalysis;
+
+					TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result);
+					TSharedPtr<FJsonObject> ResultObj;
+					if (FJsonSerializer::Deserialize(ResultReader, ResultObj) && ResultObj.IsValid())
+					{
+						FString ImageURL, ImageData, Status;
+						ResultObj->TryGetStringField(TEXT("status"), Status);
+						ResultObj->TryGetStringField(TEXT("image_url"), ImageURL);
+						ResultObj->TryGetStringField(TEXT("image_data"), ImageData);
+
+						if (Status == TEXT("ok") && (!ImageURL.IsEmpty() || !ImageData.IsEmpty()))
+						{
+							DisplayURL = ImageURL.IsEmpty() ? ImageData : ImageURL;
+
+							FMCPToolboxChatMessage ImageMsg;
+							ImageMsg.Role = EMCPToolboxMessageRole::Assistant;
+							ImageMsg.Content = TEXT("**生图成功！**");
+							ImageMsg.bHasImageAttachment = true;
+							ImageMsg.ImageDataURIs.Add(DisplayURL);
+							ImageMsg.ImageFileNames.Add(TEXT("generated.png"));
+							Self->AddMessage(ImageMsg);
+
+							const FMCPToolboxAPIKeyEntry* ActiveEntry = FMCPToolboxAPIManager::Get().GetActiveEntry();
+							bool bModelSupportsVision = false;
+							if (ActiveEntry)
+							{
+								const FString& M = ActiveEntry->ModelId;
+								bModelSupportsVision = M.Contains(TEXT("gpt-4o")) ||
+									M.Contains(TEXT("gpt-4-turbo")) || M.Contains(TEXT("gpt-4-vision")) ||
+									M.Contains(TEXT("o1")) || M.Contains(TEXT("o3")) ||
+									M.Contains(TEXT("claude-3")) || M.Contains(TEXT("claude-4")) ||
+									M.Contains(TEXT("gemini")) ||
+									M.Contains(TEXT("vl")) || M.Contains(TEXT("vision")) ||
+									M.Contains(TEXT("image")) ||
+									M.Contains(TEXT("qwen-vl")) || M.Contains(TEXT("glm-4v")) ||
+									M.Contains(TEXT("yi-vision")) || M.Contains(TEXT("step-1v")) ||
+									M.Contains(TEXT("pixtral")) || M.Contains(TEXT("sonar"));
+							}
+
+							if (bModelSupportsVision)
+							{
+								TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+								TSharedPtr<FJsonObject> TextPart = MakeShareable(new FJsonObject());
+								TextPart->SetStringField(TEXT("type"), TEXT("text"));
+								TextPart->SetStringField(TEXT("text"), TEXT("图片已生成，请分析。"));
+								ContentArray.Add(MakeShareable(new FJsonValueObject(TextPart)));
+
+								TSharedPtr<FJsonObject> ImagePart = MakeShareable(new FJsonObject());
+								ImagePart->SetStringField(TEXT("type"), TEXT("image_url"));
+
+								TSharedPtr<FJsonObject> ImageUrlObj = MakeShareable(new FJsonObject());
+								ImageUrlObj->SetStringField(TEXT("url"), DisplayURL);
+								ImagePart->SetObjectField(TEXT("image_url"), ImageUrlObj);
+
+								ContentArray.Add(MakeShareable(new FJsonValueObject(ImagePart)));
+
+								TSharedPtr<FJsonObject> ImageUserMsg = MakeShareable(new FJsonObject());
+								ImageUserMsg->SetStringField(TEXT("role"), TEXT("user"));
+								ImageUserMsg->SetArrayField(TEXT("content"), ContentArray);
+								NewMsgs.Add(MakeShareable(new FJsonValueObject(ImageUserMsg)));
+							}
+							else
+							{
+								TSharedPtr<FJsonObject> TextOnlyMsg = MakeShareable(new FJsonObject());
+								TextOnlyMsg->SetStringField(TEXT("role"), TEXT("user"));
+								TextOnlyMsg->SetStringField(TEXT("content"), TEXT("图片已生成。图片内容分析：这是用户要求生成的图片。"));
+								NewMsgs.Add(MakeShareable(new FJsonValueObject(TextOnlyMsg)));
+							}
+						}
+					}
+
+					Self->RebuildChatDisplay();
+
+					Self->bIsWaiting = true;
+					Self->SendAIRequest(NewMsgs);
+				});
+			});
+		}
+		else
+		{
+			FString Result = ExecuteToolCall(DetectedToolName, FuncArgs);
+
+			FMCPToolboxChatMessage ResultMsg;
+			ResultMsg.Role = EMCPToolboxMessageRole::System;
+			ResultMsg.Content = FString::Printf(TEXT("**%s** 结果:\n```\n%s\n```"), *DetectedToolName, *Result.Left(500));
+			AddMessage(ResultMsg);
+
+			TArray<TSharedPtr<FJsonValue>> NewMsgs;
+
+			TSharedPtr<FJsonObject> AsstMsg = MakeShareable(new FJsonObject());
+			AsstMsg->SetStringField(TEXT("role"), TEXT("assistant"));
+			AsstMsg->SetStringField(TEXT("content"), Content);
+			NewMsgs.Add(MakeShareable(new FJsonValueObject(AsstMsg)));
+
+			TSharedPtr<FJsonObject> ToolResultMsg = MakeShareable(new FJsonObject());
+			ToolResultMsg->SetStringField(TEXT("role"), TEXT("tool"));
+			ToolResultMsg->SetStringField(TEXT("tool_call_id"), TEXT(""));
+			ToolResultMsg->SetStringField(TEXT("name"), DetectedToolName);
+			ToolResultMsg->SetStringField(TEXT("content"), Result);
+			NewMsgs.Add(MakeShareable(new FJsonValueObject(ToolResultMsg)));
+
+			bIsWaiting = true;
+			SendAIRequest(NewMsgs);
+		}
+		return;
+	}
+
+	UE_LOG(LogMCPToolbox, Log, TEXT("[Chat] Streaming text completion: no tool intent detected"));
 }
 
 #undef LOCTEXT_NAMESPACE

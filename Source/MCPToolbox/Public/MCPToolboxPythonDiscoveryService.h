@@ -17,6 +17,7 @@
 #include "CoreMinimal.h"
 #include "MCPToolboxResult.h"
 #include "MCPToolboxPythonTypes.h"
+#include "MCPToolboxPythonIntrospectionBuilder.h"
 
 /**
  * Python API 发现服务。

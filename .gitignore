@@ -1,6 +1,9 @@
 # Auxiliary model files (llama.cpp + Qwen3VL model) — too large for Git
 AuxiliaryModule/
 
+# Documentation — excluded from git per project policy
+docs/
+
 # BuildPlugin packaging symlink
 Resources/
 
