@@ -3290,29 +3290,23 @@ void SMCPToolboxChatWidget::HandleAIResponse(FHttpResponsePtr Resp, const TArray
 					
 					if (DetectedToolName == TEXT("generate_image"))
 					{
-						// 从用户最近的消息中提取提示词
+						// ponytail: extract user prompt from Messages array (always up-to-date),
+						// not SentMessages (stale during self-loop).
 						FString UserPrompt;
-						if (SentMessages.Num() > 0)
+						for (int32 Mi = Messages.Num() - 1; Mi >= 0; --Mi)
 						{
-							TSharedPtr<FJsonObject> LastMsg = SentMessages.Last()->AsObject();
-							if (LastMsg.IsValid())
+							if (Messages[Mi].Role == EMCPToolboxMessageRole::User && !Messages[Mi].Content.IsEmpty())
 							{
-								FString Role;
-								LastMsg->TryGetStringField(TEXT("role"), Role);
-								if (Role == TEXT("user"))
-								{
-									LastMsg->TryGetStringField(TEXT("content"), UserPrompt);
-								}
+								UserPrompt = Messages[Mi].Content;
+								break;
 							}
 						}
-
-						// 如果没有提取到用户消息，使用 AI 回复中的描述
 						if (UserPrompt.IsEmpty())
-						{
 							UserPrompt = Content;
-						}
 
-						// 构造 generate_image 的参数
+						// Generate image of: ... — SD models need English context
+						UserPrompt = TEXT("Generate a high quality image of: ") + UserPrompt;
+
 						TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
 						ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
 						FString OutputJson;
@@ -8391,7 +8385,7 @@ void SMCPToolboxChatWidget::HandleStreamingTextCompletion(const FString& Content
 		if (DetectedToolName == TEXT("generate_image"))
 		{
 			TSharedPtr<FJsonObject> ArgsObj = MakeShareable(new FJsonObject());
-			ArgsObj->SetStringField(TEXT("prompt"), UserPrompt);
+			ArgsObj->SetStringField(TEXT("prompt"), TEXT("Generate a high quality image of: ") + UserPrompt);
 			ArgsObj->SetStringField(TEXT("save_path"), TEXT("project:/Pictures/"));
 			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&FuncArgs);
 			FJsonSerializer::Serialize(ArgsObj.ToSharedRef(), Writer);
